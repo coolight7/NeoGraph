@@ -36,8 +36,8 @@
 #pragma once
 
 #include <neograph/api.h>
-#include <neograph/graph/types.h>
 #include <neograph/graph/state.h>
+#include <neograph/graph/types.h>
 
 #include <asio/awaitable.hpp>
 
@@ -70,14 +70,15 @@ struct RunContext;
  * @see ROADMAP_v1.md "Execution plan" → PR 2
  */
 struct NodeInput {
+    /// [@coolight] 允许 Node 修改
     /// Snapshot of the channel state visible to this node.
-    const GraphState&  state;
+    GraphState& state;
 
     /// Per-run metadata threaded by the engine — cancel token,
     /// deadline, trace_id, thread_id, current super-step, stream
     /// mode. PR 1 plumbed this through every dispatch hop; PR 2 is
     /// the first place a user-overridable virtual receives it.
-    const RunContext&  ctx;
+    const RunContext& ctx;
 
     /// Streaming sink. ``nullptr`` for non-streaming runs (the engine
     /// passes a pointer to its callback only when the caller used
@@ -102,11 +103,11 @@ using NodeOutput = NodeResult;
 ///
 /// Migration recipe with case-by-case before/after examples:
 /// docs/migration-v0.4-to-v1.0.md
-#define NEOGRAPH_DEPRECATED_VIRTUAL                                  \
-    [[deprecated(                                                    \
-        "v0.4: override run(NodeInput) -> awaitable<NodeOutput> "    \
-        "instead. The legacy 8-virtual chain is preserved for "      \
-        "back-compat through v0.5 and removed in v1.0. "             \
+#define NEOGRAPH_DEPRECATED_VIRTUAL                               \
+    [[deprecated(                                                 \
+        "v0.4: override run(NodeInput) -> awaitable<NodeOutput> " \
+        "instead. The legacy 8-virtual chain is preserved for "   \
+        "back-compat through v0.5 and removed in v1.0. "          \
         "Migration recipe: docs/migration-v0.4-to-v1.0.md")]]
 
 /**
@@ -218,11 +219,11 @@ public:
     std::string get_name() const override { return name_; }
 
 private:
-    std::string              name_;
+    std::string               name_;
     std::shared_ptr<Provider> provider_;
-    std::vector<Tool*>       tools_;
-    std::string              model_;
-    std::string              instructions_;
+    std::vector<Tool*>        tools_;
+    std::string               model_;
+    std::string               instructions_;
 
     CompletionParams build_params(const GraphState& state) const;
 };
@@ -254,7 +255,7 @@ public:
     /// Tool, writes tool result messages back to the ``messages``
     /// channel.
     asio::awaitable<NodeOutput> run(NodeInput in) override;
-    std::string get_name() const override { return name_; }
+    std::string                 get_name() const override { return name_; }
 
 private:
     std::string        name_;
@@ -280,8 +281,9 @@ public:
      * @param prompt Classification prompt template sent to the LLM.
      * @param valid_routes List of valid intent route names the LLM can return.
      */
-    IntentClassifierNode(const std::string& name, const NodeContext& ctx,
-                         const std::string& prompt,
+    IntentClassifierNode(const std::string&       name,
+                         const NodeContext&       ctx,
+                         const std::string&       prompt,
                          std::vector<std::string> valid_routes);
 
     /// v0.4 PR 9a: unified ``run`` — calls the LLM with the
@@ -289,18 +291,18 @@ public:
     /// ``valid_routes``, writes the chosen route to ``__route__``.
     /// Streams per-token events when ``in.stream_cb`` is non-null.
     asio::awaitable<NodeOutput> run(NodeInput in) override;
-    std::string get_name() const override { return name_; }
+    std::string                 get_name() const override { return name_; }
 
 private:
     std::string               name_;
-    std::shared_ptr<Provider>  provider_;
+    std::shared_ptr<Provider> provider_;
     std::string               model_;
     std::string               prompt_;
     std::vector<std::string>  valid_routes_;
 
     /// Shared setup: returns (params, route_tail_callback) common to
     /// the streaming and non-streaming execute paths.
-    CompletionParams build_params(const GraphState& state) const;
+    CompletionParams          build_params(const GraphState& state) const;
     std::vector<ChannelWrite> route_from(const std::string& intent) const;
 };
 
@@ -326,9 +328,9 @@ public:
      * @param input_map Mapping of parent_channel -> child_channel for input.
      * @param output_map Mapping of child_channel -> parent_channel for output.
      */
-    SubgraphNode(const std::string& name,
-                 std::shared_ptr<GraphEngine> subgraph,
-                 std::map<std::string, std::string> input_map = {},
+    SubgraphNode(const std::string&                 name,
+                 std::shared_ptr<GraphEngine>       subgraph,
+                 std::map<std::string, std::string> input_map  = {},
                  std::map<std::string, std::string> output_map = {});
 
     /// v0.4 PR 9a: unified ``run`` — drives the child engine via
@@ -338,16 +340,16 @@ public:
     /// the child run's ``RunConfig`` so a parent cancel cascades to
     /// the subgraph.
     asio::awaitable<NodeOutput> run(NodeInput in) override;
-    std::string get_name() const override { return name_; }
+    std::string                 get_name() const override { return name_; }
 
 private:
-    std::string name_;
-    std::shared_ptr<GraphEngine> subgraph_;
+    std::string                        name_;
+    std::shared_ptr<GraphEngine>       subgraph_;
     std::map<std::string, std::string> input_map_;
     std::map<std::string, std::string> output_map_;
 
-    json build_subgraph_input(const GraphState& state) const;
+    json                      build_subgraph_input(const GraphState& state) const;
     std::vector<ChannelWrite> extract_output(const json& subgraph_output) const;
 };
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
