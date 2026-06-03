@@ -1,5 +1,6 @@
-#include <neograph/graph/state.h>
 #include <neograph/graph/cancel.h>
+#include <neograph/graph/state.h>
+
 #include <algorithm>
 #include <stdexcept>
 #include <vector>
@@ -10,11 +11,10 @@ namespace neograph::graph {
 // the "Write to unknown channel" error so the user immediately sees what
 // IS declared, instead of having to compare against the JSON definition.
 // Caller already holds the mutex.
-static std::string declared_channel_list(
-    const std::map<std::string, Channel>& channels) {
+static std::string declared_channel_list(const std::map<std::string, Channel>& channels) {
     if (channels.empty()) return "(none — no channels declared in the graph definition)";
     std::string out;
-    bool first = true;
+    bool        first = true;
     for (const auto& kv : channels) {  // std::map iterates sorted by key
         if (!first) out += ", ";
         first = false;
@@ -24,11 +24,11 @@ static std::string declared_channel_list(
 }
 
 void GraphState::init_channel(const std::string& name,
-                               ReducerType type,
-                               ReducerFn reducer,
-                               const json& initial_value) {
+                              ReducerType        type,
+                              ReducerFn          reducer,
+                              const json&        initial_value) {
     std::unique_lock lock(mutex_);
-    Channel ch;
+    Channel          ch;
     ch.name         = name;
     ch.reducer_type = type;
     ch.reducer      = std::move(reducer);
@@ -38,13 +38,13 @@ void GraphState::init_channel(const std::string& name,
 
 json GraphState::get(const std::string& channel) const {
     std::shared_lock lock(mutex_);
-    auto it = channels_.find(channel);
+    auto             it = channels_.find(channel);
     if (it == channels_.end()) return json();
     return it->second.value;
 }
 
 std::vector<ChatMessage> GraphState::get_messages() const {
-    auto msgs_json = get("messages");
+    auto                     msgs_json = get("messages");
     std::vector<ChatMessage> messages;
     if (msgs_json.is_array()) {
         for (const auto& j : msgs_json) {
@@ -58,17 +58,38 @@ std::vector<ChatMessage> GraphState::get_messages() const {
 
 void GraphState::write(const std::string& channel, const json& value) {
     std::unique_lock lock(mutex_);
-    auto it = channels_.find(channel);
+    auto             it = channels_.find(channel);
     if (it == channels_.end()) {
-        throw std::runtime_error(
-            "Write to unknown channel: '" + channel + "'. "
-            "Declared channels: " + declared_channel_list(channels_) + ". "
-            "Channel names are case-sensitive; add it to the graph "
-            "definition's \"channels\" block before writing. "
-            "See docs/troubleshooting.md \"Write to unknown channel\".");
+        throw std::runtime_error("Write to unknown channel: '" + channel +
+                                 "'. "
+                                 "Declared channels: " +
+                                 declared_channel_list(channels_) +
+                                 ". "
+                                 "Channel names are case-sensitive; add it to the graph "
+                                 "definition's \"channels\" block before writing. "
+                                 "See docs/troubleshooting.md \"Write to unknown channel\".");
     }
-    auto& ch  = it->second;
+    auto& ch   = it->second;
     ch.value   = ch.reducer(ch.value, value);
+    ch.version = ++global_version_;
+}
+
+/// [@coolight] 用于支持覆盖值，[write] 是追加值
+void GraphState::overwrite(const std::string& channel, const json& value) {
+    std::unique_lock lock(mutex_);
+    auto             it = channels_.find(channel);
+    if (it == channels_.end()) {
+        throw std::runtime_error("Write to unknown channel: '" + channel +
+                                 "'. "
+                                 "Declared channels: " +
+                                 declared_channel_list(channels_) +
+                                 ". "
+                                 "Channel names are case-sensitive; add it to the graph "
+                                 "definition's \"channels\" block before writing. "
+                                 "See docs/troubleshooting.md \"Write to unknown channel\".");
+    }
+    auto& ch   = it->second;
+    ch.value   = value;
     ch.version = ++global_version_;
 }
 
@@ -77,14 +98,16 @@ void GraphState::apply_writes(const std::vector<ChannelWrite>& writes) {
     for (const auto& w : writes) {
         auto it = channels_.find(w.channel);
         if (it == channels_.end()) {
-            throw std::runtime_error(
-                "Write to unknown channel: '" + w.channel + "'. "
-                "Declared channels: " + declared_channel_list(channels_) + ". "
-                "Channel names are case-sensitive; add it to the graph "
-                "definition's \"channels\" block before writing. "
-                "See docs/troubleshooting.md \"Write to unknown channel\".");
+            throw std::runtime_error("Write to unknown channel: '" + w.channel +
+                                     "'. "
+                                     "Declared channels: " +
+                                     declared_channel_list(channels_) +
+                                     ". "
+                                     "Channel names are case-sensitive; add it to the graph "
+                                     "definition's \"channels\" block before writing. "
+                                     "See docs/troubleshooting.md \"Write to unknown channel\".");
         }
-        auto& ch  = it->second;
+        auto& ch   = it->second;
         ch.value   = ch.reducer(ch.value, w.value);
         ch.version = ++global_version_;
     }
@@ -92,7 +115,7 @@ void GraphState::apply_writes(const std::vector<ChannelWrite>& writes) {
 
 uint64_t GraphState::channel_version(const std::string& channel) const {
     std::shared_lock lock(mutex_);
-    auto it = channels_.find(channel);
+    auto             it = channels_.find(channel);
     return it != channels_.end() ? it->second.version : 0;
 }
 
@@ -103,12 +126,9 @@ uint64_t GraphState::global_version() const {
 
 json GraphState::serialize() const {
     std::shared_lock lock(mutex_);
-    json data;
+    json             data;
     for (const auto& [name, ch] : channels_) {
-        data["channels"][name] = {
-            {"value",   ch.value},
-            {"version", ch.version}
-        };
+        data["channels"][name] = {{"value", ch.value}, {"version", ch.version}};
     }
     data["global_version"] = global_version_;
     return data;
@@ -129,7 +149,7 @@ void GraphState::restore(const json& data) {
 }
 
 std::vector<std::string> GraphState::channel_names() const {
-    std::shared_lock lock(mutex_);
+    std::shared_lock         lock(mutex_);
     std::vector<std::string> names;
     for (const auto& [name, _] : channels_) {
         names.push_back(name);
@@ -140,4 +160,4 @@ std::vector<std::string> GraphState::channel_names() const {
 // v1.0 (9d): run_cancel_token smuggling channel is gone; cancel flows
 // through RunContext::cancel_token instead.
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
