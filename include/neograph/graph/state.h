@@ -10,6 +10,7 @@
 
 #include <neograph/api.h>
 #include <neograph/graph/types.h>
+
 #include <mutex>
 #include <shared_mutex>
 #include <vector>
@@ -33,9 +34,9 @@ public:
      * @param initial_value Initial channel value (default: null).
      */
     void init_channel(const std::string& name,
-                      ReducerType type,
-                      ReducerFn reducer,
-                      const json& initial_value = json());
+                      ReducerType        type,
+                      ReducerFn          reducer,
+                      const json&        initial_value = json());
 
     /**
      * @brief Read a channel's current value (thread-safe, shared lock).
@@ -56,6 +57,8 @@ public:
      * @param value Value to merge via the channel's reducer.
      */
     void write(const std::string& channel, const json& value);
+
+    void overwrite(const std::string& channel, const json& value);
 
     /**
      * @brief Apply a batch of channel writes atomically (exclusive lock).
@@ -107,8 +110,8 @@ public:
 
 private:
     std::map<std::string, Channel> channels_;
-    uint64_t global_version_ = 0;
-    mutable std::shared_mutex mutex_;
+    uint64_t                       global_version_ = 0;
+    mutable std::shared_mutex      mutex_;
 };
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
