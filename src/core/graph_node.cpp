@@ -1,7 +1,9 @@
-#include <neograph/graph/node.h>
-#include <neograph/graph/engine.h>   // RunContext (forward-declared in node.h)
 #include <neograph/async/run_sync.h>
+#include <neograph/graph/engine.h>  // RunContext (forward-declared in node.h)
+#include <neograph/graph/node.h>
+
 #include <algorithm>
+#include <iostream>
 #include <stdexcept>
 
 namespace neograph::graph {
@@ -22,21 +24,19 @@ namespace neograph::graph {
 // =========================================================================
 
 LLMCallNode::LLMCallNode(const std::string& name, const NodeContext& ctx)
-    : name_(name)
-    , provider_(ctx.provider)
-    , tools_(ctx.tools)
-    , model_(ctx.model)
-    , instructions_(ctx.instructions)
-{}
+    : name_(name),
+      provider_(ctx.provider),
+      tools_(ctx.tools),
+      model_(ctx.model),
+      instructions_(ctx.instructions) {}
 
 CompletionParams LLMCallNode::build_params(const GraphState& state) const {
     auto messages = state.get_messages();
 
     // Ensure system message (mirrors Agent::ensure_system_message)
     if (!instructions_.empty()) {
-        bool has_system = !messages.empty()
-                          && messages[0].role == "system"
-                          && messages[0].content == instructions_;
+        // [@coolight] 当存在 system 消息时不再添加
+        bool has_system = !messages.empty() && messages[0].role == "system";
         if (!has_system) {
             ChatMessage sys;
             sys.role    = "system";
@@ -77,11 +77,10 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     // default. See PR #40.
     StreamCallback on_token;
     if (in.stream_cb) {
-        const GraphStreamCallback& cb = *in.stream_cb;
-        std::string node_name = name_;
-        on_token = [&cb, node_name](const std::string& token) {
-            cb(GraphEvent{GraphEvent::Type::LLM_TOKEN,
-                          node_name, json(token)});
+        const GraphStreamCallback& cb        = *in.stream_cb;
+        std::string                node_name = name_;
+        on_token                             = [&cb, node_name](const std::string& token) {
+            cb(GraphEvent{GraphEvent::Type::LLM_TOKEN, node_name, json(token)});
         };
     }
     auto completion = co_await provider_->invoke(params, on_token);
@@ -90,8 +89,7 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     to_json(msg_json, completion.message);
 
     NodeOutput out;
-    out.writes.push_back(
-        ChannelWrite{"messages", json::array({msg_json})});
+    out.writes.push_back(ChannelWrite{"messages", json::array({msg_json})});
     co_return out;
 }
 
@@ -100,9 +98,7 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
 // =========================================================================
 
 ToolDispatchNode::ToolDispatchNode(const std::string& name, const NodeContext& ctx)
-    : name_(name)
-    , tools_(ctx.tools)
-{}
+    : name_(name), tools_(ctx.tools) {}
 
 asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     auto messages = in.state.get_messages();
@@ -123,7 +119,7 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
 
     for (const auto& tc : assistant_msg->tool_calls) {
         auto it = std::find_if(tools_.begin(), tools_.end(),
-            [&](Tool* t) { return t->get_name() == tc.name; });
+                               [&](Tool* t) { return t->get_name() == tc.name; });
 
         ChatMessage tool_msg;
         tool_msg.role         = "tool";
@@ -134,7 +130,7 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
             tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
         } else {
             try {
-                auto args = json::parse(tc.arguments);
+                auto args        = json::parse(tc.arguments);
                 tool_msg.content = (*it)->execute(args);
             } catch (const std::exception& e) {
                 tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
@@ -155,15 +151,15 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
 // IntentClassifierNode
 // =========================================================================
 
-IntentClassifierNode::IntentClassifierNode(
-    const std::string& name, const NodeContext& ctx,
-    const std::string& prompt, std::vector<std::string> valid_routes)
-    : name_(name)
-    , provider_(ctx.provider)
-    , model_(ctx.model)
-    , prompt_(prompt)
-    , valid_routes_(std::move(valid_routes))
-{}
+IntentClassifierNode::IntentClassifierNode(const std::string&       name,
+                                           const NodeContext&       ctx,
+                                           const std::string&       prompt,
+                                           std::vector<std::string> valid_routes)
+    : name_(name),
+      provider_(ctx.provider),
+      model_(ctx.model),
+      prompt_(prompt),
+      valid_routes_(std::move(valid_routes)) {}
 
 CompletionParams IntentClassifierNode::build_params(const GraphState& state) const {
     auto messages = state.get_messages();
@@ -188,16 +184,16 @@ CompletionParams IntentClassifierNode::build_params(const GraphState& state) con
     }
 
     CompletionParams params;
-    params.model = model_;
+    params.model       = model_;
     params.temperature = 0.0f;
-    params.max_tokens = 20;
+    params.max_tokens  = 20;
 
     ChatMessage sys_msg;
-    sys_msg.role = "system";
+    sys_msg.role    = "system";
     sys_msg.content = sys_prompt;
 
     ChatMessage usr_msg;
-    usr_msg.role = "user";
+    usr_msg.role    = "user";
     usr_msg.content = user_content;
 
     params.messages = {std::move(sys_msg), std::move(usr_msg)};
@@ -218,20 +214,20 @@ std::vector<ChannelWrite> IntentClassifierNode::route_from(const std::string& in
 }
 
 asio::awaitable<NodeOutput> IntentClassifierNode::run(NodeInput in) {
-    auto params = build_params(in.state);
+    auto params         = build_params(in.state);
     params.cancel_token = in.ctx.cancel_token;
 
     // Candidate 6 PR2: same invoke() unification as LLMCallNode above.
     StreamCallback on_token;
     if (in.stream_cb) {
-        const GraphStreamCallback& cb = *in.stream_cb;
-        std::string node_name = name_;
-        on_token = [&cb, node_name](const std::string& token) {
+        const GraphStreamCallback& cb        = *in.stream_cb;
+        std::string                node_name = name_;
+        on_token                             = [&cb, node_name](const std::string& token) {
             cb(GraphEvent{GraphEvent::Type::LLM_TOKEN, node_name, json(token)});
         };
     }
-    auto completion = co_await provider_->invoke(params, on_token);
-    ChatMessage reply = std::move(completion.message);
+    auto completion                  = co_await provider_->invoke(params, on_token);
+    ChatMessage                reply = std::move(completion.message);
 
     NodeOutput out;
     out.writes = route_from(reply.content);
@@ -242,15 +238,14 @@ asio::awaitable<NodeOutput> IntentClassifierNode::run(NodeInput in) {
 // SubgraphNode
 // =========================================================================
 
-SubgraphNode::SubgraphNode(const std::string& name,
-                           std::shared_ptr<GraphEngine> subgraph,
+SubgraphNode::SubgraphNode(const std::string&                 name,
+                           std::shared_ptr<GraphEngine>       subgraph,
                            std::map<std::string, std::string> input_map,
                            std::map<std::string, std::string> output_map)
-    : name_(name)
-    , subgraph_(std::move(subgraph))
-    , input_map_(std::move(input_map))
-    , output_map_(std::move(output_map))
-{}
+    : name_(name),
+      subgraph_(std::move(subgraph)),
+      input_map_(std::move(input_map)),
+      output_map_(std::move(output_map)) {}
 
 json SubgraphNode::build_subgraph_input(const GraphState& state) const {
     json input;
@@ -269,9 +264,7 @@ json SubgraphNode::build_subgraph_input(const GraphState& state) const {
     return input;
 }
 
-std::vector<ChannelWrite> SubgraphNode::extract_output(
-    const json& subgraph_output) const {
-
+std::vector<ChannelWrite> SubgraphNode::extract_output(const json& subgraph_output) const {
     std::vector<ChannelWrite> writes;
 
     if (!subgraph_output.contains("channels")) return writes;
@@ -305,10 +298,10 @@ asio::awaitable<NodeOutput> SubgraphNode::run(NodeInput in) {
         // Forward the parent's stream sink so subgraph events (LLM
         // tokens, node enter/exit, etc.) surface at the parent
         // graph's caller without buffering.
-        auto result = co_await subgraph_->run_stream_async(config, *in.stream_cb);
+        auto result     = co_await subgraph_->run_stream_async(config, *in.stream_cb);
         subgraph_output = std::move(result.output);
     } else {
-        auto result = co_await subgraph_->run_async(config);
+        auto result     = co_await subgraph_->run_async(config);
         subgraph_output = std::move(result.output);
     }
 
@@ -317,4 +310,4 @@ asio::awaitable<NodeOutput> SubgraphNode::run(NodeInput in) {
     co_return out;
 }
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
