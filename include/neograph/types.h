@@ -8,9 +8,10 @@
  */
 #pragma once
 
+#include <neograph/json.h>
+
 #include <string>
 #include <vector>
-#include <neograph/json.h>
 
 namespace neograph {
 
@@ -34,12 +35,15 @@ struct ToolCall {
  * multi-modal content via image_urls for vision-capable models.
  */
 struct ChatMessage {
-    std::string role;                    ///< Message role: "user", "assistant", "tool", or "system".
-    std::string content;                 ///< Text content of the message.
-    std::vector<ToolCall> tool_calls;    ///< Tool calls made by the assistant (if any).
-    std::string tool_call_id;            ///< ID of the tool call being responded to (role == "tool").
-    std::string tool_name;               ///< Name of the tool being called.
-    std::vector<std::string> image_urls; ///< Base64 data URLs or HTTP URLs for vision support.
+    std::string           role;        ///< Message role: "user", "assistant", "tool", or "system".
+    std::string           content;     ///< Text content of the message.
+    std::vector<ToolCall> tool_calls;  ///< Tool calls made by the assistant (if any).
+    std::string tool_call_id;          ///< ID of the tool call being responded to (role == "tool").
+    std::string tool_name;             ///< Name of the tool being called.
+    std::vector<std::string> image_urls;  ///< Base64 data URLs or HTTP URLs for vision support.
+
+    /// [@coolight] 用于支持 修改、重新生成 消息历史
+    std::vector<std::string> history_contents;
 };
 
 /**
@@ -51,7 +55,7 @@ struct ChatMessage {
 struct ChatTool {
     std::string name;         ///< Tool name (must be unique within a session).
     std::string description;  ///< Human-readable description of what the tool does.
-    json parameters;          ///< JSON Schema object describing the tool's parameters.
+    json        parameters;   ///< JSON Schema object describing the tool's parameters.
 };
 
 /**
@@ -62,9 +66,9 @@ struct ChatCompletion {
 
     /// Token usage statistics for the completion.
     struct Usage {
-        int prompt_tokens = 0;      ///< Number of tokens in the prompt.
+        int prompt_tokens     = 0;  ///< Number of tokens in the prompt.
         int completion_tokens = 0;  ///< Number of tokens in the completion.
-        int total_tokens = 0;       ///< Total tokens used (prompt + completion).
+        int total_tokens      = 0;  ///< Total tokens used (prompt + completion).
     } usage;
 };
 
@@ -82,8 +86,8 @@ inline void to_json(json& j, const ToolCall& tc) {
 /// @param[in] j Source JSON object.
 /// @param[out] tc Target ToolCall.
 inline void from_json(const json& j, ToolCall& tc) {
-    tc.id = j.value("id", "");
-    tc.name = j.value("name", "");
+    tc.id        = j.value("id", "");
+    tc.name      = j.value("name", "");
     tc.arguments = j.value("arguments", "");
 }
 
@@ -91,7 +95,7 @@ inline void from_json(const json& j, ToolCall& tc) {
 /// @param[out] j Target JSON object.
 /// @param[in] msg ChatMessage to serialize.
 inline void to_json(json& j, const ChatMessage& msg) {
-    j["role"] = msg.role;
+    j["role"]    = msg.role;
     j["content"] = msg.content;
     if (!msg.tool_calls.empty()) {
         j["tool_calls"] = json::array();
@@ -102,8 +106,8 @@ inline void to_json(json& j, const ChatMessage& msg) {
         }
     }
     if (!msg.tool_call_id.empty()) j["tool_call_id"] = msg.tool_call_id;
-    if (!msg.tool_name.empty())    j["tool_name"] = msg.tool_name;
-    if (!msg.image_urls.empty())   j["image_urls"] = msg.image_urls;
+    if (!msg.tool_name.empty()) j["tool_name"] = msg.tool_name;
+    if (!msg.image_urls.empty()) j["image_urls"] = msg.image_urls;
 }
 
 /// @brief Deserialize a ChatMessage from JSON.
@@ -144,17 +148,15 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
         j["role"] = msg.role;
 
         if (msg.role == "tool") {
-            j["content"] = msg.content;
+            j["content"]      = msg.content;
             j["tool_call_id"] = msg.tool_call_id;
         } else if (!msg.tool_calls.empty()) {
             j["content"] = msg.content.empty() ? json(nullptr) : json(msg.content);
-            json tc_arr = json::array();
+            json tc_arr  = json::array();
             for (const auto& tc : msg.tool_calls) {
-                tc_arr.push_back({
-                    {"id", tc.id},
-                    {"type", "function"},
-                    {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}
-                });
+                tc_arr.push_back({{"id", tc.id},
+                                  {"type", "function"},
+                                  {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}});
             }
             j["tool_calls"] = tc_arr;
         } else if (!msg.image_urls.empty()) {
@@ -185,14 +187,11 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
 inline json tools_to_json(const std::vector<ChatTool>& tools) {
     json arr = json::array();
     for (const auto& tool : tools) {
-        arr.push_back({
-            {"type", "function"},
-            {"function", {
-                {"name", tool.name},
-                {"description", tool.description},
-                {"parameters", tool.parameters}
-            }}
-        });
+        arr.push_back({{"type", "function"},
+                       {"function",
+                        {{"name", tool.name},
+                         {"description", tool.description},
+                         {"parameters", tool.parameters}}}});
     }
     return arr;
 }
@@ -209,17 +208,17 @@ inline json tools_to_json(const std::vector<ChatTool>& tools) {
  */
 inline ChatMessage parse_response_message(const json& choice) {
     ChatMessage msg;
-    auto m = choice.at("message");
-    msg.role = m.value("role", "assistant");
-    msg.content = (m.contains("content") && !m["content"].is_null())
-                  ? m["content"].get<std::string>() : "";
+    auto        m = choice.at("message");
+    msg.role      = m.value("role", "assistant");
+    msg.content =
+        (m.contains("content") && !m["content"].is_null()) ? m["content"].get<std::string>() : "";
 
     if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
         for (const auto& tc : m["tool_calls"]) {
             ToolCall call;
-            call.id = tc.value("id", "");
-            auto fn = tc.at("function");
-            call.name = fn.value("name", "");
+            call.id        = tc.value("id", "");
+            auto fn        = tc.at("function");
+            call.name      = fn.value("name", "");
             call.arguments = fn.value("arguments", "");
             msg.tool_calls.push_back(std::move(call));
         }
@@ -228,4 +227,4 @@ inline ChatMessage parse_response_message(const json& choice) {
     return msg;
 }
 
-} // namespace neograph
+}  // namespace neograph
