@@ -130,7 +130,10 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
             tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
         } else {
             try {
-                auto args        = json::parse(tc.arguments);
+                auto args = json::parse(tc.arguments);
+                if (args.is_object() && args["thread_id"].is_null()) {
+                    args["thread_id"] = in.ctx.thread_id;
+                }
                 tool_msg.content = (*it)->execute(args);
             } catch (const std::exception& e) {
                 tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
