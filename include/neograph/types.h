@@ -108,6 +108,16 @@ inline void to_json(json& j, const ChatMessage& msg) {
     if (!msg.tool_call_id.empty()) j["tool_call_id"] = msg.tool_call_id;
     if (!msg.tool_name.empty()) j["tool_name"] = msg.tool_name;
     if (!msg.image_urls.empty()) j["image_urls"] = msg.image_urls;
+    if (!msg.history_contents.empty()) j["history_contents"] = msg.history_contents;
+}
+
+inline void to_json(json& j, const std::vector<ChatMessage>& msgs) {
+    j = json::array();
+    for (const auto& msg : msgs) {
+        json msgJson;
+        to_json(msgJson, msg);
+        j.push_back(msgJson);
+    }
 }
 
 /// @brief Deserialize a ChatMessage from JSON.
@@ -127,6 +137,9 @@ inline void from_json(const json& j, ChatMessage& msg) {
     msg.tool_name    = j.value("tool_name", "");
     if (j.contains("image_urls") && j["image_urls"].is_array()) {
         msg.image_urls = j["image_urls"].get<std::vector<std::string>>();
+    }
+    if (j.contains("history_contents") && j["history_contents"].is_array()) {
+        msg.history_contents = j["history_contents"].get<std::vector<std::string>>();
     }
 }
 
