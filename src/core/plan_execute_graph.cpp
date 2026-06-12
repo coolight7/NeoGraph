@@ -1,10 +1,10 @@
-#include <neograph/graph/plan_execute_graph.h>
+#include <neograph/async/run_sync.h>
 #include <neograph/graph/engine.h>
 #include <neograph/graph/loader.h>
 #include <neograph/graph/node.h>
+#include <neograph/graph/plan_execute_graph.h>
 #include <neograph/graph/state.h>
 #include <neograph/graph/types.h>
-#include <neograph/async/run_sync.h>
 
 #include <algorithm>
 #include <cctype>
@@ -20,8 +20,7 @@ namespace {
 // and a numbered/bulleted list fallback.
 // =========================================================================
 std::vector<std::string> extract_plan(const std::string& text) {
-    auto try_parse_array = [](const std::string& candidate)
-                               -> std::vector<std::string> {
+    auto try_parse_array = [](const std::string& candidate) -> std::vector<std::string> {
         try {
             auto j = json::parse(candidate);
             if (!j.is_array()) return {};
@@ -40,14 +39,13 @@ std::vector<std::string> extract_plan(const std::string& text) {
     if (!plan.empty()) return plan;
 
     const std::string fence = "```";
-    auto fo = text.find(fence);
+    auto              fo    = text.find(fence);
     if (fo != std::string::npos) {
         auto body_start = text.find('\n', fo);
         if (body_start != std::string::npos) {
             auto fc = text.find(fence, body_start);
             if (fc != std::string::npos) {
-                plan = try_parse_array(
-                    text.substr(body_start + 1, fc - body_start - 1));
+                plan = try_parse_array(text.substr(body_start + 1, fc - body_start - 1));
                 if (!plan.empty()) return plan;
             }
         }
@@ -61,20 +59,22 @@ std::vector<std::string> extract_plan(const std::string& text) {
     }
 
     std::istringstream ss(text);
-    std::string line;
+    std::string        line;
     while (std::getline(ss, line)) {
         auto pos = line.find_first_not_of(" \t");
         if (pos == std::string::npos) continue;
-        size_t i = pos;
-        bool accepted = false;
+        size_t i        = pos;
+        bool   accepted = false;
         if (i < line.size() && std::isdigit(static_cast<unsigned char>(line[i]))) {
-            while (i < line.size() &&
-                   std::isdigit(static_cast<unsigned char>(line[i]))) ++i;
+            while (i < line.size() && std::isdigit(static_cast<unsigned char>(line[i])))
+                ++i;
             if (i < line.size() && (line[i] == '.' || line[i] == ')')) {
-                ++i; accepted = true;
+                ++i;
+                accepted = true;
             }
         } else if (i < line.size() && (line[i] == '-' || line[i] == '*')) {
-            ++i; accepted = true;
+            ++i;
+            accepted = true;
         }
         if (!accepted) continue;
         while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i])))
@@ -90,25 +90,32 @@ std::vector<std::string> extract_plan(const std::string& text) {
 // =========================================================================
 class PlannerNode : public GraphNode {
 public:
-    PlannerNode(std::string name, std::shared_ptr<Provider> provider,
-                std::string model, std::string prompt)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , model_(std::move(model))
-        , prompt_(std::move(prompt)) {}
+    PlannerNode(std::string               name,
+                std::shared_ptr<Provider> provider,
+                std::string               model,
+                std::string               prompt)
+        : name_(std::move(name)),
+          provider_(std::move(provider)),
+          model_(std::move(model)),
+          prompt_(std::move(prompt)) {}
 
     std::string get_name() const override { return name_; }
 
     asio::awaitable<NodeOutput> run(NodeInput in) override {
-        auto msgs = in.state.get_messages();
+        auto        msgs = in.state.get_messages();
         std::string objective;
         for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
-            if (it->role == "user") { objective = it->content; break; }
+            if (it->role == "user") {
+                objective = it->content;
+                break;
+            }
         }
 
         std::vector<ChatMessage> prompt_msgs;
         if (!prompt_.empty()) {
-            ChatMessage s; s.role = "system"; s.content = prompt_;
+            ChatMessage s;
+            s.role    = "system";
+            s.content = prompt_;
             prompt_msgs.push_back(std::move(s));
         }
         for (auto& m : msgs) {
@@ -117,15 +124,16 @@ public:
         }
 
         CompletionParams params;
-        params.model = model_;
+        params.model    = model_;
         params.messages = std::move(prompt_msgs);
 
-        params.cancel_token = in.ctx.cancel_token;
-        auto completion = co_await provider_->invoke(params, nullptr);
-        auto plan_items = extract_plan(completion.message.content);
+        params.cancel_token                   = in.ctx.cancel_token;
+        auto completion                       = co_await provider_->invoke(params, nullptr);
+        auto                       plan_items = extract_plan(completion.message.content);
 
         json plan_json = json::array();
-        for (auto& s : plan_items) plan_json.push_back(json(s));
+        for (auto& s : plan_items)
+            plan_json.push_back(json(s));
 
         NodeOutput out;
         out.writes.push_back(ChannelWrite{"objective", json(objective)});
@@ -134,10 +142,10 @@ public:
     }
 
 private:
-    std::string name_;
+    std::string               name_;
     std::shared_ptr<Provider> provider_;
-    std::string model_;
-    std::string prompt_;
+    std::string               model_;
+    std::string               prompt_;
 };
 
 // =========================================================================
@@ -146,15 +154,18 @@ private:
 // =========================================================================
 class ExecutorNode : public GraphNode {
 public:
-    ExecutorNode(std::string name, std::shared_ptr<Provider> provider,
-                 std::vector<Tool*> tools, std::string model,
-                 std::string prompt, int max_iter)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , tools_(std::move(tools))
-        , model_(std::move(model))
-        , prompt_(std::move(prompt))
-        , max_iter_(max_iter) {}
+    ExecutorNode(std::string               name,
+                 std::shared_ptr<Provider> provider,
+                 std::vector<Tool*>        tools,
+                 std::string               model,
+                 std::string               prompt,
+                 int                       max_iter)
+        : name_(std::move(name)),
+          provider_(std::move(provider)),
+          tools_(std::move(tools)),
+          model_(std::move(model)),
+          prompt_(std::move(prompt)),
+          max_iter_(max_iter) {}
 
     std::string get_name() const override { return name_; }
 
@@ -170,28 +181,33 @@ public:
 
         std::vector<ChatMessage> convo;
         if (!prompt_.empty()) {
-            ChatMessage s; s.role = "system"; s.content = prompt_;
+            ChatMessage s;
+            s.role    = "system";
+            s.content = prompt_;
             convo.push_back(std::move(s));
         }
         {
-            ChatMessage u; u.role = "user"; u.content = step;
+            ChatMessage u;
+            u.role    = "user";
+            u.content = step;
             convo.push_back(std::move(u));
         }
 
         std::vector<ChatTool> tool_defs;
         tool_defs.reserve(tools_.size());
-        for (auto* t : tools_) tool_defs.push_back(t->get_definition());
+        for (auto* t : tools_)
+            tool_defs.push_back(t->get_definition());
 
         std::string result_text;
         for (int iter = 0; iter < max_iter_; ++iter) {
             CompletionParams params;
-            params.model = model_;
+            params.model    = model_;
             params.messages = convo;
-            params.tools = tool_defs;
+            params.tools    = tool_defs;
 
-            params.cancel_token = in.ctx.cancel_token;
-            auto completion = co_await provider_->invoke(params, nullptr);
-            auto& msg = completion.message;
+            params.cancel_token            = in.ctx.cancel_token;
+            auto completion                = co_await provider_->invoke(params, nullptr);
+            auto&                      msg = completion.message;
             convo.push_back(msg);
 
             if (msg.tool_calls.empty()) {
@@ -200,18 +216,18 @@ public:
             }
 
             for (const auto& tc : msg.tool_calls) {
-                auto it = std::find_if(tools_.begin(), tools_.end(),
-                    [&](Tool* t) { return t->get_name() == tc.name; });
+                auto        it = std::find_if(tools_.begin(), tools_.end(),
+                                              [&](Tool* t) { return t->get_name() == tc.name; });
                 ChatMessage tm;
-                tm.role = "tool";
+                tm.role         = "tool";
                 tm.tool_call_id = tc.id;
-                tm.tool_name = tc.name;
+                tm.tool_name    = tc.name;
                 if (it == tools_.end()) {
                     tm.content = R"({"error":"Tool not found: )" + tc.name + "\"}";
                 } else {
                     try {
-                        auto args = json::parse(tc.arguments);
-                        tm.content = (*it)->execute(args);
+                        auto args  = json::parse(tc.arguments);
+                        tm.content = co_await(*it)->real_execute_async(args);
                     } catch (const std::exception& e) {
                         tm.content = std::string(R"({"error":")") + e.what() + "\"}";
                     }
@@ -221,10 +237,11 @@ public:
         }
 
         json new_plan = json::array();
-        for (size_t i = 1; i < plan.size(); ++i) new_plan.push_back(plan[i]);
+        for (size_t i = 1; i < plan.size(); ++i)
+            new_plan.push_back(plan[i]);
 
-        json step_record = json::object();
-        step_record["step"] = step;
+        json step_record      = json::object();
+        step_record["step"]   = step;
         step_record["result"] = result_text;
 
         NodeOutput out;
@@ -234,12 +251,12 @@ public:
     }
 
 private:
-    std::string name_;
+    std::string               name_;
     std::shared_ptr<Provider> provider_;
-    std::vector<Tool*> tools_;
-    std::string model_;
-    std::string prompt_;
-    int max_iter_;
+    std::vector<Tool*>        tools_;
+    std::string               model_;
+    std::string               prompt_;
+    int                       max_iter_;
 };
 
 // =========================================================================
@@ -247,56 +264,59 @@ private:
 // =========================================================================
 class ResponderNode : public GraphNode {
 public:
-    ResponderNode(std::string name, std::shared_ptr<Provider> provider,
-                  std::string model, std::string prompt)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , model_(std::move(model))
-        , prompt_(std::move(prompt)) {}
+    ResponderNode(std::string               name,
+                  std::shared_ptr<Provider> provider,
+                  std::string               model,
+                  std::string               prompt)
+        : name_(std::move(name)),
+          provider_(std::move(provider)),
+          model_(std::move(model)),
+          prompt_(std::move(prompt)) {}
 
     std::string get_name() const override { return name_; }
 
     asio::awaitable<NodeOutput> run(NodeInput in) override {
         std::string objective;
-        auto obj = in.state.get("objective");
+        auto        obj = in.state.get("objective");
         if (obj.is_string()) objective = obj.get<std::string>();
 
         std::ostringstream steps_text;
-        auto past = in.state.get("past_steps");
+        auto               past = in.state.get("past_steps");
         if (past.is_array()) {
             for (auto it = past.begin(); it != past.end(); ++it) {
-                auto rec = *it;
-                std::string s = rec.is_object() && rec.contains("step") &&
-                                        rec["step"].is_string()
-                                    ? rec["step"].get<std::string>()
-                                    : "";
-                std::string r = rec.is_object() && rec.contains("result") &&
-                                        rec["result"].is_string()
-                                    ? rec["result"].get<std::string>()
-                                    : "";
+                auto        rec = *it;
+                std::string s   = rec.is_object() && rec.contains("step") && rec["step"].is_string()
+                                      ? rec["step"].get<std::string>()
+                                      : "";
+                std::string r =
+                    rec.is_object() && rec.contains("result") && rec["result"].is_string()
+                        ? rec["result"].get<std::string>()
+                        : "";
                 steps_text << "- " << s << "\n  -> " << r << "\n";
             }
         }
 
         std::vector<ChatMessage> convo;
         if (!prompt_.empty()) {
-            ChatMessage s; s.role = "system"; s.content = prompt_;
+            ChatMessage s;
+            s.role    = "system";
+            s.content = prompt_;
             convo.push_back(std::move(s));
         }
         {
-            ChatMessage u; u.role = "user";
-            u.content = "Objective:\n" + objective +
-                        "\n\nCompleted steps:\n" + steps_text.str() +
+            ChatMessage u;
+            u.role    = "user";
+            u.content = "Objective:\n" + objective + "\n\nCompleted steps:\n" + steps_text.str() +
                         "\nProduce the final answer for the user.";
             convo.push_back(std::move(u));
         }
 
         CompletionParams params;
-        params.model = model_;
+        params.model    = model_;
         params.messages = std::move(convo);
 
         params.cancel_token = in.ctx.cancel_token;
-        auto completion = co_await provider_->invoke(params, nullptr);
+        auto completion     = co_await provider_->invoke(params, nullptr);
 
         json asst_json;
         to_json(asst_json, completion.message);
@@ -308,10 +328,10 @@ public:
     }
 
 private:
-    std::string name_;
+    std::string               name_;
     std::shared_ptr<Provider> provider_;
-    std::string model_;
-    std::string prompt_;
+    std::string               model_;
+    std::string               prompt_;
 };
 
 // =========================================================================
@@ -320,33 +340,33 @@ private:
 void ensure_registrations_once() {
     static std::once_flag once;
     std::call_once(once, [] {
-        NodeFactory::instance().register_type("__pe_planner",
+        NodeFactory::instance().register_type(
+            "__pe_planner",
             [](const std::string& name, const json& config,
                const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
-                return std::make_unique<PlannerNode>(
-                    name, ctx.provider, ctx.model,
-                    config.value("prompt", std::string{}));
+                return std::make_unique<PlannerNode>(name, ctx.provider, ctx.model,
+                                                     config.value("prompt", std::string{}));
             });
 
-        NodeFactory::instance().register_type("__pe_executor",
+        NodeFactory::instance().register_type(
+            "__pe_executor",
             [](const std::string& name, const json& config,
                const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
-                return std::make_unique<ExecutorNode>(
-                    name, ctx.provider, ctx.tools, ctx.model,
-                    config.value("prompt", std::string{}),
-                    config.value("max_iter", 5));
+                return std::make_unique<ExecutorNode>(name, ctx.provider, ctx.tools, ctx.model,
+                                                      config.value("prompt", std::string{}),
+                                                      config.value("max_iter", 5));
             });
 
-        NodeFactory::instance().register_type("__pe_responder",
+        NodeFactory::instance().register_type(
+            "__pe_responder",
             [](const std::string& name, const json& config,
                const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
-                return std::make_unique<ResponderNode>(
-                    name, ctx.provider, ctx.model,
-                    config.value("prompt", std::string{}));
+                return std::make_unique<ResponderNode>(name, ctx.provider, ctx.model,
+                                                       config.value("prompt", std::string{}));
             });
 
-        ConditionRegistry::instance().register_condition("plan_empty",
-            [](const GraphState& state) -> std::string {
+        ConditionRegistry::instance().register_condition(
+            "plan_empty", [](const GraphState& state) -> std::string {
                 auto plan = state.get("plan");
                 if (!plan.is_array() || plan.size() == 0) return "true";
                 return "false";
@@ -354,17 +374,15 @@ void ensure_registrations_once() {
     });
 }
 
-} // namespace
+}  // namespace
 
-std::unique_ptr<GraphEngine> create_plan_execute_graph(
-    std::shared_ptr<Provider> provider,
-    std::vector<std::unique_ptr<Tool>> tools,
-    const std::string& planner_prompt,
-    const std::string& executor_prompt,
-    const std::string& responder_prompt,
-    const std::string& model,
-    int max_step_iterations) {
-
+std::unique_ptr<GraphEngine> create_plan_execute_graph(std::shared_ptr<Provider>          provider,
+                                                       std::vector<std::unique_ptr<Tool>> tools,
+                                                       const std::string& planner_prompt,
+                                                       const std::string& executor_prompt,
+                                                       const std::string& responder_prompt,
+                                                       const std::string& model,
+                                                       int                max_step_iterations) {
     ensure_registrations_once();
 
     // Signal-based dispatch (no static predecessor map) lets us express
@@ -372,35 +390,34 @@ std::unique_ptr<GraphEngine> create_plan_execute_graph(
     // self-referential "keep going" branch.
     json definition = {
         {"name", "plan_execute_agent"},
-        {"channels", {
-            {"messages",       {{"reducer", "append"}}},
-            {"plan",           {{"reducer", "overwrite"}}},
-            {"past_steps",     {{"reducer", "append"}}},
-            {"objective",      {{"reducer", "overwrite"}}},
-            {"final_response", {{"reducer", "overwrite"}}}
-        }},
-        {"nodes", {
-            {"planner",   {{"type", "__pe_planner"},   {"prompt", planner_prompt}}},
-            {"executor",  {{"type", "__pe_executor"},
-                           {"prompt", executor_prompt},
-                           {"max_iter", max_step_iterations}}},
-            {"responder", {{"type", "__pe_responder"}, {"prompt", responder_prompt}}}
-        }},
-        {"edges", json::array({
-            {{"from", "__start__"}, {"to", "planner"}},
-            {{"from", "planner"},  {"type", "conditional"},
-             {"condition", "plan_empty"},
-             {"routes", {{"true", "responder"}, {"false", "executor"}}}},
-            {{"from", "executor"}, {"type", "conditional"},
-             {"condition", "plan_empty"},
-             {"routes", {{"true", "responder"}, {"false", "executor"}}}},
-            {{"from", "responder"}, {"to", "__end__"}}
-        })}
-    };
+        {"channels",
+         {{"messages", {{"reducer", "append"}}},
+          {"plan", {{"reducer", "overwrite"}}},
+          {"past_steps", {{"reducer", "append"}}},
+          {"objective", {{"reducer", "overwrite"}}},
+          {"final_response", {{"reducer", "overwrite"}}}}},
+        {"nodes",
+         {{"planner", {{"type", "__pe_planner"}, {"prompt", planner_prompt}}},
+          {"executor",
+           {{"type", "__pe_executor"},
+            {"prompt", executor_prompt},
+            {"max_iter", max_step_iterations}}},
+          {"responder", {{"type", "__pe_responder"}, {"prompt", responder_prompt}}}}},
+        {"edges", json::array({{{"from", "__start__"}, {"to", "planner"}},
+                               {{"from", "planner"},
+                                {"type", "conditional"},
+                                {"condition", "plan_empty"},
+                                {"routes", {{"true", "responder"}, {"false", "executor"}}}},
+                               {{"from", "executor"},
+                                {"type", "conditional"},
+                                {"condition", "plan_empty"},
+                                {"routes", {{"true", "responder"}, {"false", "executor"}}}},
+                               {{"from", "responder"}, {"to", "__end__"}}})}};
 
     std::vector<Tool*> tool_ptrs;
     tool_ptrs.reserve(tools.size());
-    for (auto& t : tools) tool_ptrs.push_back(t.get());
+    for (auto& t : tools)
+        tool_ptrs.push_back(t.get());
 
     NodeContext ctx;
     ctx.provider     = std::move(provider);
@@ -413,4 +430,4 @@ std::unique_ptr<GraphEngine> create_plan_execute_graph(
     return engine;
 }
 
-} // namespace neograph::graph
+}  // namespace neograph::graph

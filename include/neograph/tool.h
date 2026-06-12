@@ -26,7 +26,7 @@ namespace neograph {
  * @see neograph::mcp::MCPTool for remote MCP server tools.
  */
 class NEOGRAPH_API Tool {
-  public:
+public:
     virtual ~Tool() = default;
 
     /**
@@ -41,17 +41,14 @@ class NEOGRAPH_API Tool {
     virtual ChatTool get_definition() const = 0;
 
     /**
-     * @brief Execute the tool with the given arguments.
-     * @param arguments JSON object containing the tool's input parameters.
-     * @return Result string to be fed back to the LLM.
-     */
-    virtual std::string execute(const json& arguments) = 0;
-
-    /**
      * @brief Get the tool name.
      * @return Tool name string (must match the name in get_definition()).
      */
     virtual std::string get_name() const = 0;
+
+    virtual std::string execute(const json& arguments) = 0;
+
+    virtual asio::awaitable<std::string> real_execute_async(const json& arguments);
 };
 
 /**
@@ -86,7 +83,7 @@ class NEOGRAPH_API Tool {
  * so this header only needs the asio::awaitable forward declaration.
  */
 class NEOGRAPH_API AsyncTool : public Tool {
-  public:
+public:
     /// Async work — override this. Default would infinitely recurse
     /// against execute(), so an override is mandatory; left non-pure
     /// only because Tool's contract requires execute() to be present
@@ -94,11 +91,9 @@ class NEOGRAPH_API AsyncTool : public Tool {
     /// to acknowledge AsyncTool, which we don't want.
     virtual asio::awaitable<std::string> execute_async(const json& arguments) = 0;
 
-    /// Sync facade — drives execute_async on a private io_context.
-    /// Implemented out-of-line in src/core/tool.cpp so the run_sync
-    /// helper isn't pulled into every translation unit that includes
-    /// `<neograph/tool.h>`.
-    std::string execute(const json& arguments) final;
+    virtual std::string execute(const json& arguments) override final;
+
+    asio::awaitable<std::string> real_execute_async(const json& arguments) override;
 };
 
-} // namespace neograph
+}  // namespace neograph

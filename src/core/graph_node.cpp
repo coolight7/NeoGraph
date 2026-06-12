@@ -117,7 +117,7 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     // Execute each tool call (mirrors agent.cpp:80-104)
     json results = json::array();
 
-    for (const auto& tc : assistant_msg->tool_calls) {
+    auto onExecTool = [&](const neograph::ToolCall& tc) -> asio::awaitable<ChatMessage> {
         auto it = std::find_if(tools_.begin(), tools_.end(),
                                [&](Tool* t) { return t->get_name() == tc.name; });
 
@@ -134,11 +134,20 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
                 if (args.is_object() && args["thread_id"].is_null()) {
                     args["thread_id"] = in.ctx.thread_id;
                 }
-                tool_msg.content = (*it)->execute(args);
+                tool_msg.content = co_await(*it)->real_execute_async(args);
             } catch (const std::exception& e) {
                 tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
             }
         }
+    };
+
+    /// 并发执行 toolcall
+    std::vector<asio::awaitable<ChatMessage>> toolcallResults{};
+    for (const auto& tc : assistant_msg->tool_calls) {
+        toolcallResults.emplace_back(onExecTool(tc));
+    }
+    for (auto& item : toolcallResults) {
+        ChatMessage tool_msg = co_await std::move(item);
 
         json msg_json;
         to_json(msg_json, tool_msg);

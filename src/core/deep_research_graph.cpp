@@ -1,10 +1,10 @@
+#include <neograph/async/run_sync.h>
 #include <neograph/graph/deep_research_graph.h>
 #include <neograph/graph/engine.h>
 #include <neograph/graph/loader.h>
 #include <neograph/graph/node.h>
 #include <neograph/graph/state.h>
 #include <neograph/graph/types.h>
-#include <neograph/async/run_sync.h>
 
 #include <algorithm>
 #include <memory>
@@ -24,7 +24,8 @@ namespace {
 // load-bearing instructions.
 // =========================================================================
 
-constexpr const char* SUPERVISOR_SYSTEM = R"(You are a lead research supervisor. Given a research brief, decompose it into focused sub-topics and dispatch parallel researchers.
+constexpr const char* SUPERVISOR_SYSTEM =
+    R"(You are a lead research supervisor. Given a research brief, decompose it into focused sub-topics and dispatch parallel researchers.
 
 Tools:
   - conduct_research(research_topic: string): dispatch one sub-researcher. Call MULTIPLE TIMES in a single assistant turn to fan out in parallel.
@@ -38,7 +39,8 @@ HARD RULES (the graph engine depends on these):
   4. Total budget: at most 2 rounds of research. Prefer quality+breadth in round 1 over many shallow rounds.
 )";
 
-constexpr const char* RESEARCHER_SYSTEM = R"(You are a focused researcher. You were given ONE topic. Investigate it using your tools and return rich, citation-backed findings.
+constexpr const char* RESEARCHER_SYSTEM =
+    R"(You are a focused researcher. You were given ONE topic. Investigate it using your tools and return rich, citation-backed findings.
 
 Tools:
   - web_search(query: string): search the web. Returns a list of URLs with titles and snippets.
@@ -59,7 +61,8 @@ constexpr const char* COMPRESS_SYSTEM = R"(Compress raw research notes into a te
   * Output ONLY the summary, no preamble. Bulleted markdown is fine.
 )";
 
-constexpr const char* FINAL_REPORT_SYSTEM = R"(You are a senior analyst writing a final research report. You will be given:
+constexpr const char* FINAL_REPORT_SYSTEM =
+    R"(You are a senior analyst writing a final research report. You will be given:
   1. The original research brief.
   2. A collection of findings from sub-researchers (each already compressed).
 
@@ -80,67 +83,46 @@ Output ONLY the final report. No preamble, no "here is the report" framing.
 // Build a ChatTool definition that Claude will emit as `tool_use`. The
 // arguments JSON is interpreted downstream by SupervisorDispatchNode /
 // the researcher loop.
-ChatTool make_tool(const char* name, const char* description,
-                   const json& parameters) {
+ChatTool make_tool(const char* name, const char* description, const json& parameters) {
     return {name, description, parameters};
 }
 
 std::vector<ChatTool> supervisor_tool_defs() {
-    return {
-        make_tool(
-            "conduct_research",
-            "Dispatch a focused sub-researcher on one topic. Call multiple times "
-            "in one turn to fan out in parallel.",
-            json{
-                {"type", "object"},
-                {"properties", {
-                    {"research_topic", {
-                        {"type", "string"},
-                        {"description",
-                         "A self-contained paragraph describing the topic to "
-                         "research, including context and specific questions."}
-                    }}
-                }},
-                {"required", json::array({"research_topic"})}
-            }),
-        make_tool(
-            "think_tool",
-            "Record a private reflection between research rounds. Does not "
-            "dispatch any action; use this to plan.",
-            json{
-                {"type", "object"},
-                {"properties", {
-                    {"reflection", {{"type", "string"}}}
-                }},
-                {"required", json::array({"reflection"})}
-            }),
-        make_tool(
-            "research_complete",
-            "Signal that research coverage is sufficient and it is time to "
-            "write the final report. Takes no arguments.",
-            json{
-                {"type", "object"},
-                {"properties", json::object()}
-            })
-    };
+    return {make_tool("conduct_research",
+                      "Dispatch a focused sub-researcher on one topic. Call multiple times "
+                      "in one turn to fan out in parallel.",
+                      json{{"type", "object"},
+                           {"properties",
+                            {{"research_topic",
+                              {{"type", "string"},
+                               {"description",
+                                "A self-contained paragraph describing the topic to "
+                                "research, including context and specific questions."}}}}},
+                           {"required", json::array({"research_topic"})}}),
+            make_tool("think_tool",
+                      "Record a private reflection between research rounds. Does not "
+                      "dispatch any action; use this to plan.",
+                      json{{"type", "object"},
+                           {"properties", {{"reflection", {{"type", "string"}}}}},
+                           {"required", json::array({"reflection"})}}),
+            make_tool("research_complete",
+                      "Signal that research coverage is sufficient and it is time to "
+                      "write the final report. Takes no arguments.",
+                      json{{"type", "object"}, {"properties", json::object()}})};
 }
 
 // think_tool shared with researcher
 ChatTool think_tool_def() {
-    return make_tool(
-        "think_tool",
-        "Record a private reflection between steps. Does not call any external "
-        "service; use to plan.",
-        json{
-            {"type", "object"},
-            {"properties", {{"reflection", {{"type", "string"}}}}},
-            {"required", json::array({"reflection"})}
-        });
+    return make_tool("think_tool",
+                     "Record a private reflection between steps. Does not call any external "
+                     "service; use to plan.",
+                     json{{"type", "object"},
+                          {"properties", {{"reflection", {{"type", "string"}}}}},
+                          {"required", json::array({"reflection"})}});
 }
 
 // Look up the last assistant message with tool_calls in the message log.
-const ChatMessage* last_assistant_with_calls(
-    const std::vector<ChatMessage>& msgs) {
+const ChatMessage* last_assistant_with_calls(const std::vector<ChatMessage>& msgs) {
     for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) {
         if (it->role == "assistant" && !it->tool_calls.empty()) return &(*it);
     }
@@ -153,10 +135,10 @@ ChatMessage tool_result_msg(const std::string& tool_call_id,
                             const std::string& tool_name,
                             const std::string& content) {
     ChatMessage m;
-    m.role = "tool";
+    m.role         = "tool";
     m.tool_call_id = tool_call_id;
-    m.tool_name = tool_name;
-    m.content = content;
+    m.tool_name    = tool_name;
+    m.content      = content;
     return m;
 }
 
@@ -168,11 +150,8 @@ ChatMessage tool_result_msg(const std::string& tool_call_id,
 // =========================================================================
 class SupervisorLLMNode : public GraphNode {
 public:
-    SupervisorLLMNode(std::string name, std::shared_ptr<Provider> provider,
-                      std::string model)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , model_(std::move(model)) {}
+    SupervisorLLMNode(std::string name, std::shared_ptr<Provider> provider, std::string model)
+        : name_(std::move(name)), provider_(std::move(provider)), model_(std::move(model)) {}
 
     std::string get_name() const override { return name_; }
 
@@ -182,7 +161,7 @@ public:
         // System prompt first.
         {
             ChatMessage s;
-            s.role = "system";
+            s.role    = "system";
             s.content = SUPERVISOR_SYSTEM;
             convo.push_back(std::move(s));
         }
@@ -200,33 +179,37 @@ public:
         // If the conversation is empty, seed it with the research brief as
         // the first user message.
         bool has_user = false;
-        for (const auto& m : convo) if (m.role == "user") { has_user = true; break; }
+        for (const auto& m : convo)
+            if (m.role == "user") {
+                has_user = true;
+                break;
+            }
         if (!has_user) {
-            auto brief = in.state.get("research_brief");
+            auto        brief = in.state.get("research_brief");
             ChatMessage u;
             u.role = "user";
-            u.content = brief.is_string() ? brief.get<std::string>()
-                                          : "Please research the given query.";
+            u.content =
+                brief.is_string() ? brief.get<std::string>() : "Please research the given query.";
             convo.push_back(std::move(u));
         }
 
         CompletionParams params;
-        params.model = model_;
-        params.messages = std::move(convo);
-        params.tools = supervisor_tool_defs();
+        params.model       = model_;
+        params.messages    = std::move(convo);
+        params.tools       = supervisor_tool_defs();
         params.temperature = 0.3f;
-        params.max_tokens = 2048;
+        params.max_tokens  = 2048;
 
         params.cancel_token = in.ctx.cancel_token;
-        auto completion = co_await provider_->invoke(params, nullptr);
+        auto completion     = co_await provider_->invoke(params, nullptr);
 
         json asst;
         to_json(asst, completion.message);
 
         // Track how many supervisor rounds have run — dispatcher uses this
         // as a safety cap.
-        int iter = 0;
-        auto cur = in.state.get("supervisor_iterations");
+        int  iter = 0;
+        auto cur  = in.state.get("supervisor_iterations");
         if (cur.is_number_integer()) iter = cur.get<int>();
 
         NodeOutput out;
@@ -252,24 +235,21 @@ private:
 // =========================================================================
 class SupervisorDispatchNode : public GraphNode {
 public:
-    SupervisorDispatchNode(std::string name, int max_iterations,
-                           int max_concurrent)
-        : name_(std::move(name))
-        , max_iter_(max_iterations)
-        , max_concurrent_(max_concurrent) {}
+    SupervisorDispatchNode(std::string name, int max_iterations, int max_concurrent)
+        : name_(std::move(name)), max_iter_(max_iterations), max_concurrent_(max_concurrent) {}
 
     std::string get_name() const override { return name_; }
 
     asio::awaitable<NodeOutput> run(NodeInput in) override {
         NodeOutput nr;
 
-        int iter = 0;
-        auto cur = in.state.get("supervisor_iterations");
+        int  iter = 0;
+        auto cur  = in.state.get("supervisor_iterations");
         if (cur.is_number_integer()) iter = cur.get<int>();
 
         // Parse supervisor_messages and find the tail assistant tool-calls.
         std::vector<ChatMessage> sv_msgs;
-        auto sv = in.state.get("supervisor_messages");
+        auto                     sv = in.state.get("supervisor_messages");
         if (sv.is_array()) {
             for (auto it = sv.begin(); it != sv.end(); ++it) {
                 ChatMessage m;
@@ -316,7 +296,7 @@ public:
         std::vector<ToolCall> think_calls;
         std::vector<ToolCall> research_complete_calls;
         std::vector<ToolCall> unknown_calls;
-        int research_seen = 0;
+        int                   research_seen = 0;
 
         for (const auto& tc : last->tool_calls) {
             if (tc.name == "conduct_research") {
@@ -340,7 +320,8 @@ public:
         // paired by the researcher fan-in instead.
         auto build_echo = [](const ToolCall& tc, const std::string& content) {
             auto m = tool_result_msg(tc.id, tc.name, content);
-            json j; to_json(j, m);
+            json j;
+            to_json(j, m);
             return j;
         };
 
@@ -350,26 +331,25 @@ public:
             std::string content = "noted";
             try {
                 auto args = json::parse(tc.arguments);
-                if (args.contains("reflection") &&
-                    args["reflection"].is_string()) {
-                    content = "reflection logged: "
-                        + args["reflection"].get<std::string>();
+                if (args.contains("reflection") && args["reflection"].is_string()) {
+                    content = "reflection logged: " + args["reflection"].get<std::string>();
                 }
-            } catch (...) { /* keep fallback */ }
+            } catch (...) { /* keep fallback */
+            }
             sv_updates.push_back(build_echo(tc, content));
         }
 
         for (const auto& tc : research_calls_skipped) {
-            sv_updates.push_back(build_echo(tc,
-                "skipped: conduct_research concurrency cap ("
-                + std::to_string(max_concurrent_)
-                + ") hit within this turn"));
+            sv_updates.push_back(build_echo(tc, "skipped: conduct_research concurrency cap (" +
+                                                    std::to_string(max_concurrent_) +
+                                                    ") hit within this turn"));
         }
 
         for (const auto& tc : unknown_calls) {
-            sv_updates.push_back(build_echo(tc,
-                "unknown tool name; ignored. Valid tools: conduct_research, "
-                "think_tool, research_complete"));
+            sv_updates.push_back(
+                build_echo(tc,
+                           "unknown tool name; ignored. Valid tools: conduct_research, "
+                           "think_tool, research_complete"));
         }
 
         // research_complete wins: short-circuit to final_report, echoing
@@ -384,11 +364,10 @@ public:
             // back to supervisor, no Claude call observes these messages —
             // we still write them for a clean conversation log.
             for (const auto& tc : research_calls_to_dispatch) {
-                sv_updates.push_back(build_echo(tc,
-                    "not dispatched: research_complete signalled in same turn"));
+                sv_updates.push_back(
+                    build_echo(tc, "not dispatched: research_complete signalled in same turn"));
             }
-            nr.writes.push_back(
-                ChannelWrite{"supervisor_messages", sv_updates});
+            nr.writes.push_back(ChannelWrite{"supervisor_messages", sv_updates});
             nr.command = Command{"final_report", {}};
             co_return nr;
         }
@@ -398,11 +377,10 @@ public:
         // for debug inspection and future resume semantics).
         if (iter >= max_iter_) {
             for (const auto& tc : research_calls_to_dispatch) {
-                sv_updates.push_back(build_echo(tc,
-                    "not dispatched: supervisor iteration budget exhausted"));
+                sv_updates.push_back(
+                    build_echo(tc, "not dispatched: supervisor iteration budget exhausted"));
             }
-            nr.writes.push_back(
-                ChannelWrite{"supervisor_messages", sv_updates});
+            nr.writes.push_back(ChannelWrite{"supervisor_messages", sv_updates});
             nr.command = Command{"final_report", {}};
             co_return nr;
         }
@@ -411,8 +389,7 @@ public:
         // (no research to actually run), loop back to let it try again.
         if (research_calls_to_dispatch.empty()) {
             if (!sv_updates.empty()) {
-                nr.writes.push_back(
-                    ChannelWrite{"supervisor_messages", sv_updates});
+                nr.writes.push_back(ChannelWrite{"supervisor_messages", sv_updates});
             }
             nr.command = Command{"supervisor", {}};
             co_return nr;
@@ -424,16 +401,14 @@ public:
             std::string topic;
             try {
                 auto args = json::parse(tc.arguments);
-                if (args.contains("research_topic") &&
-                    args["research_topic"].is_string()) {
+                if (args.contains("research_topic") && args["research_topic"].is_string()) {
                     topic = args["research_topic"].get<std::string>();
                 }
-            } catch (...) { /* empty topic handled by researcher */ }
+            } catch (...) { /* empty topic handled by researcher */
+            }
 
-            nr.sends.push_back(Send{"researcher", json{
-                {"current_topic",    topic},
-                {"current_call_id",  tc.id}
-            }});
+            nr.sends.push_back(
+                Send{"researcher", json{{"current_topic", topic}, {"current_call_id", tc.id}}});
         }
 
         // Write the think/skipped/unknown echoes alongside the Sends. The
@@ -441,8 +416,7 @@ public:
         // Claude schema's consecutive-user-role merging concatenates them
         // into a single valid tool_result content array.
         if (!sv_updates.empty()) {
-            nr.writes.push_back(
-                ChannelWrite{"supervisor_messages", sv_updates});
+            nr.writes.push_back(ChannelWrite{"supervisor_messages", sv_updates});
         }
 
         // After Sends finish and fan-in, edge routes back to supervisor.
@@ -466,14 +440,16 @@ private:
 // =========================================================================
 class ResearcherNode : public GraphNode {
 public:
-    ResearcherNode(std::string name, std::shared_ptr<Provider> provider,
-                   std::vector<Tool*> tools, std::string model,
-                   int max_iterations)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , tools_(std::move(tools))
-        , model_(std::move(model))
-        , max_iter_(max_iterations) {}
+    ResearcherNode(std::string               name,
+                   std::shared_ptr<Provider> provider,
+                   std::vector<Tool*>        tools,
+                   std::string               model,
+                   int                       max_iterations)
+        : name_(std::move(name)),
+          provider_(std::move(provider)),
+          tools_(std::move(tools)),
+          model_(std::move(model)),
+          max_iter_(max_iterations) {}
 
     std::string get_name() const override { return name_; }
 
@@ -492,20 +468,25 @@ public:
         if (topic.empty()) {
             // Supervisor emitted a malformed conduct_research; record a
             // terse failure note so the supervisor sees something.
-            co_return NodeOutput{fanin_writes(call_id, topic,
-                "(researcher received empty topic; skipped)")};
+            co_return NodeOutput{
+                fanin_writes(call_id, topic, "(researcher received empty topic; skipped)")};
         }
 
         std::vector<ChatTool> tool_defs;
         tool_defs.reserve(tools_.size() + 1);
-        for (auto* t : tools_) tool_defs.push_back(t->get_definition());
+        for (auto* t : tools_)
+            tool_defs.push_back(t->get_definition());
         tool_defs.push_back(think_tool_def());
 
         std::vector<ChatMessage> convo;
         {
-            ChatMessage s; s.role = "system"; s.content = RESEARCHER_SYSTEM;
+            ChatMessage s;
+            s.role    = "system";
+            s.content = RESEARCHER_SYSTEM;
             convo.push_back(std::move(s));
-            ChatMessage u; u.role = "user"; u.content = topic;
+            ChatMessage u;
+            u.role    = "user";
+            u.content = topic;
             convo.push_back(std::move(u));
         }
 
@@ -513,15 +494,15 @@ public:
 
         for (int iter = 0; iter < max_iter_; ++iter) {
             CompletionParams params;
-            params.model = model_;
-            params.messages = convo;
-            params.tools = tool_defs;
+            params.model       = model_;
+            params.messages    = convo;
+            params.tools       = tool_defs;
             params.temperature = 0.3f;
-            params.max_tokens = 2048;
+            params.max_tokens  = 2048;
 
-            params.cancel_token = in.ctx.cancel_token;
-            auto completion = co_await provider_->invoke(params, nullptr);
-            auto& msg = completion.message;
+            params.cancel_token            = in.ctx.cancel_token;
+            auto completion                = co_await provider_->invoke(params, nullptr);
+            auto&                      msg = completion.message;
             convo.push_back(msg);
 
             if (msg.tool_calls.empty()) {
@@ -532,9 +513,9 @@ public:
             // Execute each tool call, append paired tool-result messages.
             for (const auto& tc : msg.tool_calls) {
                 ChatMessage tm;
-                tm.role = "tool";
+                tm.role         = "tool";
                 tm.tool_call_id = tc.id;
-                tm.tool_name = tc.name;
+                tm.tool_name    = tc.name;
 
                 if (tc.name == "think_tool") {
                     tm.content = "noted";
@@ -543,18 +524,16 @@ public:
                 }
 
                 auto it = std::find_if(tools_.begin(), tools_.end(),
-                    [&](Tool* t) { return t->get_name() == tc.name; });
+                                       [&](Tool* t) { return t->get_name() == tc.name; });
 
                 if (it == tools_.end()) {
-                    tm.content = std::string(R"({"error":"unknown tool: )")
-                        + tc.name + "\"}";
+                    tm.content = std::string(R"({"error":"unknown tool: )") + tc.name + "\"}";
                 } else {
                     try {
-                        auto args = json::parse(tc.arguments);
-                        tm.content = (*it)->execute(args);
+                        auto args  = json::parse(tc.arguments);
+                        tm.content = co_await(*it)->real_execute_async(args);
                     } catch (const std::exception& e) {
-                        tm.content = std::string(R"({"error":")")
-                            + e.what() + "\"}";
+                        tm.content = std::string(R"({"error":")") + e.what() + "\"}";
                     }
                 }
                 convo.push_back(std::move(tm));
@@ -569,8 +548,7 @@ public:
     }
 
 private:
-    std::string compress(const std::vector<ChatMessage>& convo,
-                         const std::string& topic) {
+    std::string compress(const std::vector<ChatMessage>& convo, const std::string& topic) {
         std::ostringstream transcript;
         for (const auto& m : convo) {
             if (m.role == "system") continue;
@@ -578,30 +556,31 @@ private:
             if (!m.tool_name.empty()) transcript << ":" << m.tool_name;
             transcript << "] " << m.content << "\n";
             for (const auto& tc : m.tool_calls) {
-                transcript << "  <tool_call " << tc.name << " args="
-                           << tc.arguments << ">\n";
+                transcript << "  <tool_call " << tc.name << " args=" << tc.arguments << ">\n";
             }
         }
 
         std::vector<ChatMessage> compress_msgs;
         {
-            ChatMessage s; s.role = "system"; s.content = COMPRESS_SYSTEM;
+            ChatMessage s;
+            s.role    = "system";
+            s.content = COMPRESS_SYSTEM;
             compress_msgs.push_back(std::move(s));
-            ChatMessage u; u.role = "user";
-            u.content = "Topic: " + topic + "\n\nRaw transcript:\n"
-                      + transcript.str();
+            ChatMessage u;
+            u.role    = "user";
+            u.content = "Topic: " + topic + "\n\nRaw transcript:\n" + transcript.str();
             compress_msgs.push_back(std::move(u));
         }
 
         CompletionParams cp;
-        cp.model = model_;
-        cp.messages = std::move(compress_msgs);
+        cp.model       = model_;
+        cp.messages    = std::move(compress_msgs);
         cp.temperature = 0.2f;
-        cp.max_tokens = 2048;
+        cp.max_tokens  = 2048;
 
         try {
-            auto completion = neograph::async::run_sync(provider_->invoke(cp, nullptr));
-            std::string out = completion.message.content;
+            auto        completion = neograph::async::run_sync(provider_->invoke(cp, nullptr));
+            std::string out        = completion.message.content;
             // Hard cap regardless of what the model produced. Protects the
             // supervisor's accumulated context from unbounded growth across
             // research rounds — each round appends one tool_result per
@@ -621,19 +600,18 @@ private:
                                            const std::string& topic,
                                            const std::string& summary) {
         // raw_notes entry
-        json note = json::object();
-        note["topic"] = topic;
+        json note       = json::object();
+        note["topic"]   = topic;
         note["call_id"] = call_id;
         note["summary"] = summary;
 
         // supervisor_messages entry — paired tool-result
         ChatMessage tr = tool_result_msg(call_id, "conduct_research", summary);
-        json tr_json; to_json(tr_json, tr);
+        json        tr_json;
+        to_json(tr_json, tr);
 
-        return {
-            ChannelWrite{"raw_notes",           json::array({note})},
-            ChannelWrite{"supervisor_messages", json::array({tr_json})}
-        };
+        return {ChannelWrite{"raw_notes", json::array({note})},
+                ChannelWrite{"supervisor_messages", json::array({tr_json})}};
     }
 
     std::string               name_;
@@ -657,11 +635,8 @@ private:
 // =========================================================================
 class FinalReportNode : public GraphNode {
 public:
-    FinalReportNode(std::string name, std::shared_ptr<Provider> provider,
-                    std::string model)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , model_(std::move(model)) {}
+    FinalReportNode(std::string name, std::shared_ptr<Provider> provider, std::string model)
+        : name_(std::move(name)), provider_(std::move(provider)), model_(std::move(model)) {}
 
     std::string get_name() const override { return name_; }
 
@@ -673,28 +648,31 @@ public:
         }
 
         std::ostringstream findings;
-        auto notes = in.state.get("raw_notes");
+        auto               notes = in.state.get("raw_notes");
         if (notes.is_array()) {
             int idx = 1;
             for (auto it = notes.begin(); it != notes.end(); ++it, ++idx) {
-                auto n = *it;
-                std::string topic = n.is_object() && n.contains("topic")
-                    && n["topic"].is_string() ? n["topic"].get<std::string>() : "";
-                std::string summary = n.is_object() && n.contains("summary")
-                    && n["summary"].is_string() ? n["summary"].get<std::string>() : "";
-                findings << "### Finding " << idx << " — " << topic << "\n"
-                         << summary << "\n\n";
+                auto        n     = *it;
+                std::string topic = n.is_object() && n.contains("topic") && n["topic"].is_string()
+                                        ? n["topic"].get<std::string>()
+                                        : "";
+                std::string summary =
+                    n.is_object() && n.contains("summary") && n["summary"].is_string()
+                        ? n["summary"].get<std::string>()
+                        : "";
+                findings << "### Finding " << idx << " — " << topic << "\n" << summary << "\n\n";
             }
         }
 
         std::string findings_text = findings.str();
         if (findings_text.empty()) {
             NodeOutput out;
-            out.writes.push_back(ChannelWrite{"final_report", json(std::string(
-                "# Research Report\n\n"
-                "No researcher findings were collected. "
-                "The supervisor terminated without dispatching any "
-                "`conduct_research` calls."))});
+            out.writes.push_back(
+                ChannelWrite{"final_report",
+                             json(std::string("# Research Report\n\n"
+                                              "No researcher findings were collected. "
+                                              "The supervisor terminated without dispatching any "
+                                              "`conduct_research` calls."))});
             co_return out;
         }
 
@@ -704,28 +682,31 @@ public:
         // higher-priority since the supervisor decides what to research
         // first).
         constexpr int MAX_RETRIES = 3;
-        std::string last_error;
+        std::string   last_error;
         for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
             std::vector<ChatMessage> convo;
             {
-                ChatMessage s; s.role = "system"; s.content = FINAL_REPORT_SYSTEM;
+                ChatMessage s;
+                s.role    = "system";
+                s.content = FINAL_REPORT_SYSTEM;
                 convo.push_back(std::move(s));
-                ChatMessage u; u.role = "user";
-                u.content = "## Research brief\n" + brief +
-                            "\n\n## Collected findings\n" + findings_text;
+                ChatMessage u;
+                u.role = "user";
+                u.content =
+                    "## Research brief\n" + brief + "\n\n## Collected findings\n" + findings_text;
                 convo.push_back(std::move(u));
             }
 
             CompletionParams params;
-            params.model = model_;
-            params.messages = std::move(convo);
+            params.model       = model_;
+            params.messages    = std::move(convo);
             params.temperature = 0.4f;
-            params.max_tokens = 4096;
+            params.max_tokens  = 4096;
 
             // GCC-13 coroutine codegen: catch around co_await can miss the
             // exception type. Capture via exception_ptr and rethrow in a
             // non-coroutine try/catch (same pattern used elsewhere).
-            ChatCompletion completion;
+            ChatCompletion     completion;
             std::exception_ptr eptr;
             try {
                 completion = co_await provider_->invoke(params, nullptr);
@@ -734,8 +715,8 @@ public:
             }
             if (!eptr) {
                 NodeOutput out;
-                out.writes.push_back(ChannelWrite{"final_report",
-                    json(completion.message.content)});
+                out.writes.push_back(
+                    ChannelWrite{"final_report", json(completion.message.content)});
                 co_return out;
             }
             try {
@@ -745,19 +726,17 @@ public:
             }
             std::string lc = last_error;
             std::transform(lc.begin(), lc.end(), lc.begin(),
-                           [](unsigned char c){ return std::tolower(c); });
-            bool is_context_overflow =
-                lc.find("context") != std::string::npos
-                || lc.find("token") != std::string::npos
-                || lc.find("length") != std::string::npos
-                || lc.find("too long") != std::string::npos
-                || lc.find("max_tokens") != std::string::npos;
+                           [](unsigned char c) { return std::tolower(c); });
+            bool is_context_overflow = lc.find("context") != std::string::npos ||
+                                       lc.find("token") != std::string::npos ||
+                                       lc.find("length") != std::string::npos ||
+                                       lc.find("too long") != std::string::npos ||
+                                       lc.find("max_tokens") != std::string::npos;
             if (!is_context_overflow || attempt == MAX_RETRIES - 1) {
                 std::rethrow_exception(eptr);  // not a token-limit issue, or out of retries
             }
             // Truncate findings by 25% and retry. Keep at least 1 KB.
-            size_t new_size = std::max<size_t>(
-                1024, findings_text.size() * 3 / 4);
+            size_t new_size = std::max<size_t>(1024, findings_text.size() * 3 / 4);
             if (new_size >= findings_text.size()) {
                 std::rethrow_exception(eptr);  // can't truncate further
             }
@@ -766,9 +745,10 @@ public:
         }
         // Unreachable, but the compiler can't prove it.
         NodeOutput out;
-        out.writes.push_back(ChannelWrite{"final_report", json(
-            std::string("# Research Report\n\nFinal-report synthesis "
-                        "failed after retries: ") + last_error)});
+        out.writes.push_back(ChannelWrite{
+            "final_report", json(std::string("# Research Report\n\nFinal-report synthesis "
+                                             "failed after retries: ") +
+                                 last_error)});
         co_return out;
     }
 
@@ -793,14 +773,12 @@ private:
 class BriefNode : public GraphNode {
 public:
     BriefNode(std::string name, std::shared_ptr<Provider> provider, std::string model)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , model_(std::move(model)) {}
+        : name_(std::move(name)), provider_(std::move(provider)), model_(std::move(model)) {}
 
     std::string get_name() const override { return name_; }
 
     asio::awaitable<NodeOutput> run(NodeInput in) override {
-        auto q = in.state.get("user_query");
+        auto        q          = in.state.get("user_query");
         std::string user_query = q.is_string() ? q.get<std::string>() : "";
 
         if (user_query.empty()) {
@@ -809,7 +787,8 @@ public:
             co_return out;
         }
 
-        const char* BRIEF_SYSTEM = R"(You convert a user's research question into a focused research brief.
+        const char* BRIEF_SYSTEM =
+            R"(You convert a user's research question into a focused research brief.
 
 The brief must:
 1. Restate the core question precisely, preserving every constraint the user named (dates, scope, comparators).
@@ -821,21 +800,24 @@ Output ONLY the brief, in plain markdown. No preamble. Keep it under 200 words.)
 
         // GCC-13 coroutine codegen: catch around co_await must dispatch
         // via exception_ptr — same pattern as FinalReportNode above.
-        ChatCompletion completion;
+        ChatCompletion     completion;
         std::exception_ptr eptr;
         {
             std::vector<ChatMessage> convo;
-            ChatMessage s; s.role = "system"; s.content = BRIEF_SYSTEM;
+            ChatMessage              s;
+            s.role    = "system";
+            s.content = BRIEF_SYSTEM;
             convo.push_back(std::move(s));
-            ChatMessage u; u.role = "user";
+            ChatMessage u;
+            u.role    = "user";
             u.content = "User research question:\n" + user_query;
             convo.push_back(std::move(u));
 
             CompletionParams params;
-            params.model = model_;
-            params.messages = std::move(convo);
+            params.model       = model_;
+            params.messages    = std::move(convo);
             params.temperature = 0.2f;
-            params.max_tokens = 800;
+            params.max_tokens  = 800;
 
             try {
                 completion = co_await provider_->invoke(params, nullptr);
@@ -856,6 +838,7 @@ Output ONLY the brief, in plain markdown. No preamble. Keep it under 200 words.)
         out.writes.push_back(ChannelWrite{"research_brief", json(std::move(brief))});
         co_return out;
     }
+
 private:
     std::string               name_;
     std::shared_ptr<Provider> provider_;
@@ -879,9 +862,7 @@ private:
 class ClarifyNode : public GraphNode {
 public:
     ClarifyNode(std::string name, std::shared_ptr<Provider> provider, std::string model)
-        : name_(std::move(name))
-        , provider_(std::move(provider))
-        , model_(std::move(model)) {}
+        : name_(std::move(name)), provider_(std::move(provider)), model_(std::move(model)) {}
 
     std::string get_name() const override { return name_; }
 
@@ -897,10 +878,9 @@ public:
         // continue.
         auto msgs = in.state.get("messages");
         if (msgs.is_array() && msgs.size() > 0) {
-            auto latest = msgs[msgs.size() - 1];
+            auto        latest = msgs[msgs.size() - 1];
             std::string answer;
-            if (latest.is_object() && latest.contains("content")
-                && latest["content"].is_string()) {
+            if (latest.is_object() && latest.contains("content") && latest["content"].is_string()) {
                 answer = latest["content"].get<std::string>();
             }
             std::string augmented = query;
@@ -915,7 +895,8 @@ public:
         }
 
         // Phase 1: ask the LLM whether the query needs clarification.
-        const char* CLARIFY_SYSTEM = R"(You decide whether a user's research request is specific enough to investigate.
+        const char* CLARIFY_SYSTEM =
+            R"(You decide whether a user's research request is specific enough to investigate.
 
 If the request is concrete and self-contained, output exactly:
   DECISION: PROCEED
@@ -927,25 +908,29 @@ If a critical detail is missing (scope, time period, comparison target, definiti
 Bias toward PROCEED — only ASK when the question would clearly fork the research direction. Do not ask cosmetic preference questions.)";
 
         // GCC-13 coroutine codegen workaround — same exception_ptr dance.
-        std::string verdict;
+        std::string        verdict;
         std::exception_ptr eptr;
         {
             std::vector<ChatMessage> convo;
-            ChatMessage s; s.role = "system"; s.content = CLARIFY_SYSTEM;
+            ChatMessage              s;
+            s.role    = "system";
+            s.content = CLARIFY_SYSTEM;
             convo.push_back(std::move(s));
-            ChatMessage u; u.role = "user"; u.content = "Request:\n" + query;
+            ChatMessage u;
+            u.role    = "user";
+            u.content = "Request:\n" + query;
             convo.push_back(std::move(u));
 
             CompletionParams params;
-            params.model = model_;
-            params.messages = std::move(convo);
+            params.model       = model_;
+            params.messages    = std::move(convo);
             params.temperature = 0.0f;
-            params.max_tokens = 200;
+            params.max_tokens  = 200;
 
             try {
                 params.cancel_token = in.ctx.cancel_token;
-                auto completion = co_await provider_->invoke(params, nullptr);
-                verdict = completion.message.content;
+                auto completion     = co_await provider_->invoke(params, nullptr);
+                verdict             = completion.message.content;
             } catch (...) {
                 eptr = std::current_exception();
             }
@@ -959,9 +944,8 @@ Bias toward PROCEED — only ASK when the question would clearly fork the resear
         // in the reply.
         std::string lc = verdict;
         std::transform(lc.begin(), lc.end(), lc.begin(),
-                       [](unsigned char c){ return std::tolower(c); });
-        if (lc.find("proceed") != std::string::npos
-            && lc.find("ask") == std::string::npos) {
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lc.find("proceed") != std::string::npos && lc.find("ask") == std::string::npos) {
             co_return NodeOutput{};
         }
 
@@ -972,12 +956,11 @@ Bias toward PROCEED — only ASK when the question would clearly fork the resear
             if (pos == std::string::npos) pos = verdict.find("question:");
             if (pos != std::string::npos) {
                 pos += 9;
-                while (pos < verdict.size()
-                       && (verdict[pos] == ' ' || verdict[pos] == '\t'))
+                while (pos < verdict.size() && (verdict[pos] == ' ' || verdict[pos] == '\t'))
                     ++pos;
                 auto end = verdict.find('\n', pos);
-                question = verdict.substr(
-                    pos, end == std::string::npos ? std::string::npos : end - pos);
+                question =
+                    verdict.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
             }
         }
         if (question.empty()) {
@@ -985,8 +968,8 @@ Bias toward PROCEED — only ASK when the question would clearly fork the resear
         }
         throw NodeInterrupt(
             "Clarification needed before research begins.\n\n"
-            "QUESTION: " + question +
-            "\n\nResume with the user's answer to continue.");
+            "QUESTION: " +
+            question + "\n\nResume with the user's answer to continue.");
     }
 
 private:
@@ -1030,26 +1013,26 @@ public:
     std::string get_name() const override { return name_; }
 
     asio::awaitable<NodeOutput> run(NodeInput in) override {
-        auto msgs = in.state.get("messages");
+        auto msgs            = in.state.get("messages");
         bool have_user_reply = msgs.is_array() && msgs.size() > 0;
 
         if (!have_user_reply) {
             // First execution. Pause for the human.
             std::string report;
-            auto fr = in.state.get("final_report");
+            auto        fr = in.state.get("final_report");
             if (fr.is_string()) report = fr.get<std::string>();
             throw NodeInterrupt(
                 "Awaiting human review of the report. Resume with "
                 "'approve' to finalize, or pass any other text as "
                 "feedback to trigger another research round.\n\n"
-                "--- REPORT ---\n" + report);
+                "--- REPORT ---\n" +
+                report);
         }
 
         // Resumed. Inspect the latest message.
-        auto latest = msgs[msgs.size() - 1];
+        auto        latest = msgs[msgs.size() - 1];
         std::string content;
-        if (latest.is_object() && latest.contains("content") &&
-            latest["content"].is_string()) {
+        if (latest.is_object() && latest.contains("content") && latest["content"].is_string()) {
             content = latest["content"].get<std::string>();
         }
         std::string trimmed = content;
@@ -1060,28 +1043,26 @@ public:
             trimmed.pop_back();
         std::string lower = trimmed;
         std::transform(lower.begin(), lower.end(), lower.begin(),
-            [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) { return std::tolower(c); });
 
         NodeOutput r;
-        Command cmd;
-        if (trimmed.empty() || lower == "approve" || lower == "ok" ||
-            lower == "yes" || lower == "y") {
+        Command    cmd;
+        if (trimmed.empty() || lower == "approve" || lower == "ok" || lower == "yes" ||
+            lower == "y") {
             cmd.goto_node = std::string(END_NODE);
             // Drain `messages` so a second resume cycle (if the user
             // re-resumes the same thread) starts from an empty channel
             // and the interrupt fires again instead of re-routing.
             cmd.updates.push_back({"messages", json::array()});
         } else {
-            cmd.goto_node = "supervisor";
-            json feedback_msg = json::object();
-            feedback_msg["role"] = "user";
-            feedback_msg["content"] =
-                "[USER FOLLOW-UP after reviewing your previous report] " +
-                content +
-                "\n\nDispatch additional research if needed to address "
-                "this, then call research_complete when done.";
-            cmd.updates.push_back({"supervisor_messages",
-                json::array({feedback_msg})});
+            cmd.goto_node           = "supervisor";
+            json feedback_msg       = json::object();
+            feedback_msg["role"]    = "user";
+            feedback_msg["content"] = "[USER FOLLOW-UP after reviewing your previous report] " +
+                                      content +
+                                      "\n\nDispatch additional research if needed to address "
+                                      "this, then call research_complete when done.";
+            cmd.updates.push_back({"supervisor_messages", json::array({feedback_msg})});
             // Reset the supervisor budget so the dispatch node lets the
             // supervisor run another full round of conduct_research +
             // research_complete instead of short-circuiting on the
@@ -1106,102 +1087,93 @@ void register_node_types_once() {
         auto& nf = NodeFactory::instance();
 
         nf.register_type("__dr_clarify",
-            [](const std::string& name, const json&, const NodeContext& ctx)
-                -> std::unique_ptr<GraphNode> {
-                return std::make_unique<ClarifyNode>(
-                    name, ctx.provider, ctx.model);
-            });
+                         [](const std::string& name, const json&,
+                            const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
+                             return std::make_unique<ClarifyNode>(name, ctx.provider, ctx.model);
+                         });
 
         nf.register_type("__dr_brief",
-            [](const std::string& name, const json&, const NodeContext& ctx)
-                -> std::unique_ptr<GraphNode> {
-                return std::make_unique<BriefNode>(
-                    name, ctx.provider, ctx.model);
-            });
+                         [](const std::string& name, const json&,
+                            const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
+                             return std::make_unique<BriefNode>(name, ctx.provider, ctx.model);
+                         });
 
         nf.register_type("__dr_supervisor_llm",
-            [](const std::string& name, const json&, const NodeContext& ctx)
-                -> std::unique_ptr<GraphNode> {
-                return std::make_unique<SupervisorLLMNode>(
-                    name, ctx.provider, ctx.model);
-            });
+                         [](const std::string& name, const json&,
+                            const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
+                             return std::make_unique<SupervisorLLMNode>(name, ctx.provider,
+                                                                        ctx.model);
+                         });
 
         nf.register_type("__dr_supervisor_dispatch",
-            [](const std::string& name, const json& config, const NodeContext&)
-                -> std::unique_ptr<GraphNode> {
-                int max_iter = config.value("max_iterations", 4);
-                int max_conc = config.value("max_concurrent", 3);
-                return std::make_unique<SupervisorDispatchNode>(
-                    name, max_iter, max_conc);
-            });
+                         [](const std::string& name, const json& config,
+                            const NodeContext&) -> std::unique_ptr<GraphNode> {
+                             int max_iter = config.value("max_iterations", 4);
+                             int max_conc = config.value("max_concurrent", 3);
+                             return std::make_unique<SupervisorDispatchNode>(name, max_iter,
+                                                                             max_conc);
+                         });
 
         nf.register_type("__dr_researcher",
-            [](const std::string& name, const json& config,
-               const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
-                int max_iter = config.value("max_iterations", 4);
-                return std::make_unique<ResearcherNode>(
-                    name, ctx.provider, ctx.tools, ctx.model, max_iter);
-            });
+                         [](const std::string& name, const json& config,
+                            const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
+                             int max_iter = config.value("max_iterations", 4);
+                             return std::make_unique<ResearcherNode>(name, ctx.provider, ctx.tools,
+                                                                     ctx.model, max_iter);
+                         });
 
         nf.register_type("__dr_final_report",
-            [](const std::string& name, const json&, const NodeContext& ctx)
-                -> std::unique_ptr<GraphNode> {
-                return std::make_unique<FinalReportNode>(
-                    name, ctx.provider, ctx.model);
-            });
+                         [](const std::string& name, const json&,
+                            const NodeContext& ctx) -> std::unique_ptr<GraphNode> {
+                             return std::make_unique<FinalReportNode>(name, ctx.provider,
+                                                                      ctx.model);
+                         });
 
         nf.register_type("__dr_human_review",
-            [](const std::string& name, const json&, const NodeContext&)
-                -> std::unique_ptr<GraphNode> {
-                return std::make_unique<HumanReviewNode>(name);
-            });
+                         [](const std::string& name, const json&,
+                            const NodeContext&) -> std::unique_ptr<GraphNode> {
+                             return std::make_unique<HumanReviewNode>(name);
+                         });
     });
 }
 
-} // namespace
+}  // namespace
 
 // =========================================================================
 // Factory
 // =========================================================================
-std::unique_ptr<GraphEngine> create_deep_research_graph(
-    std::shared_ptr<Provider> provider,
-    std::vector<std::unique_ptr<Tool>> tools,
-    DeepResearchConfig cfg) {
-
+std::unique_ptr<GraphEngine> create_deep_research_graph(std::shared_ptr<Provider>          provider,
+                                                        std::vector<std::unique_ptr<Tool>> tools,
+                                                        DeepResearchConfig                 cfg) {
     register_node_types_once();
 
     NodeContext ctx;
     ctx.provider = std::move(provider);
-    ctx.model = cfg.model;
-    for (auto& t : tools) ctx.tools.push_back(t.get());
+    ctx.model    = cfg.model;
+    for (auto& t : tools)
+        ctx.tools.push_back(t.get());
 
     // Channels — common set always present.
-    json channels = {
-        {"user_query",             {{"reducer", "overwrite"}}},
-        {"research_brief",         {{"reducer", "overwrite"}}},
-        {"supervisor_messages",    {{"reducer", "append"}}},
-        {"supervisor_iterations",  {{"reducer", "overwrite"}}},
-        {"current_topic",          {{"reducer", "overwrite"}}},
-        {"current_call_id",        {{"reducer", "overwrite"}}},
-        {"raw_notes",              {{"reducer", "append"}}},
-        {"final_report",           {{"reducer", "overwrite"}}}
-    };
+    json channels = {{"user_query", {{"reducer", "overwrite"}}},
+                     {"research_brief", {{"reducer", "overwrite"}}},
+                     {"supervisor_messages", {{"reducer", "append"}}},
+                     {"supervisor_iterations", {{"reducer", "overwrite"}}},
+                     {"current_topic", {{"reducer", "overwrite"}}},
+                     {"current_call_id", {{"reducer", "overwrite"}}},
+                     {"raw_notes", {{"reducer", "append"}}},
+                     {"final_report", {{"reducer", "overwrite"}}}};
 
     // Nodes — common set always present.
     json nodes = {
-        {"brief",        {{"type", "__dr_brief"}}},
-        {"supervisor",   {{"type", "__dr_supervisor_llm"}}},
-        {"dispatch",     {
-            {"type", "__dr_supervisor_dispatch"},
-            {"max_iterations", cfg.max_supervisor_iterations},
-            {"max_concurrent", cfg.max_concurrent_researchers}
-        }},
-        {"researcher",   {
-            {"type", "__dr_researcher"},
-            {"max_iterations", cfg.max_researcher_iterations}
-        }},
-        {"final_report", {{"type", "__dr_final_report"}}}
-    };
+        {"brief", {{"type", "__dr_brief"}}},
+        {"supervisor", {{"type", "__dr_supervisor_llm"}}},
+        {"dispatch",
+         {{"type", "__dr_supervisor_dispatch"},
+          {"max_iterations", cfg.max_supervisor_iterations},
+          {"max_concurrent", cfg.max_concurrent_researchers}}},
+        {"researcher",
+         {{"type", "__dr_researcher"}, {"max_iterations", cfg.max_researcher_iterations}}},
+        {"final_report", {{"type", "__dr_final_report"}}}};
 
     // Edges — common set: start → brief → supervisor → dispatch loop;
     // dispatch emits Command(final_report) to short-circuit when done.
@@ -1211,21 +1183,21 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(
         // The `messages` channel is shared between clarify and human_review.
         // Both nodes consume the resume_value engine.resume() drops here.
         channels["messages"] = json{{"reducer", "overwrite"}};
-        nodes["clarify"] = json{{"type", "__dr_clarify"}};
+        nodes["clarify"]     = json{{"type", "__dr_clarify"}};
         edges.push_back({{"from", "__start__"}, {"to", "clarify"}});
-        edges.push_back({{"from", "clarify"},   {"to", "brief"}});
+        edges.push_back({{"from", "clarify"}, {"to", "brief"}});
     } else {
         edges.push_back({{"from", "__start__"}, {"to", "brief"}});
     }
-    edges.push_back({{"from", "brief"},      {"to", "supervisor"}});
+    edges.push_back({{"from", "brief"}, {"to", "supervisor"}});
     edges.push_back({{"from", "supervisor"}, {"to", "dispatch"}});
-    edges.push_back({{"from", "dispatch"},   {"to", "supervisor"}});
+    edges.push_back({{"from", "dispatch"}, {"to", "supervisor"}});
 
     if (cfg.enable_human_review) {
         // Add the `messages` channel that engine.resume writes the user's
         // resume_value into. Overwrite reducer keeps a single-element
         // array semantically meaning "latest human input pending review".
-        channels["messages"] = json{{"reducer", "overwrite"}};
+        channels["messages"]  = json{{"reducer", "overwrite"}};
         nodes["human_review"] = json{{"type", "__dr_human_review"}};
         // Re-route final_report through the review gate. The terminal
         // edge from human_review is decorative — HumanReviewNode emits
@@ -1238,12 +1210,10 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(
         edges.push_back({{"from", "final_report"}, {"to", "__end__"}});
     }
 
-    json definition = {
-        {"name", "deep_research_agent"},
-        {"channels", channels},
-        {"nodes", nodes},
-        {"edges", edges}
-    };
+    json definition = {{"name", "deep_research_agent"},
+                       {"channels", channels},
+                       {"nodes", nodes},
+                       {"edges", edges}};
 
     auto engine = GraphEngine::compile(definition, ctx);
     engine->own_tools(std::move(tools));
@@ -1261,15 +1231,15 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(
     // two retries at up to 45s apart cover that. Applied to every LLM-calling
     // node. Brief/dispatch don't call the API but policy is harmless there.
     RetryPolicy llm_retry;
-    llm_retry.max_retries       = 2;
-    llm_retry.initial_delay_ms  = 15'000;
+    llm_retry.max_retries        = 2;
+    llm_retry.initial_delay_ms   = 15'000;
     llm_retry.backoff_multiplier = 2.0f;
-    llm_retry.max_delay_ms      = 45'000;
-    engine->set_node_retry_policy("supervisor",   llm_retry);
-    engine->set_node_retry_policy("researcher",   llm_retry);
+    llm_retry.max_delay_ms       = 45'000;
+    engine->set_node_retry_policy("supervisor", llm_retry);
+    engine->set_node_retry_policy("researcher", llm_retry);
     engine->set_node_retry_policy("final_report", llm_retry);
 
     return engine;
 }
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
