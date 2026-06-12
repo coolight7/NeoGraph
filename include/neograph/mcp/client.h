@@ -30,7 +30,7 @@ namespace detail {
 /// and a mutex serialising concurrent rpc_call() calls. Destroying the
 /// session sends SIGTERM to the child and reaps it via waitpid.
 class StdioSession;
-}
+}  // namespace detail
 
 /**
  * @brief Wraps a remote MCP server tool as a local Tool.
@@ -39,22 +39,22 @@ class StdioSession;
  * through the owning transport (HTTP or stdio). Created automatically
  * by MCPClient::get_tools().
  */
-class NEOGRAPH_API MCPTool : public Tool {
-  public:
+class NEOGRAPH_API MCPTool : public AsyncTool {
+public:
     /// HTTP-mode constructor. Each execute() opens an ephemeral
     /// MCPClient against @p server_url.
     MCPTool(const std::string& server_url,
             const std::string& name,
             const std::string& description,
-            const json& input_schema);
+            const json&        input_schema);
 
     /// stdio-mode constructor. The MCPTool keeps the session alive —
     /// the subprocess stays up as long as any tool instance holds a
     /// reference to it.
     MCPTool(std::shared_ptr<detail::StdioSession> session,
-            const std::string& name,
-            const std::string& description,
-            const json& input_schema);
+            const std::string&                    name,
+            const std::string&                    description,
+            const json&                           input_schema);
 
     ChatTool get_definition() const override;
 
@@ -63,16 +63,16 @@ class NEOGRAPH_API MCPTool : public Tool {
      * @param arguments JSON object containing the tool's input parameters.
      * @return Result string (text content joined by newlines) or JSON dump.
      */
-    std::string execute(const json& arguments) override;
+    asio::awaitable<std::string> execute_async(const json& arguments) override;
 
     std::string get_name() const override { return name_; }
 
-  private:
-    std::string server_url_;                              ///< Non-empty in HTTP mode.
-    std::shared_ptr<detail::StdioSession> stdio_session_; ///< Non-null in stdio mode.
-    std::string name_;
-    std::string description_;
-    json input_schema_;
+private:
+    std::string                           server_url_;     ///< Non-empty in HTTP mode.
+    std::shared_ptr<detail::StdioSession> stdio_session_;  ///< Non-null in stdio mode.
+    std::string                           name_;
+    std::string                           description_;
+    json                                  input_schema_;
 };
 
 /**
@@ -95,7 +95,7 @@ class NEOGRAPH_API MCPTool : public Tool {
  * @endcode
  */
 class NEOGRAPH_API MCPClient {
-  public:
+public:
     /**
      * @brief Construct an HTTP-mode MCP client.
      * @param server_url URL of the MCP server (e.g., "http://localhost:8000").
@@ -124,7 +124,8 @@ class NEOGRAPH_API MCPClient {
      * @brief Discover tools from the MCP server.
      * @return Vector of Tool unique_ptrs (MCPTool instances).
      */
-    std::vector<std::unique_ptr<Tool>> get_tools();
+    std::vector<std::unique_ptr<Tool>>                  get_tools();
+    asio::awaitable<std::vector<std::unique_ptr<Tool>>> get_tools_async();
 
     /**
      * @brief Call a tool directly by name.
@@ -133,6 +134,8 @@ class NEOGRAPH_API MCPClient {
      * @return JSON response from the server.
      */
     json call_tool(const std::string& name, const json& arguments);
+
+    asio::awaitable<json> call_tool_async(const std::string& name, const json& arguments);
 
     /**
      * @brief Async variant of rpc_call for the HTTP transport.
@@ -146,11 +149,10 @@ class NEOGRAPH_API MCPClient {
      * @param params Method parameters (defaults to empty object).
      * @return Awaitable resolving to the `result` field of the JSON-RPC response.
      */
-    asio::awaitable<json> rpc_call_async(
-        const std::string& method,
-        const json& params = json::object());
+    asio::awaitable<json> rpc_call_async(const std::string& method,
+                                         const json&        params = json::object());
 
-  private:
+private:
     /// Sync rpc_call — for stdio it dispatches synchronously; for HTTP
     /// it routes through `run_sync(rpc_call_async(...))`.
     json rpc_call(const std::string& method, const json& params = json::object());
@@ -169,17 +171,17 @@ class NEOGRAPH_API MCPClient {
     /// across the network call itself, so concurrent in-flight RPCs
     /// remain possible.
     mutable std::mutex http_state_mu_;
-    std::string session_id_;
+    std::string        session_id_;
     /// Protocol version negotiated during initialize. The MCP spec
     /// requires the client to echo this on every subsequent HTTP request
     /// in the `MCP-Protocol-Version` header (transports/Streamable HTTP §
     /// "Protocol Version Header", spec 2025-11-25). Empty until
     /// initialize completes.
     std::string negotiated_protocol_version_;
-    int request_id_ = 0;
+    int         request_id_ = 0;
 
     // stdio state (null when in HTTP mode).
     std::shared_ptr<detail::StdioSession> stdio_session_;
 };
 
-} // namespace neograph::mcp
+}  // namespace neograph::mcp

@@ -1,8 +1,7 @@
-#include <neograph/mcp/client.h>
-
 #include <neograph/async/endpoint.h>
 #include <neograph/async/http_client.h>
 #include <neograph/async/run_sync.h>
+#include <neograph/mcp/client.h>
 
 #include <asio/experimental/channel.hpp>
 #include <asio/read_until.hpp>
@@ -12,19 +11,19 @@
 #include <asio/write.hpp>
 
 #ifdef _WIN32
-#  include <asio/windows/stream_handle.hpp>
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
+#include <asio/windows/stream_handle.hpp>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #else
-#  include <asio/posix/stream_descriptor.hpp>
-#  include <dirent.h>
-#  include <fcntl.h>
-#  include <signal.h>
-#  include <sys/wait.h>
-#  include <unistd.h>
-#  if defined(__linux__)
-#    include <sys/syscall.h>
-#  endif
+#include <asio/posix/stream_descriptor.hpp>
+#include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 #include <atomic>
@@ -89,8 +88,7 @@ public:
     /// Sync rpc_call() continues to use the std::mutex mtx_ and must
     /// NOT be mixed with rpc_call_async on the same session (the two
     /// locks don't know about each other).
-    asio::awaitable<json> rpc_call_async(
-        const std::string& method, const json& params);
+    asio::awaitable<json> rpc_call_async(const std::string& method, const json& params);
 
     // Send a JSON-RPC notification (no id, no response expected).
     void notify(const std::string& method, const json& params);
@@ -98,25 +96,25 @@ public:
 private:
     StdioSession() = default;
 
-    std::string read_line_locked();       ///< caller holds mtx_
-    void write_frame_locked(const json& j); ///< caller holds mtx_
+    std::string read_line_locked();                 ///< caller holds mtx_
+    void        write_frame_locked(const json& j);  ///< caller holds mtx_
 
     asio::awaitable<std::string> async_read_line_locked(AsyncHandle& out);
-    asio::awaitable<void> async_write_frame_locked(AsyncHandle& in, const json& j);
+    asio::awaitable<void>        async_write_frame_locked(AsyncHandle& in, const json& j);
 
 #ifdef _WIN32
-    HANDLE process_ = nullptr;   ///< child process handle (CloseHandle on dtor)
-    HANDLE stdin_h_ = nullptr;   ///< parent → child (write end of a pipe)
+    HANDLE process_  = nullptr;  ///< child process handle (CloseHandle on dtor)
+    HANDLE stdin_h_  = nullptr;  ///< parent → child (write end of a pipe)
     HANDLE stdout_h_ = nullptr;  ///< child → parent (read end of a pipe)
 #else
-    pid_t pid_ = -1;
-    int   stdin_fd_ = -1;   // parent → child
+    pid_t pid_       = -1;
+    int   stdin_fd_  = -1;  // parent → child
     int   stdout_fd_ = -1;  // child  → parent
 #endif
 
-    std::mutex   mtx_;        ///< sync path serialisation
-    std::string  buffer_;     ///< sync read buffer
-    std::string  abuffer_;    ///< async read buffer (separate to avoid mixing)
+    std::mutex       mtx_;      ///< sync path serialisation
+    std::string      buffer_;   ///< sync read buffer
+    std::string      abuffer_;  ///< async read buffer (separate to avoid mixing)
     std::atomic<int> next_id_{0};
 
     // Awaitable lock for the async path (Sem 4 follow-up). Capacity-1
@@ -125,7 +123,7 @@ private:
     // suspends cooperatively rather than blocking the worker thread.
     using AsyncLock = asio::experimental::channel<void(asio::error_code)>;
     std::unique_ptr<AsyncLock> async_lock_;
-    std::mutex async_lock_init_mtx_;
+    std::mutex                 async_lock_init_mtx_;
 
     // Cached AsyncHandle wrappers for the async path. Lazy-created on
     // first rpc_call_async using the caller's executor, then reused
@@ -153,7 +151,7 @@ private:
     //   declaration in tests and call sites).
     std::unique_ptr<AsyncHandle> async_in_;
     std::unique_ptr<AsyncHandle> async_out_;
-    std::mutex async_handles_init_mtx_;
+    std::mutex                   async_handles_init_mtx_;
 };
 
 #ifdef _WIN32
@@ -167,9 +165,8 @@ std::string build_win_cmdline(const std::vector<std::string>& argv) {
     std::string out;
     for (size_t i = 0; i < argv.size(); ++i) {
         if (i) out.push_back(' ');
-        const auto& a = argv[i];
-        bool need_quote = a.empty() ||
-            a.find_first_of(" \t\"") != std::string::npos;
+        const auto& a          = argv[i];
+        bool        need_quote = a.empty() || a.find_first_of(" \t\"") != std::string::npos;
         if (need_quote) {
             out.push_back('"');
             for (char c : a) {
@@ -188,45 +185,44 @@ std::string build_win_cmdline(const std::vector<std::string>& argv) {
 // FILE_FLAG_OVERLAPPED (needed for asio::windows::stream_handle) and
 // the child side is a plain inheritable handle. CreatePipe's anonymous
 // pipes don't support overlapped I/O, hence the named-pipe dance.
-struct PipePair { HANDLE parent; HANDLE child; };
+struct PipePair {
+    HANDLE parent;
+    HANDLE child;
+};
 PipePair make_overlapped_pipe(const char* name_prefix, bool parent_reads) {
     static std::atomic<uint64_t> counter{0};
-    char name[128];
-    std::snprintf(name, sizeof(name),
-        "\\\\.\\pipe\\neograph_mcp_%s_%lu_%llu",
-        name_prefix,
-        static_cast<unsigned long>(GetCurrentProcessId()),
-        static_cast<unsigned long long>(counter.fetch_add(1)));
+    char                         name[128];
+    std::snprintf(name, sizeof(name), "\\\\.\\pipe\\neograph_mcp_%s_%lu_%llu", name_prefix,
+                  static_cast<unsigned long>(GetCurrentProcessId()),
+                  static_cast<unsigned long long>(counter.fetch_add(1)));
 
-    DWORD parent_mode = parent_reads
-        ? (PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED)
-        : (PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED);
-    HANDLE parent = CreateNamedPipeA(
-        name, parent_mode,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        /*instances=*/1, /*outbuf=*/64*1024, /*inbuf=*/64*1024,
-        /*timeout=*/0, /*sa=*/nullptr);
+    DWORD  parent_mode = parent_reads ? (PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED)
+                                      : (PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED);
+    HANDLE parent =
+        CreateNamedPipeA(name, parent_mode, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                         /*instances=*/1, /*outbuf=*/64 * 1024, /*inbuf=*/64 * 1024,
+                         /*timeout=*/0, /*sa=*/nullptr);
     if (parent == INVALID_HANDLE_VALUE) {
-        throw std::system_error(static_cast<int>(GetLastError()),
-            std::system_category(), "CreateNamedPipe");
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                                "CreateNamedPipe");
     }
 
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };  // inheritable
-    DWORD child_access = parent_reads ? GENERIC_WRITE : GENERIC_READ;
-    HANDLE child = CreateFileA(name, child_access,
-        0, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    SECURITY_ATTRIBUTES sa           = {sizeof(sa), nullptr, TRUE};  // inheritable
+    DWORD               child_access = parent_reads ? GENERIC_WRITE : GENERIC_READ;
+    HANDLE              child =
+        CreateFileA(name, child_access, 0, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (child == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         CloseHandle(parent);
-        throw std::system_error(static_cast<int>(err),
-            std::system_category(), "CreateFile(child side)");
+        throw std::system_error(static_cast<int>(err), std::system_category(),
+                                "CreateFile(child side)");
     }
 
     // Parent side must NOT be inherited by the child.
     SetHandleInformation(parent, HANDLE_FLAG_INHERIT, 0);
     return PipePair{parent, child};
 }
-} // namespace
+}  // namespace
 
 std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>& argv) {
     if (argv.empty()) {
@@ -235,7 +231,7 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
 
     // Two pipes: in = parent writes (child reads on stdin),
     //            out = child writes (parent reads on stdout).
-    PipePair in_p  = make_overlapped_pipe("in",  /*parent_reads=*/false);
+    PipePair in_p = make_overlapped_pipe("in", /*parent_reads=*/false);
     PipePair out_p;
     try {
         out_p = make_overlapped_pipe("out", /*parent_reads=*/true);
@@ -256,7 +252,8 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
         const auto& exe = argv[0];
         if (exe.size() >= 4) {
             std::string ext = exe.substr(exe.size() - 4);
-            for (auto& c : ext) c = static_cast<char>(::tolower(c));
+            for (auto& c : ext)
+                c = static_cast<char>(::tolower(c));
             if (ext == ".bat" || ext == ".cmd") {
                 throw std::runtime_error(
                     "StdioSession: refusing to spawn .bat/.cmd target via "
@@ -270,21 +267,19 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
     std::string cmdline = build_win_cmdline(argv);
 
     STARTUPINFOA si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput  = in_p.child;
-    si.hStdOutput = out_p.child;
-    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);  // inherit parent's stderr
+    si.cb           = sizeof(si);
+    si.dwFlags      = STARTF_USESTDHANDLES;
+    si.hStdInput    = in_p.child;
+    si.hStdOutput   = out_p.child;
+    si.hStdError    = GetStdHandle(STD_ERROR_HANDLE);  // inherit parent's stderr
 
     PROCESS_INFORMATION pi = {};
     // cmdline.data() is mutable per CreateProcess's contract.
     BOOL ok = CreateProcessA(
-        /*application=*/nullptr,
-        cmdline.data(),
+        /*application=*/nullptr, cmdline.data(),
         /*proc_sa=*/nullptr, /*thr_sa=*/nullptr,
         /*inherit=*/TRUE, /*flags=*/0,
-        /*env=*/nullptr, /*cwd=*/nullptr,
-        &si, &pi);
+        /*env=*/nullptr, /*cwd=*/nullptr, &si, &pi);
     // Child side handles belong to the child now (inherited) — we can
     // close our copies regardless of success.
     CloseHandle(in_p.child);
@@ -293,12 +288,11 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
         DWORD err = GetLastError();
         CloseHandle(in_p.parent);
         CloseHandle(out_p.parent);
-        throw std::system_error(static_cast<int>(err),
-            std::system_category(), "CreateProcess");
+        throw std::system_error(static_cast<int>(err), std::system_category(), "CreateProcess");
     }
     CloseHandle(pi.hThread);  // thread handle unused
 
-    auto sess = std::shared_ptr<StdioSession>(new StdioSession());
+    auto sess       = std::shared_ptr<StdioSession>(new StdioSession());
     sess->process_  = pi.hProcess;
     sess->stdin_h_  = in_p.parent;
     sess->stdout_h_ = out_p.parent;
@@ -306,8 +300,14 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
 }
 
 StdioSession::~StdioSession() {
-    if (stdin_h_)  { CloseHandle(stdin_h_); stdin_h_ = nullptr; }
-    if (stdout_h_) { CloseHandle(stdout_h_); stdout_h_ = nullptr; }
+    if (stdin_h_) {
+        CloseHandle(stdin_h_);
+        stdin_h_ = nullptr;
+    }
+    if (stdout_h_) {
+        CloseHandle(stdout_h_);
+        stdout_h_ = nullptr;
+    }
 
     if (process_) {
         // Give the child a moment to exit cleanly on its own (closing
@@ -335,7 +335,10 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
 
     auto close_all = [&]() {
         for (int* fd : {&in_pipe[0], &in_pipe[1], &out_pipe[0], &out_pipe[1]}) {
-            if (*fd >= 0) { ::close(*fd); *fd = -1; }
+            if (*fd >= 0) {
+                ::close(*fd);
+                *fd = -1;
+            }
         }
     };
 
@@ -352,12 +355,14 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
 
     if (pid == 0) {
         // --- child ---
-        ::dup2(in_pipe[0],  STDIN_FILENO);
+        ::dup2(in_pipe[0], STDIN_FILENO);
         ::dup2(out_pipe[1], STDOUT_FILENO);
         // Leave stderr alone so server logs remain visible.
 
-        ::close(in_pipe[0]);  ::close(in_pipe[1]);
-        ::close(out_pipe[0]); ::close(out_pipe[1]);
+        ::close(in_pipe[0]);
+        ::close(in_pipe[1]);
+        ::close(out_pipe[0]);
+        ::close(out_pipe[1]);
 
         // Close every other inherited file descriptor before exec.
         // Without this, the child inherits whatever the parent had
@@ -374,30 +379,32 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
 #if defined(__linux__) && defined(SYS_close_range)
         if (::syscall(SYS_close_range, 3u, ~0u, 0u) != 0) {
 #endif
-        DIR* d = ::opendir("/proc/self/fd");
-        if (d) {
-            int dfd = ::dirfd(d);
-            struct dirent* ent;
-            while ((ent = ::readdir(d)) != nullptr) {
-                if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
-                int fd = std::atoi(ent->d_name);
-                if (fd > 2 && fd != dfd) ::close(fd);
+            DIR* d = ::opendir("/proc/self/fd");
+            if (d) {
+                int            dfd = ::dirfd(d);
+                struct dirent* ent;
+                while ((ent = ::readdir(d)) != nullptr) {
+                    if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
+                    int fd = std::atoi(ent->d_name);
+                    if (fd > 2 && fd != dfd) ::close(fd);
+                }
+                ::closedir(d);
+            } else {
+                // Last-resort sweep — best effort, bounded so a high
+                // RLIMIT_NOFILE doesn't make exec take seconds.
+                int max_fd = static_cast<int>(::sysconf(_SC_OPEN_MAX));
+                if (max_fd <= 0 || max_fd > 65536) max_fd = 65536;
+                for (int fd = 3; fd < max_fd; ++fd)
+                    ::close(fd);
             }
-            ::closedir(d);
-        } else {
-            // Last-resort sweep — best effort, bounded so a high
-            // RLIMIT_NOFILE doesn't make exec take seconds.
-            int max_fd = static_cast<int>(::sysconf(_SC_OPEN_MAX));
-            if (max_fd <= 0 || max_fd > 65536) max_fd = 65536;
-            for (int fd = 3; fd < max_fd; ++fd) ::close(fd);
-        }
 #if defined(__linux__) && defined(SYS_close_range)
         }
 #endif
 
         std::vector<char*> cargv;
         cargv.reserve(argv.size() + 1);
-        for (const auto& a : argv) cargv.push_back(const_cast<char*>(a.c_str()));
+        for (const auto& a : argv)
+            cargv.push_back(const_cast<char*>(a.c_str()));
         cargv.push_back(nullptr);
 
         ::execvp(cargv[0], cargv.data());
@@ -410,7 +417,7 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
     ::close(in_pipe[0]);
     ::close(out_pipe[1]);
 
-    auto sess = std::shared_ptr<StdioSession>(new StdioSession());
+    auto sess        = std::shared_ptr<StdioSession>(new StdioSession());
     sess->pid_       = pid;
     sess->stdin_fd_  = in_pipe[1];
     sess->stdout_fd_ = out_pipe[0];
@@ -418,7 +425,7 @@ std::shared_ptr<StdioSession> StdioSession::spawn(const std::vector<std::string>
 }
 
 StdioSession::~StdioSession() {
-    if (stdin_fd_  >= 0) ::close(stdin_fd_);
+    if (stdin_fd_ >= 0) ::close(stdin_fd_);
     if (stdout_fd_ >= 0) ::close(stdout_fd_);
 
     if (pid_ > 0) {
@@ -426,9 +433,12 @@ StdioSession::~StdioSession() {
 
         // Poll for exit up to ~500 ms, then SIGKILL.
         for (int i = 0; i < 50; ++i) {
-            int status = 0;
-            pid_t w = ::waitpid(pid_, &status, WNOHANG);
-            if (w == pid_) { pid_ = -1; return; }
+            int   status = 0;
+            pid_t w      = ::waitpid(pid_, &status, WNOHANG);
+            if (w == pid_) {
+                pid_ = -1;
+                return;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         ::kill(pid_, SIGKILL);
@@ -444,7 +454,7 @@ void StdioSession::write_frame_locked(const json& j) {
     std::string line = j.dump();
     line.push_back('\n');
 
-    const char* p = line.data();
+    const char* p         = line.data();
     size_t      remaining = line.size();
     while (remaining > 0) {
 #ifdef _WIN32
@@ -452,21 +462,19 @@ void StdioSession::write_frame_locked(const json& j) {
         // With an overlapped named pipe, WriteFile(hEvent=nullptr) still
         // works synchronously on this thread — it just uses the pipe's
         // internal event. That's fine for the sync path.
-        if (!WriteFile(stdin_h_, p, static_cast<DWORD>(remaining),
-                       &written, nullptr)) {
-            throw std::system_error(static_cast<int>(GetLastError()),
-                std::system_category(), "StdioSession::WriteFile()");
+        if (!WriteFile(stdin_h_, p, static_cast<DWORD>(remaining), &written, nullptr)) {
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                                    "StdioSession::WriteFile()");
         }
-        p         += written;
+        p += written;
         remaining -= static_cast<size_t>(written);
 #else
         ssize_t n = ::write(stdin_fd_, p, remaining);
         if (n < 0) {
             if (errno == EINTR) continue;
-            throw std::system_error(errno, std::generic_category(),
-                                    "StdioSession::write()");
+            throw std::system_error(errno, std::generic_category(), "StdioSession::write()");
         }
-        p         += n;
+        p += n;
         remaining -= static_cast<size_t>(n);
 #endif
     }
@@ -488,36 +496,31 @@ std::string StdioSession::read_line_locked() {
             return line;
         }
         if (buffer_.size() > MAX_LINE_BYTES) {
-            throw std::runtime_error(
-                "StdioSession: incoming line exceeded "
-                + std::to_string(MAX_LINE_BYTES)
-                + " bytes without newline (peer misbehaving)");
+            throw std::runtime_error("StdioSession: incoming line exceeded " +
+                                     std::to_string(MAX_LINE_BYTES) +
+                                     " bytes without newline (peer misbehaving)");
         }
 
         char tmp[4096];
 #ifdef _WIN32
         DWORD got = 0;
-        if (!ReadFile(stdout_h_, tmp, static_cast<DWORD>(sizeof(tmp)),
-                      &got, nullptr)) {
+        if (!ReadFile(stdout_h_, tmp, static_cast<DWORD>(sizeof(tmp)), &got, nullptr)) {
             DWORD err = GetLastError();
             if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
-                throw std::runtime_error(
-                    "StdioSession: child closed stdout");
+                throw std::runtime_error("StdioSession: child closed stdout");
             }
-            throw std::system_error(static_cast<int>(err),
-                std::system_category(), "StdioSession::ReadFile()");
+            throw std::system_error(static_cast<int>(err), std::system_category(),
+                                    "StdioSession::ReadFile()");
         }
         if (got == 0) {
-            throw std::runtime_error(
-                "StdioSession: child closed stdout");
+            throw std::runtime_error("StdioSession: child closed stdout");
         }
         buffer_.append(tmp, static_cast<size_t>(got));
 #else
         ssize_t n = ::read(stdout_fd_, tmp, sizeof(tmp));
         if (n < 0) {
             if (errno == EINTR) continue;
-            throw std::system_error(errno, std::generic_category(),
-                                    "StdioSession::read()");
+            throw std::system_error(errno, std::generic_category(), "StdioSession::read()");
         }
         if (n == 0) {
             throw std::runtime_error("StdioSession: child closed stdout");
@@ -530,12 +533,7 @@ std::string StdioSession::read_line_locked() {
 json StdioSession::rpc_call(const std::string& method, const json& params) {
     const int id = ++next_id_;
 
-    json req = {
-        {"jsonrpc", "2.0"},
-        {"id", id},
-        {"method", method},
-        {"params", params}
-    };
+    json req = {{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
 
     std::lock_guard<std::mutex> lock(mtx_);
     write_frame_locked(req);
@@ -554,13 +552,12 @@ json StdioSession::rpc_call(const std::string& method, const json& params) {
             continue;
         }
 
-        if (!resp.contains("id")) continue;          // notification from server
-        if (resp["id"] != id)     continue;          // response to a prior call?
+        if (!resp.contains("id")) continue;  // notification from server
+        if (resp["id"] != id) continue;      // response to a prior call?
 
         if (resp.contains("error")) {
             auto err = resp["error"];
-            throw std::runtime_error(
-                "MCP stdio RPC error: " + err.value("message", "unknown"));
+            throw std::runtime_error("MCP stdio RPC error: " + err.value("message", "unknown"));
         }
         return resp.value("result", json::object());
     }
@@ -568,25 +565,18 @@ json StdioSession::rpc_call(const std::string& method, const json& params) {
 }
 
 void StdioSession::notify(const std::string& method, const json& params) {
-    json n = {
-        {"jsonrpc", "2.0"},
-        {"method", method},
-        {"params", params}
-    };
+    json                        n = {{"jsonrpc", "2.0"}, {"method", method}, {"params", params}};
     std::lock_guard<std::mutex> lock(mtx_);
     write_frame_locked(n);
 }
 
-asio::awaitable<void>
-StdioSession::async_write_frame_locked(AsyncHandle& in,
-                                       const json& j) {
+asio::awaitable<void> StdioSession::async_write_frame_locked(AsyncHandle& in, const json& j) {
     std::string line = j.dump();
     line.push_back('\n');
     co_await asio::async_write(in, asio::buffer(line), asio::use_awaitable);
 }
 
-asio::awaitable<std::string>
-StdioSession::async_read_line_locked(AsyncHandle& out) {
+asio::awaitable<std::string> StdioSession::async_read_line_locked(AsyncHandle& out) {
     auto nl = abuffer_.find('\n');
     if (nl == std::string::npos) {
         asio::streambuf sbuf;
@@ -597,8 +587,7 @@ StdioSession::async_read_line_locked(AsyncHandle& out) {
             os.write(abuffer_.data(), static_cast<std::streamsize>(abuffer_.size()));
             abuffer_.clear();
         }
-        std::size_t n = co_await asio::async_read_until(
-            out, sbuf, '\n', asio::use_awaitable);
+        std::size_t n = co_await asio::async_read_until(out, sbuf, '\n', asio::use_awaitable);
         // Re-merge into our string buffer so the rest of the trailing
         // bytes (after the newline) are kept for the next call.
         std::string drained(asio::buffers_begin(sbuf.data()),
@@ -608,9 +597,8 @@ StdioSession::async_read_line_locked(AsyncHandle& out) {
         if (nl == std::string::npos) {
             // async_read_until promised a delim was found within `n`
             // bytes; this branch is defensive.
-            throw std::runtime_error(
-                "StdioSession::async_read_line: delimiter missing after "
-                + std::to_string(n) + " bytes");
+            throw std::runtime_error("StdioSession::async_read_line: delimiter missing after " +
+                                     std::to_string(n) + " bytes");
         }
     }
     std::string line = abuffer_.substr(0, nl);
@@ -619,16 +607,10 @@ StdioSession::async_read_line_locked(AsyncHandle& out) {
     co_return line;
 }
 
-asio::awaitable<json>
-StdioSession::rpc_call_async(const std::string& method, const json& params) {
+asio::awaitable<json> StdioSession::rpc_call_async(const std::string& method, const json& params) {
     const int id = ++next_id_;
 
-    json req = {
-        {"jsonrpc", "2.0"},
-        {"id", id},
-        {"method", method},
-        {"params", params}
-    };
+    json req = {{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
 
     auto ex = co_await asio::this_coro::executor;
 
@@ -664,7 +646,9 @@ StdioSession::rpc_call_async(const std::string& method, const json& params) {
             // try_send is noexcept-ish (no throw on a healthy
             // channel). We're on the hot unwind path; swallow any
             // residual error rather than abort the program.
-            try { ch->try_send(asio::error_code{}); } catch (...) {}
+            try {
+                ch->try_send(asio::error_code{});
+            } catch (...) {}
         }
     } lock_rel{async_lock_.get()};
 
@@ -676,19 +660,18 @@ StdioSession::rpc_call_async(const std::string& method, const json& params) {
         std::lock_guard<std::mutex> g(async_handles_init_mtx_);
         if (!async_in_ || !async_out_) {
 #ifdef _WIN32
-            HANDLE dup_in = nullptr, dup_out = nullptr;
+            HANDLE       dup_in = nullptr, dup_out = nullptr;
             const HANDLE self = GetCurrentProcess();
-            if (!DuplicateHandle(self, stdin_h_, self, &dup_in,
-                                 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-                throw std::system_error(static_cast<int>(GetLastError()),
-                    std::system_category(), "DuplicateHandle(stdin)");
+            if (!DuplicateHandle(self, stdin_h_, self, &dup_in, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                                        "DuplicateHandle(stdin)");
             }
-            if (!DuplicateHandle(self, stdout_h_, self, &dup_out,
-                                 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            if (!DuplicateHandle(self, stdout_h_, self, &dup_out, 0, FALSE,
+                                 DUPLICATE_SAME_ACCESS)) {
                 DWORD err = GetLastError();
                 CloseHandle(dup_in);
-                throw std::system_error(static_cast<int>(err),
-                    std::system_category(), "DuplicateHandle(stdout)");
+                throw std::system_error(static_cast<int>(err), std::system_category(),
+                                        "DuplicateHandle(stdout)");
             }
             try {
                 async_in_  = std::make_unique<AsyncHandle>(ex, dup_in);
@@ -697,30 +680,28 @@ StdioSession::rpc_call_async(const std::string& method, const json& params) {
                 // On partial success, close whichever dup the failed
                 // wrapper didn't take. Wrappers that succeeded already
                 // own their dup and will close on reset/destruction.
-                if (!async_in_)  CloseHandle(dup_in);
+                if (!async_in_) CloseHandle(dup_in);
                 if (!async_out_) CloseHandle(dup_out);
                 async_in_.reset();
                 async_out_.reset();
                 throw;
             }
 #else
-            int dup_in  = ::dup(stdin_fd_);
+            int dup_in = ::dup(stdin_fd_);
             if (dup_in < 0) {
-                throw std::system_error(errno, std::system_category(),
-                    "dup(stdin_fd)");
+                throw std::system_error(errno, std::system_category(), "dup(stdin_fd)");
             }
             int dup_out = ::dup(stdout_fd_);
             if (dup_out < 0) {
                 int err = errno;
                 ::close(dup_in);
-                throw std::system_error(err, std::system_category(),
-                    "dup(stdout_fd)");
+                throw std::system_error(err, std::system_category(), "dup(stdout_fd)");
             }
             try {
                 async_in_  = std::make_unique<AsyncHandle>(ex, dup_in);
                 async_out_ = std::make_unique<AsyncHandle>(ex, dup_out);
             } catch (...) {
-                if (!async_in_)  ::close(dup_in);
+                if (!async_in_) ::close(dup_in);
                 if (!async_out_) ::close(dup_out);
                 async_in_.reset();
                 async_out_.reset();
@@ -744,20 +725,18 @@ StdioSession::rpc_call_async(const std::string& method, const json& params) {
         }
 
         if (!resp.contains("id")) continue;
-        if (resp["id"] != id)     continue;
+        if (resp["id"] != id) continue;
 
         if (resp.contains("error")) {
             auto err = resp["error"];
-            throw std::runtime_error(
-                "MCP stdio RPC error: " + err.value("message", "unknown"));
+            throw std::runtime_error("MCP stdio RPC error: " + err.value("message", "unknown"));
         }
         co_return resp.value("result", json::object());
     }
-    throw std::runtime_error(
-        "StdioSession::rpc_call_async: giving up after 1024 lines");
+    throw std::runtime_error("StdioSession::rpc_call_async: giving up after 1024 lines");
 }
 
-} // namespace detail
+}  // namespace detail
 
 // ===========================================================================
 // Shared helper — shape an MCP tools/call result into a string for the LLM.
@@ -776,7 +755,7 @@ std::string format_tool_result(const json& result) {
     }
     return result.dump();
 }
-} // namespace
+}  // namespace
 
 // ===========================================================================
 // MCPTool
@@ -785,53 +764,46 @@ std::string format_tool_result(const json& result) {
 MCPTool::MCPTool(const std::string& server_url,
                  const std::string& name,
                  const std::string& description,
-                 const json& input_schema)
-  : server_url_(server_url)
-  , stdio_session_(nullptr)
-  , name_(name)
-  , description_(description)
-  , input_schema_(input_schema)
-{
-}
+                 const json&        input_schema)
+    : server_url_(server_url),
+      stdio_session_(nullptr),
+      name_(name),
+      description_(description),
+      input_schema_(input_schema) {}
 
 MCPTool::MCPTool(std::shared_ptr<detail::StdioSession> session,
-                 const std::string& name,
-                 const std::string& description,
-                 const json& input_schema)
-  : server_url_()
-  , stdio_session_(std::move(session))
-  , name_(name)
-  , description_(description)
-  , input_schema_(input_schema)
-{
-}
+                 const std::string&                    name,
+                 const std::string&                    description,
+                 const json&                           input_schema)
+    : server_url_(),
+      stdio_session_(std::move(session)),
+      name_(name),
+      description_(description),
+      input_schema_(input_schema) {}
 
 ChatTool MCPTool::get_definition() const {
-    return { name_, description_, input_schema_ };
+    return {name_, description_, input_schema_};
 }
 
-std::string MCPTool::execute(const json& arguments) {
+asio::awaitable<std::string> MCPTool::execute_async(const json& arguments) {
     if (stdio_session_) {
-        json result = stdio_session_->rpc_call(
-            "tools/call",
-            json{{"name", name_}, {"arguments", arguments}});
-        return format_tool_result(result);
+        json result = co_await stdio_session_->rpc_call_async(
+            "tools/call", json{{"name", name_}, {"arguments", arguments}});
+        co_return format_tool_result(result);
     }
 
     // HTTP path (legacy) — one ephemeral client per call.
     MCPClient client(server_url_);
     client.initialize();
-    return format_tool_result(client.call_tool(name_, arguments));
+    co_return format_tool_result(client.call_tool(name_, arguments));
 }
 
 // ===========================================================================
 // MCPClient — HTTP transport
 // ===========================================================================
 
-MCPClient::MCPClient(const std::string& server_url)
-  : server_url_(server_url)
-{
-    host_ = server_url;
+MCPClient::MCPClient(const std::string& server_url) : server_url_(server_url) {
+    host_           = server_url;
     auto scheme_end = host_.find("://");
     if (scheme_end != std::string::npos) {
         auto path_start = host_.find('/', scheme_end + 3);
@@ -847,9 +819,7 @@ MCPClient::MCPClient(const std::string& server_url)
 // ===========================================================================
 
 MCPClient::MCPClient(std::vector<std::string> argv)
-  : stdio_session_(detail::StdioSession::spawn(argv))
-{
-}
+    : stdio_session_(detail::StdioSession::spawn(argv)) {}
 
 // ===========================================================================
 // MCPClient — RPC dispatch
@@ -862,8 +832,7 @@ json MCPClient::rpc_call(const std::string& method, const json& params) {
     return async::run_sync(rpc_call_async(method, params));
 }
 
-asio::awaitable<json>
-MCPClient::rpc_call_async(const std::string& method, const json& params) {
+asio::awaitable<json> MCPClient::rpc_call_async(const std::string& method, const json& params) {
     if (stdio_session_) {
         co_return co_await stdio_session_->rpc_call_async(method, params);
     }
@@ -880,8 +849,8 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
         this_id = ++request_id_;
         headers = {
             {"Content-Type", "application/json"},
-            {"Accept",       "application/json, text/event-stream"},
-            {"Host",         "localhost"},
+            {"Accept", "application/json, text/event-stream"},
+            {"Host", "localhost"},
         };
         if (!session_id_.empty()) {
             headers.emplace_back("Mcp-Session-Id", session_id_);
@@ -892,8 +861,7 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
         // Request without it. Skip on the initialize call itself —
         // negotiated_protocol_version_ is empty until initialize returns.
         if (!negotiated_protocol_version_.empty()) {
-            headers.emplace_back("MCP-Protocol-Version",
-                                 negotiated_protocol_version_);
+            headers.emplace_back("MCP-Protocol-Version", negotiated_protocol_version_);
         }
     }
 
@@ -902,7 +870,7 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
     body["id"]      = this_id;
     body["method"]  = method;
     body["params"]  = params;
-    auto body_str = body.dump();
+    auto body_str   = body.dump();
 
     auto endpoint = async::split_async_endpoint(server_url_);
 
@@ -913,9 +881,8 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
     // though the user gave a correct URL (issue #66). Only append the
     // suffix when it isn't already there.
     std::string path;
-    auto ends_with_mcp = [](const std::string& s) {
-        return s == "/mcp" ||
-               (s.size() > 4 && s.compare(s.size() - 4, 4, "/mcp") == 0);
+    auto        ends_with_mcp = [](const std::string& s) {
+        return s == "/mcp" || (s.size() > 4 && s.compare(s.size() - 4, 4, "/mcp") == 0);
     };
     if (endpoint.prefix.empty() || endpoint.prefix == "/") {
         path = "/mcp";
@@ -928,18 +895,11 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
     async::RequestOptions opts;
     opts.timeout = std::chrono::seconds(30);
 
-    auto ex = co_await asio::this_coro::executor;
+    auto ex = co_await  asio::this_coro::executor;
     async::HttpResponse res;
     try {
-        res = co_await async::async_post(
-            ex,
-            endpoint.host,
-            endpoint.port,
-            path,
-            body_str,
-            std::move(headers),
-            endpoint.tls,
-            opts);
+        res = co_await async::async_post(ex, endpoint.host, endpoint.port, path, body_str,
+                                         std::move(headers), endpoint.tls, opts);
     } catch (const std::system_error& e) {
         throw std::runtime_error(std::string("MCP request failed: ") + e.what());
     }
@@ -954,19 +914,18 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
     }
 
     if (res.status != 200) {
-        std::string scheme = endpoint.tls ? "https://" : "http://";
-        std::string full_url =
-            scheme + endpoint.host + ":" + endpoint.port + path;
+        std::string scheme   = endpoint.tls ? "https://" : "http://";
+        std::string full_url = scheme + endpoint.host + ":" + endpoint.port + path;
         std::string hint;
         if (res.status == 404) {
-            hint = " — the server has no MCP endpoint at this path. Check the "
-                   "configured URL (a trailing '/mcp' is added automatically, "
-                   "so pass the server base like 'http://host:8000' or the "
-                   "full 'http://host:8000/mcp').";
+            hint =
+                " — the server has no MCP endpoint at this path. Check the "
+                "configured URL (a trailing '/mcp' is added automatically, "
+                "so pass the server base like 'http://host:8000' or the "
+                "full 'http://host:8000/mcp').";
         }
-        throw std::runtime_error(
-            "MCP error (HTTP " + std::to_string(res.status) + ") for " +
-            full_url + ": " + res.body + hint);
+        throw std::runtime_error("MCP error (HTTP " + std::to_string(res.status) + ") for " +
+                                 full_url + ": " + res.body + hint);
     }
 
     // Parse response — may be plain JSON or SSE. Streamable HTTP can
@@ -981,26 +940,23 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
         // Parse SSE event stream: events separated by "\n\n", lines
         // within an event starting with "data:" are concatenated with
         // newlines per the W3C SSE spec.
-        json matched;
-        json last;
-        bool have_last = false;
-        size_t pos = 0;
+        json   matched;
+        json   last;
+        bool   have_last = false;
+        size_t pos       = 0;
         while (pos < res.body.size()) {
-            auto event_end = res.body.find("\n\n", pos);
-            std::string event = (event_end == std::string::npos)
-                                ? res.body.substr(pos)
-                                : res.body.substr(pos, event_end - pos);
-            pos = (event_end == std::string::npos)
-                  ? res.body.size()
-                  : event_end + 2;
+            auto        event_end = res.body.find("\n\n", pos);
+            std::string event     = (event_end == std::string::npos)
+                                        ? res.body.substr(pos)
+                                        : res.body.substr(pos, event_end - pos);
+            pos = (event_end == std::string::npos) ? res.body.size() : event_end + 2;
 
             std::string data;
-            size_t lp = 0;
+            size_t      lp = 0;
             while (lp < event.size()) {
-                auto nl = event.find('\n', lp);
-                std::string line = (nl == std::string::npos)
-                                   ? event.substr(lp)
-                                   : event.substr(lp, nl - lp);
+                auto        nl = event.find('\n', lp);
+                std::string line =
+                    (nl == std::string::npos) ? event.substr(lp) : event.substr(lp, nl - lp);
                 lp = (nl == std::string::npos) ? event.size() : nl + 1;
                 if (line.rfind("data:", 0) == 0) {
                     auto value = line.substr(5);
@@ -1012,11 +968,10 @@ MCPClient::rpc_call_async(const std::string& method, const json& params) {
             if (data.empty()) continue;
             try {
                 json frame = json::parse(data);
-                last = frame;
-                have_last = true;
-                if (frame.contains("id")
-                    && frame["id"].is_number_integer()
-                    && frame["id"].get<int>() == this_id) {
+                last       = frame;
+                have_last  = true;
+                if (frame.contains("id") && frame["id"].is_number_integer() &&
+                    frame["id"].get<int>() == this_id) {
                     matched = std::move(frame);
                     break;
                 }
@@ -1057,10 +1012,8 @@ bool MCPClient::initialize(const std::string& client_name) {
     auto init_result = rpc_call("initialize", params);
     {
         std::lock_guard lk(http_state_mu_);
-        if (init_result.contains("protocolVersion")
-            && init_result["protocolVersion"].is_string()) {
-            negotiated_protocol_version_ =
-                init_result["protocolVersion"].get<std::string>();
+        if (init_result.contains("protocolVersion") && init_result["protocolVersion"].is_string()) {
+            negotiated_protocol_version_ = init_result["protocolVersion"].get<std::string>();
         } else {
             // Server didn't echo a version back — assume it agreed to ours.
             negotiated_protocol_version_ = "2025-11-25";
@@ -1089,8 +1042,8 @@ bool MCPClient::initialize(const std::string& client_name) {
         std::lock_guard lk(http_state_mu_);
         headers = {
             {"Content-Type", "application/json"},
-            {"Accept",       "application/json, text/event-stream"},
-            {"Host",         "localhost"},
+            {"Accept", "application/json, text/event-stream"},
+            {"Host", "localhost"},
         };
         if (!session_id_.empty()) {
             headers.emplace_back("Mcp-Session-Id", session_id_);
@@ -1098,39 +1051,36 @@ bool MCPClient::initialize(const std::string& client_name) {
         // Spec MUST (transports / Streamable HTTP § "Protocol Version
         // Header"). Strict 2025-11-25 servers respond 400 without it.
         if (!negotiated_protocol_version_.empty()) {
-            headers.emplace_back("MCP-Protocol-Version",
-                                 negotiated_protocol_version_);
+            headers.emplace_back("MCP-Protocol-Version", negotiated_protocol_version_);
         }
     }
 
     auto notify_body = notify.dump();
-    auto res = async::run_sync([&]() -> asio::awaitable<async::HttpResponse> {
+    auto res         = async::run_sync([&]() -> asio::awaitable<async::HttpResponse> {
         auto ex = co_await asio::this_coro::executor;
-        co_return co_await async::async_post(
-            ex,
-            endpoint.host,
-            endpoint.port,
-            endpoint.prefix + "/mcp",
-            notify_body,
-            headers,
-            endpoint.tls);
+        co_return co_await async::async_post(ex, endpoint.host, endpoint.port,
+                                                     endpoint.prefix + "/mcp", notify_body, headers,
+                                                     endpoint.tls);
     }());
 
     // 200 OK and 202 Accepted are both valid per MCP spec for
     // notifications. Anything else is an error.
     if (res.status != 200 && res.status != 202 && res.status != 204) {
-        throw std::runtime_error(
-            "MCP initialize notification returned HTTP "
-            + std::to_string(res.status) + ": " + res.body);
+        throw std::runtime_error("MCP initialize notification returned HTTP " +
+                                 std::to_string(res.status) + ": " + res.body);
     }
 
     return true;
 }
 
 std::vector<std::unique_ptr<Tool>> MCPClient::get_tools() {
+    return async::run_sync(get_tools_async());
+}
+
+asio::awaitable<std::vector<std::unique_ptr<Tool>>> MCPClient::get_tools_async() {
     initialize();
 
-    auto result = rpc_call("tools/list", json::object());
+    auto result = co_await             rpc_call_async("tools/list", json::object());
     std::vector<std::unique_ptr<Tool>> tools;
 
     if (result.contains("tools") && result["tools"].is_array()) {
@@ -1140,23 +1090,25 @@ std::vector<std::unique_ptr<Tool>> MCPClient::get_tools() {
             auto schema = t.value("inputSchema", json::object());
 
             if (stdio_session_) {
-                tools.push_back(std::make_unique<MCPTool>(
-                    stdio_session_, name, desc, schema));
+                tools.push_back(std::make_unique<MCPTool>(stdio_session_, name, desc, schema));
             } else {
-                tools.push_back(std::make_unique<MCPTool>(
-                    server_url_, name, desc, schema));
+                tools.push_back(std::make_unique<MCPTool>(server_url_, name, desc, schema));
             }
         }
     }
 
-    return tools;
+    co_return tools;
 }
 
 json MCPClient::call_tool(const std::string& name, const json& arguments) {
+    return async::run_sync(call_tool_async(name, arguments));
+}
+
+asio::awaitable<json> MCPClient::call_tool_async(const std::string& name, const json& arguments) {
     json params;
     params["name"]      = name;
     params["arguments"] = arguments;
-    return rpc_call("tools/call", params);
+    co_return co_await rpc_call_async("tools/call", params);
 }
 
-} // namespace neograph::mcp
+}  // namespace neograph::mcp
