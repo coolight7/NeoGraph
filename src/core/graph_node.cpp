@@ -139,6 +139,7 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
                 tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
             }
         }
+        co_return tool_msg;
     };
 
     /// 并发执行 toolcall

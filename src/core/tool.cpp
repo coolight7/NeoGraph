@@ -18,7 +18,7 @@ std::string AsyncTool::execute(const json& arguments) {
     return neograph::async::run_sync(execute_async(arguments));
 }
 asio::awaitable<std::string> AsyncTool::real_execute_async(const json& arguments) {
-    co_return execute_async(arguments);
+    co_return co_await execute_async(arguments);
 }
 
 }  // namespace neograph

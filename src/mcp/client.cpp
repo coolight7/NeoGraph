@@ -787,15 +787,16 @@ ChatTool MCPTool::get_definition() const {
 
 asio::awaitable<std::string> MCPTool::execute_async(const json& arguments) {
     if (stdio_session_) {
-        json result = co_await stdio_session_->rpc_call_async(
+        auto result = co_await stdio_session_->rpc_call_async(
             "tools/call", json{{"name", name_}, {"arguments", arguments}});
         co_return format_tool_result(result);
     }
 
     // HTTP path (legacy) — one ephemeral client per call.
-    MCPClient client(server_url_);
+    auto client = MCPClient{server_url_};
     client.initialize();
-    co_return format_tool_result(client.call_tool(name_, arguments));
+    auto result = co_await client.call_tool_async(name_, arguments);
+    co_return              format_tool_result(result);
 }
 
 // ===========================================================================
