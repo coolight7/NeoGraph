@@ -12,6 +12,7 @@
 
 #include <asio/awaitable.hpp>
 
+#include <map>
 #include <string>
 
 namespace neograph {
@@ -20,13 +21,15 @@ namespace neograph {
  * @brief Abstract base class for tools that agents can call.
  *
  * A tool provides its definition (name, description, parameter schema)
- * so the LLM knows when and how to call it, and an execute() method
+ * so the LLM knows when and how to call it, and an real_execute_async() method
  * that performs the actual work.
  *
  * @see neograph::mcp::MCPTool for remote MCP server tools.
  */
 class NEOGRAPH_API Tool {
 public:
+    std::map<std::string, std::string> extra;
+
     virtual ~Tool() = default;
 
     /**
