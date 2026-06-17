@@ -100,6 +100,11 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
 ToolDispatchNode::ToolDispatchNode(const std::string& name, const NodeContext& ctx)
     : name_(name), tools_(ctx.tools) {}
 
+asio::awaitable<std::string> ToolDispatchNode::execTool(neograph::Tool* tool,
+                                                        neograph::json& args) const {
+    co_return co_await tool->real_execute_async(args);
+}
+
 asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     auto messages = in.state.get_messages();
     if (messages.empty()) co_return NodeOutput{};
@@ -134,7 +139,7 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
                 if (args.is_object() && args["thread_id"].is_null()) {
                     args["thread_id"] = in.ctx.thread_id;
                 }
-                tool_msg.content = co_await(*it)->real_execute_async(args);
+                tool_msg.content = co_await execTool(*it, args);
             } catch (const std::exception& e) {
                 tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
             }
