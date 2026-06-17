@@ -8,9 +8,9 @@
  * instantiation cost is paid once (here) rather than at every include
  * of provider.h.
  */
-#include <neograph/provider.h>
 #include <neograph/async/run_sync.h>
 #include <neograph/graph/cancel.h>
+#include <neograph/provider.h>
 
 #include <asio/dispatch.hpp>
 #include <asio/redirect_error.hpp>
@@ -23,6 +23,15 @@
 #include <memory>
 #include <optional>
 #include <thread>
+
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
 
 namespace neograph {
 
@@ -45,13 +54,12 @@ ChatCompletion Provider::complete(const CompletionParams& params) {
     return neograph::async::run_sync(complete_async(params), tok);
 }
 
-asio::awaitable<ChatCompletion>
-Provider::complete_async(const CompletionParams& params) {
+asio::awaitable<ChatCompletion> Provider::complete_async(const CompletionParams& params) {
     co_return complete(params);
 }
 
 ChatCompletion Provider::complete_stream(const CompletionParams& params,
-                                         const StreamCallback& on_chunk) {
+                                         const StreamCallback&   on_chunk) {
     // Issue #22: default body so mocks / test fixtures / non-streaming
     // demos don't have to stub out a four-line override that does
     // exactly this. Streaming-native subclasses (OpenAI / schema-driven
@@ -63,9 +71,8 @@ ChatCompletion Provider::complete_stream(const CompletionParams& params,
     return result;
 }
 
-asio::awaitable<ChatCompletion>
-Provider::complete_stream_async(const CompletionParams& params,
-                                const StreamCallback& on_chunk) {
+asio::awaitable<ChatCompletion> Provider::complete_stream_async(const CompletionParams& params,
+                                                                const StreamCallback&   on_chunk) {
     // Issue #4 fix: previous implementation was `co_return
     // complete_stream(params, on_chunk)`, which blocked the awaiting
     // coroutine's executor for the full duration of the stream. With
@@ -95,7 +102,7 @@ Provider::complete_stream_async(const CompletionParams& params,
 
     struct Shared {
         std::optional<ChatCompletion> result;
-        std::exception_ptr err;
+        std::exception_ptr            err;
     };
     auto shared = std::make_shared<Shared>();
 
@@ -128,8 +135,8 @@ Provider::complete_stream_async(const CompletionParams& params,
     // Suspend until the worker fires cancel(). async_wait completes
     // with operation_aborted on cancel — we don't care about the ec
     // value, only that we resumed.
-    asio::error_code ec;
-    co_await done->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    neograph_asio_error_code ec;
+    co_await                 done->async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
     if (shared->err) std::rethrow_exception(shared->err);
     co_return std::move(*shared->result);
@@ -153,8 +160,8 @@ Provider::complete_stream_async(const CompletionParams& params,
 // before calling invoke(); user code passes their own token. The
 // legacy `current_cancel_token()` thread_local fallback is gone with
 // `CurrentCancelTokenScope` (see 9d).
-asio::awaitable<ChatCompletion>
-Provider::invoke(const CompletionParams& params, StreamCallback on_chunk) {
+asio::awaitable<ChatCompletion> Provider::invoke(const CompletionParams& params,
+                                                 StreamCallback          on_chunk) {
     if (on_chunk) {
         co_return co_await complete_stream_async(params, on_chunk);
     }
@@ -163,4 +170,4 @@ Provider::invoke(const CompletionParams& params, StreamCallback on_chunk) {
 
 NEOGRAPH_POP_IGNORE_DEPRECATED
 
-} // namespace neograph
+}  // namespace neograph

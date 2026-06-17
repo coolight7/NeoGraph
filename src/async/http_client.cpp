@@ -19,8 +19,8 @@
 //      this library actually talks to).
 
 #include <neograph/async/http_client.h>
-#include "http_exchange_detail.h"
 
+#include "http_exchange_detail.h"
 #include <asio/buffer.hpp>
 #include <asio/connect.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
@@ -44,12 +44,11 @@ std::string_view HttpResponse::get_header(std::string_view name) const noexcept 
     // (response typically has 5-20 entries), so a linear scan beats
     // allocating a lowercase name key + map lookup.
     auto ieq = [](char a, char b) {
-        return std::tolower(static_cast<unsigned char>(a))
-            == std::tolower(static_cast<unsigned char>(b));
+        return std::tolower(static_cast<unsigned char>(a)) ==
+               std::tolower(static_cast<unsigned char>(b));
     };
     for (const auto& [k, v] : headers) {
-        if (k.size() == name.size() &&
-            std::equal(k.begin(), k.end(), name.begin(), ieq)) {
+        if (k.size() == name.size() && std::equal(k.begin(), k.end(), name.begin(), ieq)) {
             return v;
         }
     }
@@ -77,22 +76,19 @@ struct Target {
 // (scheme-less but not starting with '/', which we conservatively
 // reject rather than guess).
 Target parse_location(const Target& cur, std::string_view loc) {
-    Target out = cur;
-    auto starts_with = [](std::string_view s, std::string_view p) {
+    Target out         = cur;
+    auto   starts_with = [](std::string_view s, std::string_view p) {
         return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
     };
 
     if (starts_with(loc, "http://") || starts_with(loc, "https://")) {
-        const bool https = starts_with(loc, "https://");
-        std::string_view rest = loc.substr(https ? 8 : 7);
-        out.tls = https;
+        const bool       https = starts_with(loc, "https://");
+        std::string_view rest  = loc.substr(https ? 8 : 7);
+        out.tls                = https;
 
-        auto slash = rest.find('/');
-        std::string_view authority =
-            slash == std::string_view::npos ? rest : rest.substr(0, slash);
-        out.path = slash == std::string_view::npos
-                       ? "/"
-                       : std::string(rest.substr(slash));
+        auto             slash     = rest.find('/');
+        std::string_view authority = slash == std::string_view::npos ? rest : rest.substr(0, slash);
+        out.path = slash == std::string_view::npos ? "/" : std::string(rest.substr(slash));
 
         auto colon = authority.find(':');
         if (colon == std::string_view::npos) {
@@ -116,8 +112,7 @@ Target parse_location(const Target& cur, std::string_view loc) {
 }
 
 constexpr bool is_redirect_status(int status) noexcept {
-    return status == 301 || status == 302 || status == 303 ||
-           status == 307 || status == 308;
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
 // ── Single-exchange primitives ────────────────────────────────────
@@ -125,25 +120,25 @@ constexpr bool is_redirect_status(int status) noexcept {
 // with timeout + redirect logic.
 
 asio::awaitable<HttpResponse> async_post_once(
-    asio::any_io_executor ex,
-    std::string host, std::string port, std::string path,
-    std::string body,
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls) {
-
+    bool                                             tls) {
     asio::ip::tcp::resolver resolver{ex};
-    auto endpoints = co_await resolver.async_resolve(
-        host, port, asio::use_awaitable);
+    auto endpoints = co_await resolver.async_resolve(host, port, asio::use_awaitable);
 
     asio::ip::tcp::socket sock{ex};
-    co_await asio::async_connect(sock, endpoints, asio::use_awaitable);
+    co_await              asio::async_connect(sock, endpoints, asio::use_awaitable);
 
-    std::string req = detail::build_request(
-        host, path, body, headers, detail::ConnDirective::close);
+    std::string req =
+        detail::build_request(host, path, body, headers, detail::ConnDirective::close);
 
     if (!tls) {
-        auto r = co_await detail::run_exchange(sock, req);
-        asio::error_code ec;
+        auto r = co_await        detail::run_exchange(sock, req);
+        neograph_asio_error_code ec;
         sock.set_option(asio::socket_base::linger(true, 0), ec);
         sock.close(ec);
         co_return r.response;
@@ -155,14 +150,13 @@ asio::awaitable<HttpResponse> async_post_once(
 
     asio::ssl::stream<asio::ip::tcp::socket&> tls_stream{sock, ctx};
     if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
-                             asio::error::get_ssl_category()},
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
+                                     asio::error::get_ssl_category()},
             "SNI setup"};
     }
     tls_stream.set_verify_callback(asio::ssl::host_name_verification{host});
-    co_await tls_stream.async_handshake(
-        asio::ssl::stream_base::client, asio::use_awaitable);
+    co_await tls_stream.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
 
     auto r = co_await detail::run_exchange(tls_stream, req);
 
@@ -171,35 +165,35 @@ asio::awaitable<HttpResponse> async_post_once(
     } catch (const std::exception&) {
         // Peer commonly closes first after responding — benign.
     }
-    asio::error_code ec;
+    neograph_asio_error_code ec;
     sock.close(ec);
     co_return r.response;
 }
 
 asio::awaitable<HttpStreamResponse> async_post_stream_once(
-    asio::any_io_executor ex,
-    std::string host, std::string port, std::string path,
-    std::string body,
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    std::function<void(std::string_view chunk)> on_chunk) {
-
+    bool                                             tls,
+    std::function<void(std::string_view chunk)>      on_chunk) {
     asio::ip::tcp::resolver resolver{ex};
-    auto endpoints = co_await resolver.async_resolve(
-        host, port, asio::use_awaitable);
+    auto endpoints = co_await resolver.async_resolve(host, port, asio::use_awaitable);
 
     asio::ip::tcp::socket sock{ex};
-    co_await asio::async_connect(sock, endpoints, asio::use_awaitable);
+    co_await              asio::async_connect(sock, endpoints, asio::use_awaitable);
 
-    std::string req = detail::build_request(
-        host, path, body, headers, detail::ConnDirective::close);
+    std::string req =
+        detail::build_request(host, path, body, headers, detail::ConnDirective::close);
 
     HttpStreamResponse out;
 
     if (!tls) {
-        auto r = co_await detail::run_exchange_stream(sock, req, on_chunk);
+        auto r     = co_await detail::run_exchange_stream(sock, req, on_chunk);
         out.status = r.status;
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.set_option(asio::socket_base::linger(true, 0), ec);
         sock.close(ec);
         co_return out;
@@ -211,16 +205,15 @@ asio::awaitable<HttpStreamResponse> async_post_stream_once(
 
     asio::ssl::stream<asio::ip::tcp::socket&> tls_stream{sock, ctx};
     if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
-                             asio::error::get_ssl_category()},
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
+                                     asio::error::get_ssl_category()},
             "SNI setup"};
     }
     tls_stream.set_verify_callback(asio::ssl::host_name_verification{host});
-    co_await tls_stream.async_handshake(
-        asio::ssl::stream_base::client, asio::use_awaitable);
+    co_await tls_stream.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
 
-    auto r = co_await detail::run_exchange_stream(tls_stream, req, on_chunk);
+    auto r     = co_await detail::run_exchange_stream(tls_stream, req, on_chunk);
     out.status = r.status;
 
     try {
@@ -228,7 +221,7 @@ asio::awaitable<HttpStreamResponse> async_post_stream_once(
     } catch (const std::exception&) {
         // Peer commonly closes first on long streams — benign.
     }
-    asio::error_code ec;
+    neograph_asio_error_code ec;
     sock.close(ec);
     co_return out;
 }
@@ -244,54 +237,55 @@ asio::awaitable<HttpStreamResponse> async_post_stream_once(
 // behavior bit-identical to the pre-1.5 free functions.
 
 asio::awaitable<HttpResponse> async_post_once_timed(
-    asio::any_io_executor ex,
-    std::string host, std::string port, std::string path,
-    std::string body,
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls, std::chrono::milliseconds timeout) {
+    bool                                             tls,
+    std::chrono::milliseconds                        timeout) {
     if (timeout.count() <= 0) {
-        co_return co_await async_post_once(
-            ex, std::move(host), std::move(port), std::move(path),
-            std::move(body), std::move(headers), tls);
+        co_return co_await async_post_once(ex, std::move(host), std::move(port), std::move(path),
+                                           std::move(body), std::move(headers), tls);
     }
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(ex);
     timer.expires_after(timeout);
-    auto res = co_await (
-        async_post_once(ex, std::move(host), std::move(port), std::move(path),
-                        std::move(body), std::move(headers), tls)
-        || timer.async_wait(asio::use_awaitable));
+    auto res = co_await(async_post_once(ex, std::move(host), std::move(port), std::move(path),
+                                        std::move(body), std::move(headers), tls) ||
+                        timer.async_wait(asio::use_awaitable));
     if (res.index() == 1) {
-        throw asio::system_error(asio::error::timed_out,
-                                 "async_post: per-hop timeout");
+        throw neograph_asio_system_error(asio::error::timed_out, "async_post: per-hop timeout");
     }
     co_return std::get<0>(std::move(res));
 }
 
 asio::awaitable<HttpStreamResponse> async_post_stream_once_timed(
-    asio::any_io_executor ex,
-    std::string host, std::string port, std::string path,
-    std::string body,
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    std::function<void(std::string_view chunk)> on_chunk,
-    std::chrono::milliseconds timeout) {
+    bool                                             tls,
+    std::function<void(std::string_view chunk)>      on_chunk,
+    std::chrono::milliseconds                        timeout) {
     if (timeout.count() <= 0) {
-        co_return co_await async_post_stream_once(
-            ex, std::move(host), std::move(port), std::move(path),
-            std::move(body), std::move(headers), tls, std::move(on_chunk));
+        co_return co_await async_post_stream_once(ex, std::move(host), std::move(port),
+                                                  std::move(path), std::move(body),
+                                                  std::move(headers), tls, std::move(on_chunk));
     }
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(ex);
     timer.expires_after(timeout);
-    auto res = co_await (
-        async_post_stream_once(ex, std::move(host), std::move(port),
-                               std::move(path), std::move(body),
-                               std::move(headers), tls, std::move(on_chunk))
-        || timer.async_wait(asio::use_awaitable));
+    auto res = co_await(async_post_stream_once(ex, std::move(host), std::move(port),
+                                               std::move(path), std::move(body), std::move(headers),
+                                               tls, std::move(on_chunk)) ||
+                        timer.async_wait(asio::use_awaitable));
     if (res.index() == 1) {
-        throw asio::system_error(asio::error::timed_out,
-                                 "async_post_stream: per-hop timeout");
+        throw neograph_asio_system_error(asio::error::timed_out,
+                                         "async_post_stream: per-hop timeout");
     }
     co_return std::get<0>(std::move(res));
 }
@@ -300,25 +294,20 @@ asio::awaitable<HttpStreamResponse> async_post_stream_once_timed(
 
 // ── Public API ────────────────────────────────────────────────────
 
-asio::awaitable<HttpResponse> async_post(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
-    std::string_view body,
-    std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    RequestOptions opts) {
-
-    Target cur{
-        std::string(host), std::string(port), std::string(path), tls
-    };
+asio::awaitable<HttpResponse> async_post(asio::any_io_executor                            ex,
+                                         std::string_view                                 host,
+                                         std::string_view                                 port,
+                                         std::string_view                                 path,
+                                         std::string_view                                 body,
+                                         std::vector<std::pair<std::string, std::string>> headers,
+                                         bool                                             tls,
+                                         RequestOptions                                   opts) {
+    Target      cur{std::string(host), std::string(port), std::string(path), tls};
     std::string req_body(body);
-    int hops = 0;
+    int         hops = 0;
     for (;;) {
-        auto resp = co_await async_post_once_timed(
-            ex, cur.host, cur.port, cur.path,
-            req_body, headers, cur.tls, opts.timeout);
+        auto resp = co_await async_post_once_timed(ex, cur.host, cur.port, cur.path, req_body,
+                                                   headers, cur.tls, opts.timeout);
 
         if (!is_redirect_status(resp.status) || opts.max_redirects <= 0) {
             co_return resp;
@@ -344,24 +333,24 @@ asio::awaitable<HttpResponse> async_post(
 // RequestOptions) is enforced through the same pattern as POST.
 
 asio::awaitable<HttpResponse> async_get_once(
-    asio::any_io_executor ex,
-    std::string host, std::string port, std::string path,
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls) {
-
+    bool                                             tls) {
     asio::ip::tcp::resolver resolver{ex};
-    auto endpoints = co_await resolver.async_resolve(
-        host, port, asio::use_awaitable);
+    auto endpoints = co_await resolver.async_resolve(host, port, asio::use_awaitable);
 
     asio::ip::tcp::socket sock{ex};
-    co_await asio::async_connect(sock, endpoints, asio::use_awaitable);
+    co_await              asio::async_connect(sock, endpoints, asio::use_awaitable);
 
-    std::string req = detail::build_request(
-        host, path, /*body=*/"", headers, detail::ConnDirective::close, "GET");
+    std::string req = detail::build_request(host, path, /*body=*/"", headers,
+                                            detail::ConnDirective::close, "GET");
 
     if (!tls) {
-        auto r = co_await detail::run_exchange(sock, req);
-        asio::error_code ec;
+        auto r = co_await        detail::run_exchange(sock, req);
+        neograph_asio_error_code ec;
         sock.set_option(asio::socket_base::linger(true, 0), ec);
         sock.close(ec);
         co_return r.response;
@@ -373,14 +362,13 @@ asio::awaitable<HttpResponse> async_get_once(
 
     asio::ssl::stream<asio::ip::tcp::socket&> tls_stream{sock, ctx};
     if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
-                             asio::error::get_ssl_category()},
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
+                                     asio::error::get_ssl_category()},
             "SNI setup"};
     }
     tls_stream.set_verify_callback(asio::ssl::host_name_verification{host});
-    co_await tls_stream.async_handshake(
-        asio::ssl::stream_base::client, asio::use_awaitable);
+    co_await tls_stream.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
 
     auto r = co_await detail::run_exchange(tls_stream, req);
     try {
@@ -388,76 +376,69 @@ asio::awaitable<HttpResponse> async_get_once(
     } catch (const std::exception&) {
         // Peer commonly closes first after responding — benign.
     }
-    asio::error_code ec;
+    neograph_asio_error_code ec;
     sock.close(ec);
     co_return r.response;
 }
 
 asio::awaitable<HttpResponse> async_get_once_timed(
-    asio::any_io_executor ex,
-    std::string host, std::string port, std::string path,
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls, std::chrono::milliseconds timeout) {
+    bool                                             tls,
+    std::chrono::milliseconds                        timeout) {
     if (timeout.count() <= 0) {
-        co_return co_await async_get_once(
-            ex, std::move(host), std::move(port), std::move(path),
-            std::move(headers), tls);
+        co_return co_await async_get_once(ex, std::move(host), std::move(port), std::move(path),
+                                          std::move(headers), tls);
     }
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(ex);
     timer.expires_after(timeout);
-    auto res = co_await (
-        async_get_once(ex, std::move(host), std::move(port), std::move(path),
-                       std::move(headers), tls)
-        || timer.async_wait(asio::use_awaitable));
+    auto res = co_await(async_get_once(ex, std::move(host), std::move(port), std::move(path),
+                                       std::move(headers), tls) ||
+                        timer.async_wait(asio::use_awaitable));
     if (res.index() == 1) {
-        throw asio::system_error(asio::error::timed_out,
-                                 "async_get: per-hop timeout");
+        throw neograph_asio_system_error(asio::error::timed_out, "async_get: per-hop timeout");
     }
     co_return std::get<0>(std::move(res));
 }
 
-asio::awaitable<HttpResponse> async_get(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
-    std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    RequestOptions opts) {
-
-    co_return co_await async_get_once_timed(
-        ex, std::string(host), std::string(port), std::string(path),
-        std::move(headers), tls, opts.timeout);
+asio::awaitable<HttpResponse> async_get(asio::any_io_executor                            ex,
+                                        std::string_view                                 host,
+                                        std::string_view                                 port,
+                                        std::string_view                                 path,
+                                        std::vector<std::pair<std::string, std::string>> headers,
+                                        bool                                             tls,
+                                        RequestOptions                                   opts) {
+    co_return co_await async_get_once_timed(ex, std::string(host), std::string(port),
+                                            std::string(path), std::move(headers), tls,
+                                            opts.timeout);
 }
 
 asio::awaitable<HttpStreamResponse> async_post_stream(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
-    std::string_view body,
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
+    std::string_view                                 body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    std::function<void(std::string_view chunk)> on_chunk,
-    RequestOptions opts) {
-
+    bool                                             tls,
+    std::function<void(std::string_view chunk)>      on_chunk,
+    RequestOptions                                   opts) {
     // Streaming redirects are an uncommon combination (servers that
     // stream don't tend to return 3xx on the same path). Follow them
     // only if asked, by retrying the whole exchange — callers that
     // configured on_chunk should be aware it can fire twice if a
     // redirect occurs. In practice, streaming endpoints always return
     // 200 or a fixed-body error, so this loop usually runs once.
-    Target cur{
-        std::string(host), std::string(port), std::string(path), tls
-    };
+    Target      cur{std::string(host), std::string(port), std::string(path), tls};
     std::string req_body(body);
-    int hops = 0;
+    int         hops = 0;
     for (;;) {
         auto resp = co_await async_post_stream_once_timed(
-            ex, cur.host, cur.port, cur.path,
-            req_body, headers, cur.tls,
-            on_chunk, opts.timeout);
+            ex, cur.host, cur.port, cur.path, req_body, headers, cur.tls, on_chunk, opts.timeout);
 
         if (!is_redirect_status(resp.status) || opts.max_redirects <= 0) {
             co_return resp;
@@ -473,4 +454,4 @@ asio::awaitable<HttpStreamResponse> async_post_stream(
     }
 }
 
-} // namespace neograph::async
+}  // namespace neograph::async

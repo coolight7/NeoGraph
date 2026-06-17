@@ -39,6 +39,15 @@
 #include <utility>
 #include <vector>
 
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
+
 namespace neograph::async {
 
 struct ConnPoolOptions {
@@ -54,15 +63,14 @@ struct ConnPoolOptions {
 
 class NEOGRAPH_API ConnPool {
 public:
-    explicit ConnPool(asio::any_io_executor ex,
-                      ConnPoolOptions opts = {});
+    explicit ConnPool(asio::any_io_executor ex, ConnPoolOptions opts = {});
     ~ConnPool();
 
-    ConnPool(const ConnPool&) = delete;
+    ConnPool(const ConnPool&)            = delete;
     ConnPool& operator=(const ConnPool&) = delete;
 
     /// Pooled HTTP(S) POST. See free async_post for parameter
-    /// semantics. Throws asio::system_error on fresh-connection
+    /// semantics. Throws neograph_asio_system_error on fresh-connection
     /// failure (DNS, connect, TLS handshake, write/read of the
     /// second attempt). A stale-idle-conn failure is absorbed.
     /// Pooled HTTP(S) POST. See free async_post for parameter
@@ -74,13 +82,13 @@ public:
     /// too much for the library to do behind the caller's back.
     /// Use the free async_post for redirect-following.
     asio::awaitable<HttpResponse> async_post(
-        std::string_view host,
-        std::string_view port,
-        std::string_view path,
-        std::string_view body,
+        std::string_view                                 host,
+        std::string_view                                 port,
+        std::string_view                                 path,
+        std::string_view                                 body,
         std::vector<std::pair<std::string, std::string>> headers = {},
-        bool tls = false,
-        RequestOptions opts = {});
+        bool                                             tls     = false,
+        RequestOptions                                   opts    = {});
 
     /// Total idle connections across all host buckets. Diagnostic.
     std::size_t idle_count() const;
@@ -90,4 +98,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace neograph::async
+}  // namespace neograph::async

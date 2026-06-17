@@ -21,17 +21,15 @@
 #include <asio/ssl/host_name_verification.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
-
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
-
-#include <iostream>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -52,9 +50,8 @@ std::string base64_encode(const std::uint8_t* data, std::size_t len) {
     // EVP_EncodeBlock writes ceil(len/3)*4 bytes + NUL. No newlines.
     std::string out;
     out.resize(4 * ((len + 2) / 3));
-    int written = ::EVP_EncodeBlock(
-        reinterpret_cast<unsigned char*>(out.data()),
-        data, static_cast<int>(len));
+    int written = ::EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), data,
+                                    static_cast<int>(len));
     if (written < 0) {
         throw std::runtime_error("base64_encode: EVP_EncodeBlock failed");
     }
@@ -64,15 +61,13 @@ std::string base64_encode(const std::uint8_t* data, std::size_t len) {
 
 }  // namespace
 
-void apply_mask(char* data, std::size_t len,
-                const std::uint8_t mask_key[4]) noexcept {
+void apply_mask(char* data, std::size_t len, const std::uint8_t mask_key[4]) noexcept {
     // Byte-wise XOR is plenty fast for the payload sizes we see
     // (Responses frames are typically < 16 KB). A 32-bit SWAR pass
     // would save maybe microseconds on multi-MB frames — not worth
     // the endian branch here.
     for (std::size_t i = 0; i < len; ++i) {
-        data[i] = static_cast<char>(
-            static_cast<std::uint8_t>(data[i]) ^ mask_key[i & 3]);
+        data[i] = static_cast<char>(static_cast<std::uint8_t>(data[i]) ^ mask_key[i & 3]);
     }
 }
 
@@ -82,7 +77,7 @@ std::optional<WsFrameHeader> parse_frame_header(std::string_view buf) {
     auto b1 = static_cast<std::uint8_t>(buf[1]);
 
     WsFrameHeader h{};
-    h.fin    = (b0 & 0x80) != 0;
+    h.fin = (b0 & 0x80) != 0;
     // RSV1/2/3 must be zero — we don't negotiate any extension.
     if ((b0 & 0x70) != 0) {
         throw std::runtime_error("ws: reserved bits set (RSV1/2/3)");
@@ -90,24 +85,22 @@ std::optional<WsFrameHeader> parse_frame_header(std::string_view buf) {
     h.opcode = static_cast<WsOpcode>(b0 & 0x0F);
     h.masked = (b1 & 0x80) != 0;
 
-    const std::uint8_t len7 = b1 & 0x7F;
-    std::size_t cursor = 2;
+    const std::uint8_t len7   = b1 & 0x7F;
+    std::size_t        cursor = 2;
 
     if (len7 < 126) {
         h.payload_len = len7;
     } else if (len7 == 126) {
         if (buf.size() < cursor + 2) return std::nullopt;
-        h.payload_len =
-            (static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[cursor])) << 8) |
-             static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[cursor + 1]));
+        h.payload_len = (static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[cursor])) << 8) |
+                        static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[cursor + 1]));
         cursor += 2;
     } else {
         // len7 == 127 → 8-byte length. MSB must be zero per §5.2.
         if (buf.size() < cursor + 8) return std::nullopt;
         std::uint64_t v = 0;
         for (int i = 0; i < 8; ++i) {
-            v = (v << 8) |
-                static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[cursor + i]));
+            v = (v << 8) | static_cast<std::uint64_t>(static_cast<std::uint8_t>(buf[cursor + i]));
         }
         if ((v & (std::uint64_t{1} << 63)) != 0) {
             throw std::runtime_error("ws: 64-bit length has MSB set");
@@ -128,14 +121,12 @@ std::optional<WsFrameHeader> parse_frame_header(std::string_view buf) {
     return h;
 }
 
-void encode_frame_header(
-    std::string& out,
-    WsOpcode opcode,
-    bool fin,
-    bool masked,
-    std::uint64_t payload_len,
-    const std::uint8_t mask_key[4]) {
-
+void encode_frame_header(std::string&       out,
+                         WsOpcode           opcode,
+                         bool               fin,
+                         bool               masked,
+                         std::uint64_t      payload_len,
+                         const std::uint8_t mask_key[4]) {
     std::uint8_t b0 = static_cast<std::uint8_t>(opcode) & 0x0F;
     if (fin) b0 |= 0x80;
     out.push_back(static_cast<char>(b0));
@@ -176,8 +167,7 @@ std::string compute_sec_websocket_accept(std::string_view client_key) {
     concat.append(kWebSocketGuid, sizeof(kWebSocketGuid) - 1);
 
     std::uint8_t digest[SHA_DIGEST_LENGTH];
-    ::SHA1(reinterpret_cast<const unsigned char*>(concat.data()),
-           concat.size(), digest);
+    ::SHA1(reinterpret_cast<const unsigned char*>(concat.data()), concat.size(), digest);
     return base64_encode(digest, sizeof digest);
 }
 
@@ -197,7 +187,7 @@ struct WsClient::Impl {
     // Bytes read but not yet consumed by frame parsing.
     std::string read_buf;
 
-    bool close_sent = false;
+    bool close_sent     = false;
     bool close_received = false;
 
     explicit Impl(asio::any_io_executor ex) : socket(ex) {}
@@ -237,16 +227,14 @@ struct WsClient::Impl {
 
     /// Encode + mask + write a frame. Client → server frames MUST be
     /// masked per RFC 6455 §5.3.
-    asio::awaitable<void> write_frame(
-        WsOpcode opcode, bool fin, std::string_view payload) {
+    asio::awaitable<void> write_frame(WsOpcode opcode, bool fin, std::string_view payload) {
         std::uint8_t mask_key[4];
         if (::RAND_bytes(mask_key, sizeof mask_key) != 1) {
             throw std::runtime_error("ws: RAND_bytes failed");
         }
         std::string header;
         header.reserve(14);
-        detail::encode_frame_header(
-            header, opcode, fin, /*masked=*/true, payload.size(), mask_key);
+        detail::encode_frame_header(header, opcode, fin, /*masked=*/true, payload.size(), mask_key);
         std::string masked(payload);
         detail::apply_mask(masked.data(), masked.size(), mask_key);
         std::string combined;
@@ -258,8 +246,8 @@ struct WsClient::Impl {
 };
 
 WsClient::WsClient(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
-WsClient::~WsClient() = default;
-WsClient::WsClient(WsClient&&) noexcept = default;
+WsClient::~WsClient()                              = default;
+WsClient::WsClient(WsClient&&) noexcept            = default;
 WsClient& WsClient::operator=(WsClient&&) noexcept = default;
 
 // ── Frame send/recv ───────────────────────────────────────────────
@@ -274,8 +262,7 @@ asio::awaitable<void> WsClient::send_binary(std::string_view payload) {
     co_return;
 }
 
-asio::awaitable<void> WsClient::send_close(
-    std::uint16_t code, std::string_view reason) {
+asio::awaitable<void> WsClient::send_close(std::uint16_t code, std::string_view reason) {
     if (impl_->close_sent) co_return;
     std::string payload;
     payload.reserve(2 + reason.size());
@@ -292,9 +279,9 @@ asio::awaitable<WsMessage> WsClient::recv() {
     // the real opcode (Text/Binary) with FIN=0; subsequent
     // Continuation frames carry FIN=0 until the final FIN=1. Control
     // frames (§5.5) may be interleaved and are handled inline.
-    WsOpcode message_op = WsOpcode::Continuation;
+    WsOpcode    message_op = WsOpcode::Continuation;
     std::string assembled;
-    bool started = false;
+    bool        started = false;
 
     for (;;) {
         // Parse header (may need multiple reads to have enough bytes).
@@ -316,9 +303,8 @@ asio::awaitable<WsMessage> WsClient::recv() {
             co_await impl_->ensure_available(needed);
         }
 
-        std::string_view payload(
-            impl_->read_buf.data() + header->header_size,
-            static_cast<std::size_t>(header->payload_len));
+        std::string_view payload(impl_->read_buf.data() + header->header_size,
+                                 static_cast<std::size_t>(header->payload_len));
 
         // Handle control frames (§5.5) independently of assembly.
         // Control frames MUST NOT be fragmented and payload ≤ 125.
@@ -350,8 +336,7 @@ asio::awaitable<WsMessage> WsClient::recv() {
                 impl_->close_received = true;
                 // Echo close back if we haven't already (§5.5.1).
                 if (!impl_->close_sent) {
-                    co_await impl_->write_frame(
-                        WsOpcode::Close, true, close_payload);
+                    co_await impl_->write_frame(WsOpcode::Close, true, close_payload);
                     impl_->close_sent = true;
                 }
                 co_return WsMessage{WsOpcode::Close, std::move(close_payload)};
@@ -363,19 +348,16 @@ asio::awaitable<WsMessage> WsClient::recv() {
         // Data frame: Text / Binary / Continuation.
         if (!started) {
             if (header->opcode == WsOpcode::Continuation) {
-                throw std::runtime_error(
-                    "ws: continuation frame without initial data frame");
+                throw std::runtime_error("ws: continuation frame without initial data frame");
             }
-            if (header->opcode != WsOpcode::Text &&
-                header->opcode != WsOpcode::Binary) {
+            if (header->opcode != WsOpcode::Text && header->opcode != WsOpcode::Binary) {
                 throw std::runtime_error("ws: unknown opcode");
             }
             message_op = header->opcode;
-            started = true;
+            started    = true;
         } else {
             if (header->opcode != WsOpcode::Continuation) {
-                throw std::runtime_error(
-                    "ws: new data frame mid-fragmentation");
+                throw std::runtime_error("ws: new data frame mid-fragmentation");
             }
         }
 
@@ -410,13 +392,12 @@ bool ieq(std::string_view a, std::string_view b) {
 /// of header name → last value (we don't care about duplicates for
 /// the handshake check).
 struct ParsedUpgradeResponse {
-    int status = 0;
+    int                                              status = 0;
     std::vector<std::pair<std::string, std::string>> headers;
-    std::size_t consumed = 0;
+    std::size_t                                      consumed = 0;
 };
 
-std::optional<ParsedUpgradeResponse> try_parse_upgrade_response(
-    std::string_view buf) {
+std::optional<ParsedUpgradeResponse> try_parse_upgrade_response(std::string_view buf) {
     auto end = buf.find("\r\n\r\n");
     if (end == std::string_view::npos) return std::nullopt;
     std::string_view head = buf.substr(0, end);
@@ -424,18 +405,17 @@ std::optional<ParsedUpgradeResponse> try_parse_upgrade_response(
     ParsedUpgradeResponse out;
     out.consumed = end + 4;
 
-    auto line_end = head.find("\r\n");
+    auto             line_end    = head.find("\r\n");
     std::string_view status_line = head.substr(0, line_end);
     // "HTTP/1.1 101 Switching Protocols"
     auto sp1 = status_line.find(' ');
     if (sp1 == std::string_view::npos) {
         throw std::runtime_error("ws: malformed status line");
     }
-    auto rest = status_line.substr(sp1 + 1);
-    auto sp2 = rest.find(' ');
-    std::string_view code_str =
-        sp2 == std::string_view::npos ? rest : rest.substr(0, sp2);
-    int code = 0;
+    auto             rest     = status_line.substr(sp1 + 1);
+    auto             sp2      = rest.find(' ');
+    std::string_view code_str = sp2 == std::string_view::npos ? rest : rest.substr(0, sp2);
+    int              code     = 0;
     for (char c : code_str) {
         if (c < '0' || c > '9') {
             throw std::runtime_error("ws: non-numeric status code");
@@ -446,13 +426,13 @@ std::optional<ParsedUpgradeResponse> try_parse_upgrade_response(
 
     std::size_t p = (line_end == std::string_view::npos ? head.size() : line_end + 2);
     while (p < head.size()) {
-        auto nl = head.find("\r\n", p);
-        std::string_view line = head.substr(
-            p, nl == std::string_view::npos ? head.size() - p : nl - p);
+        auto             nl = head.find("\r\n", p);
+        std::string_view line =
+            head.substr(p, nl == std::string_view::npos ? head.size() - p : nl - p);
         if (line.empty()) break;
         auto colon = line.find(':');
         if (colon != std::string_view::npos) {
-            std::string_view name = line.substr(0, colon);
+            std::string_view name  = line.substr(0, colon);
             std::string_view value = line.substr(colon + 1);
             while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
                 value.remove_prefix(1);
@@ -468,9 +448,8 @@ std::optional<ParsedUpgradeResponse> try_parse_upgrade_response(
     return out;
 }
 
-std::string_view find_header(
-    const std::vector<std::pair<std::string, std::string>>& headers,
-    std::string_view name) {
+std::string_view find_header(const std::vector<std::pair<std::string, std::string>>& headers,
+                             std::string_view                                        name) {
     for (const auto& [k, v] : headers) {
         if (ieq(k, name)) return v;
     }
@@ -478,11 +457,10 @@ std::string_view find_header(
 }
 
 std::string build_upgrade_request(
-    std::string_view host,
-    std::string_view path,
-    std::string_view sec_key,
+    std::string_view                                        host,
+    std::string_view                                        path,
+    std::string_view                                        sec_key,
     const std::vector<std::pair<std::string, std::string>>& extra_headers) {
-
     std::string req;
     req.reserve(256 + extra_headers.size() * 32);
     req.append("GET ").append(path).append(" HTTP/1.1\r\n");
@@ -496,11 +474,9 @@ std::string build_upgrade_request(
     for (const auto& [k, v] : extra_headers) {
         // Block the handshake-controlled headers — callers don't
         // need them and silently overwriting is worse than throwing.
-        if (ieq(k, "Upgrade") || ieq(k, "Connection") ||
-            ieq(k, "Host") ||
+        if (ieq(k, "Upgrade") || ieq(k, "Connection") || ieq(k, "Host") ||
             (k.size() >= 14 && ieq(k.substr(0, 14), "Sec-WebSocket-"))) {
-            throw std::runtime_error(
-                "ws: handshake-reserved header in extra headers: " + k);
+            throw std::runtime_error("ws: handshake-reserved header in extra headers: " + k);
         }
         if (ieq(k, "User-Agent")) caller_set_user_agent = true;
         req.append(k).append(": ").append(v).append("\r\n");
@@ -520,44 +496,40 @@ std::string build_upgrade_request(
 }  // namespace
 
 asio::awaitable<std::unique_ptr<WsClient>> ws_connect(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls) {
-
+    bool                                             tls) {
     auto impl = std::make_unique<WsClient::Impl>(ex);
 
     asio::ip::tcp::resolver resolver{ex};
-    auto endpoints = co_await resolver.async_resolve(
-        std::string(host), std::string(port), asio::use_awaitable);
-    co_await asio::async_connect(impl->socket, endpoints, asio::use_awaitable);
+    auto                    endpoints =
+        co_await resolver.async_resolve(std::string(host), std::string(port), asio::use_awaitable);
+    co_await     asio::async_connect(impl->socket, endpoints, asio::use_awaitable);
 
     if (tls) {
-        impl->ssl_ctx = std::make_unique<asio::ssl::context>(
-            asio::ssl::context::tls_client);
+        impl->ssl_ctx = std::make_unique<asio::ssl::context>(asio::ssl::context::tls_client);
         impl->ssl_ctx->set_default_verify_paths();
         impl->ssl_ctx->set_verify_mode(asio::ssl::verify_peer);
 
-        impl->tls_stream = std::make_unique<
-            asio::ssl::stream<asio::ip::tcp::socket&>>(impl->socket, *impl->ssl_ctx);
+        impl->tls_stream = std::make_unique<asio::ssl::stream<asio::ip::tcp::socket&>>(
+            impl->socket, *impl->ssl_ctx);
         std::string host_str(host);
-        if (!SSL_set_tlsext_host_name(
-                impl->tls_stream->native_handle(), host_str.c_str())) {
-            throw asio::system_error{
-                asio::error_code{static_cast<int>(::ERR_get_error()),
-                                 asio::error::get_ssl_category()},
+        if (!SSL_set_tlsext_host_name(impl->tls_stream->native_handle(), host_str.c_str())) {
+            throw neograph_asio_system_error{
+                neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
+                                         asio::error::get_ssl_category()},
                 "ws: SNI setup"};
         }
-        impl->tls_stream->set_verify_callback(
-            asio::ssl::host_name_verification{host_str});
-        co_await impl->tls_stream->async_handshake(
-            asio::ssl::stream_base::client, asio::use_awaitable);
+        impl->tls_stream->set_verify_callback(asio::ssl::host_name_verification{host_str});
+        co_await impl->tls_stream->async_handshake(asio::ssl::stream_base::client,
+                                                   asio::use_awaitable);
     }
 
     std::string sec_key = detail::generate_sec_websocket_key();
-    std::string req = build_upgrade_request(host, path, sec_key, headers);
+    std::string req     = build_upgrade_request(host, path, sec_key, headers);
     if (std::getenv("NEOGRAPH_WS_DEBUG")) {
         std::cerr << "[WS DEBUG] upgrade request:\n" << req;
     }
@@ -571,15 +543,13 @@ asio::awaitable<std::unique_ptr<WsClient>> ws_connect(
         std::array<char, 4096> scratch{};
         auto n = co_await impl->read_some(asio::buffer(scratch));
         if (n == 0) {
-            throw std::runtime_error(
-                "ws: peer closed before handshake response");
+            throw std::runtime_error("ws: peer closed before handshake response");
         }
         impl->read_buf.append(scratch.data(), n);
     }
 
     if (parsed->status != 101) {
-        throw std::runtime_error(
-            "ws: upgrade refused, status " + std::to_string(parsed->status));
+        throw std::runtime_error("ws: upgrade refused, status " + std::to_string(parsed->status));
     }
     auto upgrade_h    = find_header(parsed->headers, "Upgrade");
     auto connection_h = find_header(parsed->headers, "Connection");
@@ -589,17 +559,20 @@ asio::awaitable<std::unique_ptr<WsClient>> ws_connect(
     }
     // Connection header can be a comma-separated list; look for Upgrade token.
     {
-        bool saw_upgrade = false;
-        std::size_t p = 0;
+        bool        saw_upgrade = false;
+        std::size_t p           = 0;
         while (p < connection_h.size()) {
-            auto comma = connection_h.find(',', p);
-            std::string_view tok = connection_h.substr(
+            auto             comma = connection_h.find(',', p);
+            std::string_view tok   = connection_h.substr(
                 p, comma == std::string_view::npos ? connection_h.size() - p : comma - p);
             while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
                 tok.remove_prefix(1);
             while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
                 tok.remove_suffix(1);
-            if (ieq(tok, "Upgrade")) { saw_upgrade = true; break; }
+            if (ieq(tok, "Upgrade")) {
+                saw_upgrade = true;
+                break;
+            }
             if (comma == std::string_view::npos) break;
             p = comma + 1;
         }

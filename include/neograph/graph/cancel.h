@@ -46,8 +46,16 @@
 #include <utility>
 #include <vector>
 
-namespace neograph::graph {
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
 
+namespace neograph::graph {
 /**
  * @brief Thrown by the engine when a run is cancelled mid-flight via
  *        ``CancelToken::cancel()``.
@@ -60,8 +68,7 @@ namespace neograph::graph {
  */
 class NEOGRAPH_API CancelledException : public std::runtime_error {
 public:
-    CancelledException()
-        : std::runtime_error("neograph: run cancelled") {}
+    CancelledException() : std::runtime_error("neograph: run cancelled") {}
     explicit CancelledException(const std::string& detail)
         : std::runtime_error("neograph: run cancelled — " + detail) {}
 };
@@ -78,7 +85,7 @@ class NEOGRAPH_API CancelToken {
 public:
     CancelToken() = default;
 
-    CancelToken(const CancelToken&) = delete;
+    CancelToken(const CancelToken&)            = delete;
     CancelToken& operator=(const CancelToken&) = delete;
 
     /**
@@ -110,9 +117,7 @@ public:
             // Post the emit onto the strand that owns the signal —
             // emit() is documented as not thread-safe across executors.
             // The engine binds the same executor it co_spawns on.
-            asio::post(ex_snapshot, [this]() {
-                sig_.emit(asio::cancellation_type::all);
-            });
+            asio::post(ex_snapshot, [this]() { sig_.emit(asio::cancellation_type::all); });
         }
 
         // v1.0 (9c): the legacy ``add_cancel_hook`` / hooks_ iteration
@@ -161,15 +166,13 @@ public:
         bool fire_immediately = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            ex_ = std::move(ex);
+            ex_              = std::move(ex);
             fire_immediately = cancelled_.load(std::memory_order_acquire);
         }
         if (fire_immediately) {
             std::lock_guard<std::mutex> lk(mu_);
             if (ex_) {
-                asio::post(ex_, [this]() {
-                    sig_.emit(asio::cancellation_type::all);
-                });
+                asio::post(ex_, [this]() { sig_.emit(asio::cancellation_type::all); });
             }
         }
     }
@@ -183,9 +186,7 @@ public:
      * Slots are not thread-safe; this is consumed once by the
      * spawn site, then never read again by user code.
      */
-    asio::cancellation_slot slot() noexcept {
-        return sig_.slot();
-    }
+    asio::cancellation_slot slot() noexcept { return sig_.slot(); }
 
     /**
      * @brief Throws ``CancelledException`` if cancelled. Convenience
@@ -245,11 +246,8 @@ public:
             // long-lived parents (e.g. an engine with 1000 LLM calls
             // per run, each forking once).
             children_.erase(
-                std::remove_if(
-                    children_.begin(), children_.end(),
-                    [](const std::weak_ptr<CancelToken>& w) {
-                        return w.expired();
-                    }),
+                std::remove_if(children_.begin(), children_.end(),
+                               [](const std::weak_ptr<CancelToken>& w) { return w.expired(); }),
                 children_.end());
             children_.push_back(child);
         }
@@ -264,17 +262,17 @@ public:
     }
 
 private:
-    std::atomic<bool>        cancelled_{false};
-    mutable std::mutex       mu_;        // guards ex_ vs cancel() race
-    asio::any_io_executor    ex_;        // bound by engine before HTTP I/O
-    asio::cancellation_signal sig_;      // for asio operation cancel
+    std::atomic<bool>         cancelled_{false};
+    mutable std::mutex        mu_;   // guards ex_ vs cancel() race
+    asio::any_io_executor     ex_;   // bound by engine before HTTP I/O
+    asio::cancellation_signal sig_;  // for asio operation cancel
 
     // Hierarchical cascade list. Each entry is a child token
     // produced by ``fork()``. ``cancel()`` walks live children and
     // cascades. Stored as ``weak_ptr`` so a child that goes out of
     // scope (its run_sync returned, run completed) is automatically
     // pruned on the next ``cancel()`` / ``fork()`` traversal.
-    mutable std::mutex children_mu_;
+    mutable std::mutex                      children_mu_;
     std::vector<std::weak_ptr<CancelToken>> children_;
 };
 

@@ -30,9 +30,9 @@
 namespace neograph::async {
 
 struct SseEvent {
-    std::string event;   ///< "event:" field. Empty ⇒ default ("message").
-    std::string data;    ///< "data:" field, lines joined with '\n'.
-    std::string id;      ///< "id:" field.
+    std::string event;  ///< "event:" field. Empty ⇒ default ("message").
+    std::string data;   ///< "data:" field, lines joined with '\n'.
+    std::string id;     ///< "id:" field.
 };
 
 class NEOGRAPH_API SseEventParser {
@@ -51,15 +51,15 @@ public:
     void reset() noexcept;
 
 private:
-    void   consume_line(std::string_view line);
-    void   finish_event();
+    void consume_line(std::string_view line);
+    void finish_event();
 
-    std::string              raw_;              ///< bytes awaiting line split
-    std::string              cur_data_;         ///< accumulated data: lines
-    std::string              cur_event_;        ///< last event: value
-    std::string              cur_id_;           ///< last id: value
-    bool                     cur_in_progress_ = false;
-    std::vector<SseEvent>    pending_;
+    std::string           raw_;        ///< bytes awaiting line split
+    std::string           cur_data_;   ///< accumulated data: lines
+    std::string           cur_event_;  ///< last event: value
+    std::string           cur_id_;     ///< last id: value
+    bool                  cur_in_progress_ = false;
+    std::vector<SseEvent> pending_;
 };
 
 }  // namespace neograph::async

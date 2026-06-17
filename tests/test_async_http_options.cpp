@@ -23,7 +23,6 @@
 #include <asio/system_error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
-
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -60,11 +59,11 @@ struct RoutedMock {
         acceptor.listen();
         port = acceptor.local_endpoint().port();
         asio::co_spawn(io, accept_loop(), asio::detached);
-        worker = std::thread([this]{ io.run(); });
+        worker = std::thread([this] { io.run(); });
     }
 
     ~RoutedMock() {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         acceptor.close(ec);
         io.stop();
         if (worker.joinable()) worker.join();
@@ -73,11 +72,10 @@ struct RoutedMock {
     asio::awaitable<void> handle(asio::ip::tcp::socket sock) {
         try {
             asio::streambuf buf;
-            co_await asio::async_read_until(
-                sock, buf, "\r\n\r\n", asio::use_awaitable);
+            co_await        asio::async_read_until(sock, buf, "\r\n\r\n", asio::use_awaitable);
 
             std::istream is(&buf);
-            std::string req_line;
+            std::string  req_line;
             std::getline(is, req_line);
             if (!req_line.empty() && req_line.back() == '\r') req_line.pop_back();
             // POST /path HTTP/1.1
@@ -90,70 +88,84 @@ struct RoutedMock {
                 }
             }
 
-            long content_length = 0;
+            long        content_length = 0;
             std::string line;
             while (std::getline(is, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 if (line.empty()) break;
                 auto colon = line.find(':');
                 if (colon == std::string::npos) continue;
-                std::string name = line.substr(0, colon);
+                std::string name  = line.substr(0, colon);
                 std::string value = line.substr(colon + 1);
-                auto f = value.find_first_not_of(" \t");
+                auto        f     = value.find_first_not_of(" \t");
                 if (f != std::string::npos) value = value.substr(f);
                 for (auto& c : name)
-                    c = static_cast<char>(std::tolower(
-                        static_cast<unsigned char>(c)));
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (name == "content-length") content_length = std::stol(value);
             }
             auto already = buf.size();
             if (static_cast<long>(already) < content_length) {
-                long rem = content_length - static_cast<long>(already);
+                long              rem = content_length - static_cast<long>(already);
                 std::vector<char> tail(rem);
-                co_await asio::async_read(sock, asio::buffer(tail),
-                    asio::transfer_exactly(rem), asio::use_awaitable);
+                co_await asio::async_read(sock, asio::buffer(tail), asio::transfer_exactly(rem),
+                                          asio::use_awaitable);
             } else if (static_cast<long>(already) > content_length) {
                 buf.consume(content_length);
             }
 
             ++requests;
             std::string resp = responder(path);
-            co_await asio::async_write(sock, asio::buffer(resp),
-                                       asio::use_awaitable);
-        } catch (...) { }
-        asio::error_code ec;
+            co_await    asio::async_write(sock, asio::buffer(resp), asio::use_awaitable);
+        } catch (...) {}
+        neograph_asio_error_code ec;
         sock.close(ec);
     }
 
     asio::awaitable<void> accept_loop() {
         for (;;) {
-            asio::ip::tcp::socket sock{io};
-            asio::error_code ec;
-            co_await acceptor.async_accept(
-                sock, asio::redirect_error(asio::use_awaitable, ec));
+            asio::ip::tcp::socket    sock{io};
+            neograph_asio_error_code ec;
+            co_await acceptor.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
             asio::co_spawn(io, handle(std::move(sock)), asio::detached);
         }
     }
 };
 
-std::string http_response(int status, const std::string& body,
+std::string http_response(int                status,
+                          const std::string& body,
                           const std::string& extra_headers = {}) {
     std::string reason;
     switch (status) {
-        case 200: reason = "OK"; break;
-        case 301: reason = "Moved Permanently"; break;
-        case 302: reason = "Found"; break;
-        case 307: reason = "Temporary Redirect"; break;
-        case 429: reason = "Too Many Requests"; break;
-        case 500: reason = "Internal Server Error"; break;
-        default:  reason = "Status"; break;
+        case 200:
+            reason = "OK";
+            break;
+        case 301:
+            reason = "Moved Permanently";
+            break;
+        case 302:
+            reason = "Found";
+            break;
+        case 307:
+            reason = "Temporary Redirect";
+            break;
+        case 429:
+            reason = "Too Many Requests";
+            break;
+        case 500:
+            reason = "Internal Server Error";
+            break;
+        default:
+            reason = "Status";
+            break;
     }
     std::string out;
-    out.append("HTTP/1.1 ").append(std::to_string(status))
-       .append(" ").append(reason).append("\r\n");
-    out.append("Content-Length: ").append(std::to_string(body.size()))
-       .append("\r\n");
+    out.append("HTTP/1.1 ")
+        .append(std::to_string(status))
+        .append(" ")
+        .append(reason)
+        .append("\r\n");
+    out.append("Content-Length: ").append(std::to_string(body.size())).append("\r\n");
     out.append("Connection: close\r\n");
     out.append(extra_headers);
     out.append("\r\n");
@@ -164,83 +176,80 @@ std::string http_response(int status, const std::string& body,
 TEST(RequestOptions, RedirectFollowedWithinLimit) {
     RoutedMock srv([&](const std::string& path) {
         if (path == "/start") {
-            return http_response(302, "redirecting",
-                                 "Location: /final\r\n");
+            return http_response(302, "redirecting", "Location: /final\r\n");
         }
         return http_response(200, "arrived");
     });
 
     asio::io_context client_io;
-    int status = 0;
-    std::string body;
-    asio::co_spawn(client_io,
+    int              status = 0;
+    std::string      body;
+    asio::co_spawn(
+        client_io,
         [&]() -> asio::awaitable<void> {
             neograph::async::RequestOptions opts;
             opts.max_redirects = 3;
-            auto resp = co_await neograph::async::async_post(
-                client_io.get_executor(),
-                "127.0.0.1", std::to_string(srv.port),
-                "/start", "{}", {}, false, opts);
-            status = resp.status;
-            body   = resp.body;
+            auto resp = co_await neograph::async::async_post(client_io.get_executor(), "127.0.0.1",
+                                                             std::to_string(srv.port), "/start",
+                                                             "{}", {}, false, opts);
+            status    = resp.status;
+            body      = resp.body;
         },
         asio::detached);
     client_io.run();
 
     EXPECT_EQ(status, 200);
     EXPECT_EQ(body, "arrived");
-    EXPECT_EQ(srv.requests.load(), 2);   // original + one hop
+    EXPECT_EQ(srv.requests.load(), 2);  // original + one hop
 }
 
 TEST(RequestOptions, RedirectDisabledReturns3xx) {
     RoutedMock srv([&](const std::string& path) {
         if (path == "/start") {
-            return http_response(302, "bounce",
-                                 "Location: /somewhere\r\n");
+            return http_response(302, "bounce", "Location: /somewhere\r\n");
         }
         return http_response(200, "never");
     });
 
     asio::io_context client_io;
-    int status = 0;
-    std::string location;
-    asio::co_spawn(client_io,
+    int              status = 0;
+    std::string      location;
+    asio::co_spawn(
+        client_io,
         [&]() -> asio::awaitable<void> {
             // Default RequestOptions — max_redirects = 0.
-            auto resp = co_await neograph::async::async_post(
-                client_io.get_executor(),
-                "127.0.0.1", std::to_string(srv.port),
-                "/start", "{}", {}, false, {});
-            status   = resp.status;
-            location = resp.location;
+            auto resp = co_await neograph::async::async_post(client_io.get_executor(), "127.0.0.1",
+                                                             std::to_string(srv.port), "/start",
+                                                             "{}", {}, false, {});
+            status    = resp.status;
+            location  = resp.location;
         },
         asio::detached);
     client_io.run();
 
     EXPECT_EQ(status, 302);
     EXPECT_EQ(location, "/somewhere");
-    EXPECT_EQ(srv.requests.load(), 1);   // no follow
+    EXPECT_EQ(srv.requests.load(), 1);  // no follow
 }
 
 TEST(RequestOptions, RedirectHopLimitReturnsFinal3xx) {
     RoutedMock srv([&](const std::string& path) {
         (void)path;
         // Infinite loop — every response redirects back.
-        return http_response(302, "loop",
-                             "Location: /loop\r\n");
+        return http_response(302, "loop", "Location: /loop\r\n");
     });
 
     asio::io_context client_io;
-    int status = 0;
-    asio::co_spawn(client_io,
+    int              status = 0;
+    asio::co_spawn(
+        client_io,
         [&]() -> asio::awaitable<void> {
             neograph::async::RequestOptions opts;
             opts.max_redirects = 2;
-            auto resp = co_await neograph::async::async_post(
-                client_io.get_executor(),
-                "127.0.0.1", std::to_string(srv.port),
-                "/loop", "{}", {}, false, opts);
-            status = resp.status;
+            auto resp = co_await neograph::async::async_post(client_io.get_executor(), "127.0.0.1",
+                                                             std::to_string(srv.port), "/loop",
+                                                             "{}", {}, false, opts);
+            status    = resp.status;
         },
         asio::detached);
     client_io.run();
@@ -253,20 +262,19 @@ TEST(RequestOptions, RedirectHopLimitReturnsFinal3xx) {
 TEST(RequestOptions, RetryAfterExtracted) {
     RoutedMock srv([&](const std::string& path) {
         (void)path;
-        return http_response(429, "slow down",
-                             "Retry-After: 42\r\n");
+        return http_response(429, "slow down", "Retry-After: 42\r\n");
     });
 
     asio::io_context client_io;
-    int status = 0;
-    std::string retry_after;
-    asio::co_spawn(client_io,
+    int              status = 0;
+    std::string      retry_after;
+    asio::co_spawn(
+        client_io,
         [&]() -> asio::awaitable<void> {
-            auto resp = co_await neograph::async::async_post(
-                client_io.get_executor(),
-                "127.0.0.1", std::to_string(srv.port),
-                "/x", "{}", {}, false, {});
-            status      = resp.status;
+            auto resp = co_await neograph::async::async_post(client_io.get_executor(), "127.0.0.1",
+                                                             std::to_string(srv.port), "/x", "{}",
+                                                             {}, false, {});
+            status    = resp.status;
             retry_after = resp.retry_after;
         },
         asio::detached);
@@ -280,12 +288,12 @@ TEST(RequestOptions, TimeoutTriggers) {
     // Server that never responds — accepts the socket, reads
     // the request, and then sits. The client should time out.
     struct StallingServer {
-        asio::io_context io;
-        asio::ip::tcp::acceptor acc{io};
-        std::thread worker;
-        unsigned short port = 0;
+        asio::io_context                   io;
+        asio::ip::tcp::acceptor            acc{io};
+        std::thread                        worker;
+        unsigned short                     port = 0;
         std::vector<asio::ip::tcp::socket> held;
-        std::mutex mu;
+        std::mutex                         mu;
 
         StallingServer() {
             acc.open(asio::ip::tcp::v4());
@@ -294,20 +302,19 @@ TEST(RequestOptions, TimeoutTriggers) {
             acc.listen();
             port = acc.local_endpoint().port();
             asio::co_spawn(io, loop(), asio::detached);
-            worker = std::thread([this]{ io.run(); });
+            worker = std::thread([this] { io.run(); });
         }
         ~StallingServer() {
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             acc.close(ec);
             io.stop();
             if (worker.joinable()) worker.join();
         }
         asio::awaitable<void> loop() {
             for (;;) {
-                asio::ip::tcp::socket sock{io};
-                asio::error_code ec;
-                co_await acc.async_accept(
-                    sock, asio::redirect_error(asio::use_awaitable, ec));
+                asio::ip::tcp::socket    sock{io};
+                neograph_asio_error_code ec;
+                co_await acc.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
                 if (ec) co_return;
                 // Hold the socket so the TCP conn stays alive but
                 // we never write a response.
@@ -318,21 +325,21 @@ TEST(RequestOptions, TimeoutTriggers) {
     } srv;
 
     asio::io_context client_io;
-    bool timed_out = false;
-    asio::co_spawn(client_io,
+    bool             timed_out = false;
+    asio::co_spawn(
+        client_io,
         [&]() -> asio::awaitable<void> {
             neograph::async::RequestOptions opts;
             opts.timeout = std::chrono::milliseconds(150);
             try {
-                co_await neograph::async::async_post(
-                    client_io.get_executor(),
-                    "127.0.0.1", std::to_string(srv.port),
-                    "/x", "{}", {}, false, opts);
-            } catch (const asio::system_error& e) {
+                co_await neograph::async::async_post(client_io.get_executor(), "127.0.0.1",
+                                                     std::to_string(srv.port), "/x", "{}", {},
+                                                     false, opts);
+            } catch (const neograph_asio_system_error& e) {
                 if (e.code() == asio::error::timed_out) {
                     timed_out = true;
                 }
-            } catch (...) { }
+            } catch (...) {}
         },
         asio::detached);
 
@@ -350,12 +357,12 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
     // Same stalling-server shape, but via ConnPool to verify the
     // pool's timeout wrapper is symmetric with the free function.
     struct StallingServer {
-        asio::io_context io;
-        asio::ip::tcp::acceptor acc{io};
-        std::thread worker;
-        unsigned short port = 0;
+        asio::io_context                   io;
+        asio::ip::tcp::acceptor            acc{io};
+        std::thread                        worker;
+        unsigned short                     port = 0;
         std::vector<asio::ip::tcp::socket> held;
-        std::mutex mu;
+        std::mutex                         mu;
 
         StallingServer() {
             acc.open(asio::ip::tcp::v4());
@@ -364,20 +371,19 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
             acc.listen();
             port = acc.local_endpoint().port();
             asio::co_spawn(io, loop(), asio::detached);
-            worker = std::thread([this]{ io.run(); });
+            worker = std::thread([this] { io.run(); });
         }
         ~StallingServer() {
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             acc.close(ec);
             io.stop();
             if (worker.joinable()) worker.join();
         }
         asio::awaitable<void> loop() {
             for (;;) {
-                asio::ip::tcp::socket sock{io};
-                asio::error_code ec;
-                co_await acc.async_accept(
-                    sock, asio::redirect_error(asio::use_awaitable, ec));
+                asio::ip::tcp::socket    sock{io};
+                neograph_asio_error_code ec;
+                co_await acc.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
                 if (ec) co_return;
                 std::lock_guard lk(mu);
                 held.push_back(std::move(sock));
@@ -385,22 +391,22 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
         }
     } srv;
 
-    asio::io_context client_io;
+    asio::io_context          client_io;
     neograph::async::ConnPool pool(client_io.get_executor());
-    bool timed_out = false;
-    asio::co_spawn(client_io,
+    bool                      timed_out = false;
+    asio::co_spawn(
+        client_io,
         [&]() -> asio::awaitable<void> {
             neograph::async::RequestOptions opts;
             opts.timeout = std::chrono::milliseconds(150);
             try {
-                co_await pool.async_post(
-                    "127.0.0.1", std::to_string(srv.port),
-                    "/x", "{}", {}, false, opts);
-            } catch (const asio::system_error& e) {
+                co_await pool.async_post("127.0.0.1", std::to_string(srv.port), "/x", "{}", {},
+                                         false, opts);
+            } catch (const neograph_asio_system_error& e) {
                 if (e.code() == asio::error::timed_out) {
                     timed_out = true;
                 }
-            } catch (...) { }
+            } catch (...) {}
         },
         asio::detached);
 
@@ -420,20 +426,20 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
 TEST(HttpResponseHeaders, PreservesAllHeadersInWireOrder) {
     RoutedMock srv([](const std::string&) {
         return http_response(200, "ok",
-            "X-Alpha: one\r\n"
-            "X-Beta: two\r\n"
-            "Mcp-Session-Id: sess-42\r\n"
-            "X-Upper-MixedCase: three\r\n");
+                             "X-Alpha: one\r\n"
+                             "X-Beta: two\r\n"
+                             "Mcp-Session-Id: sess-42\r\n"
+                             "X-Upper-MixedCase: three\r\n");
     });
 
-    asio::io_context io;
+    asio::io_context              io;
     neograph::async::HttpResponse resp;
-    asio::co_spawn(io,
+    asio::co_spawn(
+        io,
         [&]() -> asio::awaitable<void> {
-            resp = co_await neograph::async::async_post(
-                io.get_executor(), "127.0.0.1",
-                std::to_string(srv.port), "/any",
-                "body", {}, false);
+            resp = co_await neograph::async::async_post(io.get_executor(), "127.0.0.1",
+                                                        std::to_string(srv.port), "/any", "body",
+                                                        {}, false);
         },
         asio::detached);
     io.run();
@@ -445,7 +451,7 @@ TEST(HttpResponseHeaders, PreservesAllHeadersInWireOrder) {
     bool saw_alpha = false, saw_beta = false, saw_sid = false, saw_mixed = false;
     for (const auto& [k, v] : resp.headers) {
         if (k == "X-Alpha" && v == "one") saw_alpha = true;
-        if (k == "X-Beta"  && v == "two") saw_beta = true;
+        if (k == "X-Beta" && v == "two") saw_beta = true;
         if (k == "Mcp-Session-Id" && v == "sess-42") saw_sid = true;
         // Original-cased name preserved — not lowercased.
         if (k == "X-Upper-MixedCase" && v == "three") saw_mixed = true;
@@ -469,18 +475,18 @@ TEST(HttpResponseHeaders, RetryAfterAndLocationAlsoInHeadersMap) {
     // keep working, new code can prefer the uniform surface.
     RoutedMock srv([](const std::string&) {
         return http_response(429, "rate limited",
-            "Retry-After: 42\r\n"
-            "Location: /queue\r\n");
+                             "Retry-After: 42\r\n"
+                             "Location: /queue\r\n");
     });
 
-    asio::io_context io;
+    asio::io_context              io;
     neograph::async::HttpResponse resp;
-    asio::co_spawn(io,
+    asio::co_spawn(
+        io,
         [&]() -> asio::awaitable<void> {
-            resp = co_await neograph::async::async_post(
-                io.get_executor(), "127.0.0.1",
-                std::to_string(srv.port), "/any",
-                "body", {}, false);
+            resp = co_await neograph::async::async_post(io.get_executor(), "127.0.0.1",
+                                                        std::to_string(srv.port), "/any", "body",
+                                                        {}, false);
         },
         asio::detached);
     io.run();

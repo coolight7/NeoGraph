@@ -38,6 +38,15 @@
 #include <optional>
 #include <utility>
 
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
+
 namespace neograph::async {
 
 /// Run @p aw to completion on a fresh single-threaded io_context
@@ -56,8 +65,7 @@ namespace neograph::async {
 /// token set by the engine before each node dispatch) into the LLM
 /// HTTP request, so a cancelled run stops billable work mid-call.
 template <typename T>
-T run_sync(asio::awaitable<T> aw,
-           neograph::graph::CancelToken* cancel = nullptr) {
+T run_sync(asio::awaitable<T> aw, neograph::graph::CancelToken* cancel = nullptr) {
     // v0.3.2: short-circuit if the parent token is already cancelled.
     // Without this, the retry loop in NodeExecutor would re-call
     // Provider::complete after a first cancel, fresh run_sync would
@@ -72,8 +80,8 @@ T run_sync(asio::awaitable<T> aw,
         throw neograph::graph::CancelledException("run_sync entry");
     }
 
-    asio::io_context io;
-    std::optional<T> result;
+    asio::io_context   io;
+    std::optional<T>   result;
     std::exception_ptr err;
 
     auto body = [&]() -> asio::awaitable<void> {
@@ -115,15 +123,13 @@ T run_sync(asio::awaitable<T> aw,
         // construction altogether).
         auto child = cancel->fork();
         child->bind_executor(io.get_executor());
-        asio::co_spawn(io, body(),
-            asio::bind_cancellation_slot(child->slot(),
-                                          asio::detached));
+        asio::co_spawn(io, body(), asio::bind_cancellation_slot(child->slot(), asio::detached));
         io.run();
         // ``child`` goes out of scope at end of block → parent's
         // weak_ptr expires → next parent.cancel()/fork() prunes it.
 
         // v0.3.2: if the inner co_spawn completed because of a cancel
-        // (asio::system_error operation_aborted from a torn-down HTTP
+        // (neograph_asio_system_error operation_aborted from a torn-down HTTP
         // socket), surface it as the typed CancelledException so the
         // executor's retry loop can short-circuit instead of treating
         // it as a transient runtime_error.
@@ -140,15 +146,14 @@ T run_sync(asio::awaitable<T> aw,
 }
 
 /// Void specialization — same semantics, no return value.
-inline void run_sync(asio::awaitable<void> aw,
-                     neograph::graph::CancelToken* cancel = nullptr) {
+inline void run_sync(asio::awaitable<void> aw, neograph::graph::CancelToken* cancel = nullptr) {
     // v0.3.2: same eager short-circuit as the templated peer above.
     // See that overload's comment for the retry/cost-leak rationale.
     if (cancel && cancel->is_cancelled()) {
         throw neograph::graph::CancelledException("run_sync entry");
     }
 
-    asio::io_context io;
+    asio::io_context   io;
     std::exception_ptr err;
 
     auto body = [&]() -> asio::awaitable<void> {
@@ -165,9 +170,7 @@ inline void run_sync(asio::awaitable<void> aw,
         // void specialization.
         auto child = cancel->fork();
         child->bind_executor(io.get_executor());
-        asio::co_spawn(io, body(),
-            asio::bind_cancellation_slot(child->slot(),
-                                          asio::detached));
+        asio::co_spawn(io, body(), asio::bind_cancellation_slot(child->slot(), asio::detached));
         io.run();
         if (err && cancel->is_cancelled()) {
             throw neograph::graph::CancelledException("run_sync inner abort");
@@ -192,8 +195,8 @@ inline void run_sync(asio::awaitable<void> aw,
 /// one std::thread per worker; cost is non-trivial for hot paths.
 template <typename T>
 T run_sync_pool(asio::awaitable<T> aw, std::size_t n_threads) {
-    asio::thread_pool pool(n_threads > 0 ? n_threads : 1);
-    std::optional<T> result;
+    asio::thread_pool  pool(n_threads > 0 ? n_threads : 1);
+    std::optional<T>   result;
     std::exception_ptr err;
 
     asio::co_spawn(
@@ -216,7 +219,7 @@ T run_sync_pool(asio::awaitable<T> aw, std::size_t n_threads) {
 
 /// Void specialization — same semantics, no return value.
 inline void run_sync_pool(asio::awaitable<void> aw, std::size_t n_threads) {
-    asio::thread_pool pool(n_threads > 0 ? n_threads : 1);
+    asio::thread_pool  pool(n_threads > 0 ? n_threads : 1);
     std::exception_ptr err;
 
     asio::co_spawn(
@@ -235,4 +238,4 @@ inline void run_sync_pool(asio::awaitable<void> aw, std::size_t n_threads) {
     if (err) std::rethrow_exception(err);
 }
 
-} // namespace neograph::async
+}  // namespace neograph::async

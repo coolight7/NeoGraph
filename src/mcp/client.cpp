@@ -121,7 +121,7 @@ private:
     // channel behaves as a binary semaphore: holder takes the token
     // via `async_receive`, releases via `try_send`. Second acquirer
     // suspends cooperatively rather than blocking the worker thread.
-    using AsyncLock = asio::experimental::channel<void(asio::error_code)>;
+    using AsyncLock = asio::experimental::channel<void(neograph_asio_error_code)>;
     std::unique_ptr<AsyncLock> async_lock_;
     std::mutex                 async_lock_init_mtx_;
 
@@ -627,7 +627,7 @@ asio::awaitable<json> StdioSession::rpc_call_async(const std::string& method, co
             // take it without blocking. try_send returns false if
             // the channel is already full, which we never hit here
             // because we just created it with capacity 1 and empty.
-            async_lock_->try_send(asio::error_code{});
+            async_lock_->try_send(neograph_asio_error_code{});
         }
     }
 
@@ -647,7 +647,7 @@ asio::awaitable<json> StdioSession::rpc_call_async(const std::string& method, co
             // channel). We're on the hot unwind path; swallow any
             // residual error rather than abort the program.
             try {
-                ch->try_send(asio::error_code{});
+                ch->try_send(neograph_asio_error_code{});
             } catch (...) {}
         }
     } lock_rel{async_lock_.get()};

@@ -17,7 +17,18 @@
 #include <stdexcept>
 #include <string>
 
-namespace neograph::graph { class CancelToken; }
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
+
+namespace neograph::graph {
+class CancelToken;
+}
 
 namespace neograph {
 
@@ -37,8 +48,7 @@ namespace neograph {
 class NEOGRAPH_API RateLimitError : public std::runtime_error {
 public:
     RateLimitError(const std::string& message, int retry_after_seconds = -1)
-        : std::runtime_error(message)
-        , retry_after_seconds_(retry_after_seconds) {}
+        : std::runtime_error(message), retry_after_seconds_(retry_after_seconds) {}
 
     /// @brief Seconds to wait per the upstream, or -1 if unknown.
     int retry_after_seconds() const noexcept { return retry_after_seconds_; }
@@ -55,11 +65,11 @@ using StreamCallback = std::function<void(const std::string& chunk)>;
  * @brief Parameters for an LLM completion request.
  */
 struct CompletionParams {
-    std::string model;                  ///< Model name to use (e.g., "gpt-4o-mini").
+    std::string              model;     ///< Model name to use (e.g., "gpt-4o-mini").
     std::vector<ChatMessage> messages;  ///< Conversation history.
-    std::vector<ChatTool> tools;        ///< Available tools the LLM may call.
-    float temperature = 0.7f;           ///< Sampling temperature (0.0 = deterministic, 1.0 = creative).
-    int max_tokens = -1;                ///< Maximum output tokens. -1 means provider default.
+    std::vector<ChatTool>    tools;     ///< Available tools the LLM may call.
+    float temperature = 0.7f;  ///< Sampling temperature (0.0 = deterministic, 1.0 = creative).
+    int   max_tokens  = -1;    ///< Maximum output tokens. -1 means provider default.
 
     /**
      * @brief Optional cancel handle (v0.3+).
@@ -125,7 +135,7 @@ struct CompletionParams {
  * @see neograph::llm::SchemaProvider
  */
 class NEOGRAPH_API Provider {
-  public:
+public:
     virtual ~Provider() = default;
 
     /**
@@ -147,7 +157,8 @@ class NEOGRAPH_API Provider {
      * deprecation window and is removed in v1.0.0. See ROADMAP_v1.md
      * Candidate 6.
      */
-    [[deprecated("v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate 6")]]
+    [[deprecated(
+        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate 6")]]
     virtual ChatCompletion complete(const CompletionParams& params);
 
     /**
@@ -172,9 +183,9 @@ class NEOGRAPH_API Provider {
      *
      * @deprecated Use `invoke(params, nullptr)`. v1.0 removes this.
      */
-    [[deprecated("v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate 6")]]
-    virtual asio::awaitable<ChatCompletion>
-    complete_async(const CompletionParams& params);
+    [[deprecated(
+        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate 6")]]
+    virtual asio::awaitable<ChatCompletion> complete_async(const CompletionParams& params);
 
     /**
      * @brief Perform a streaming LLM completion.
@@ -197,9 +208,10 @@ class NEOGRAPH_API Provider {
      * `neograph::async::run_sync(invoke(params, on_chunk))` for a
      * sync caller). v1.0 removes this.
      */
-    [[deprecated("v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate 6")]]
+    [[deprecated(
+        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate 6")]]
     virtual ChatCompletion complete_stream(const CompletionParams& params,
-                                           const StreamCallback& on_chunk);
+                                           const StreamCallback&   on_chunk);
 
     /**
      * @brief Async streaming completion. Awaitable peer of @ref complete_stream.
@@ -258,10 +270,10 @@ class NEOGRAPH_API Provider {
      *
      * @deprecated Use `invoke(params, on_chunk)`. v1.0 removes this.
      */
-    [[deprecated("v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate 6")]]
-    virtual asio::awaitable<ChatCompletion>
-    complete_stream_async(const CompletionParams& params,
-                          const StreamCallback& on_chunk);
+    [[deprecated(
+        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate 6")]]
+    virtual asio::awaitable<ChatCompletion> complete_stream_async(const CompletionParams& params,
+                                                                  const StreamCallback&   on_chunk);
 
     /**
      * @brief Single-dispatch async-streaming completion (v1.0 canonical).
@@ -307,8 +319,8 @@ class NEOGRAPH_API Provider {
      *                 streaming use.
      * @return Awaitable yielding the full assembled completion.
      */
-    virtual asio::awaitable<ChatCompletion>
-    invoke(const CompletionParams& params, StreamCallback on_chunk = nullptr);
+    virtual asio::awaitable<ChatCompletion> invoke(const CompletionParams& params,
+                                                   StreamCallback          on_chunk = nullptr);
 
     /**
      * @brief Get the provider name (e.g., "openai", "claude").
@@ -334,4 +346,4 @@ class NEOGRAPH_API Provider {
     virtual std::string get_name() const = 0;
 };
 
-} // namespace neograph
+}  // namespace neograph

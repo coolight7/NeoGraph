@@ -14,7 +14,6 @@
 #pragma once
 
 #include <string>
-
 namespace neograph::async {
 
 /// Result of decomposing a URL into the pieces async_post needs.
@@ -34,19 +33,19 @@ struct AsyncEndpoint {
 /// non-tls) and missing path (prefix empty).
 inline AsyncEndpoint split_async_endpoint(const std::string& base_url) {
     AsyncEndpoint out;
-    std::string rest = base_url;
+    std::string   rest = base_url;
 
     auto scheme_end = rest.find("://");
     if (scheme_end != std::string::npos) {
         std::string scheme = rest.substr(0, scheme_end);
-        out.tls = (scheme == "https");
-        rest = rest.substr(scheme_end + 3);
+        out.tls            = (scheme == "https");
+        rest               = rest.substr(scheme_end + 3);
     }
 
-    auto path_start = rest.find('/');
+    auto        path_start = rest.find('/');
     std::string authority;
     if (path_start != std::string::npos) {
-        authority = rest.substr(0, path_start);
+        authority  = rest.substr(0, path_start);
         out.prefix = rest.substr(path_start);
     } else {
         authority = rest;
@@ -63,4 +62,4 @@ inline AsyncEndpoint split_async_endpoint(const std::string& base_url) {
     return out;
 }
 
-} // namespace neograph::async
+}  // namespace neograph::async

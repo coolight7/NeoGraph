@@ -15,8 +15,8 @@
 
 #include <neograph/api.h>
 
-#include <asio/awaitable.hpp>
 #include <asio/any_io_executor.hpp>
+#include <asio/awaitable.hpp>
 
 #include <chrono>
 #include <functional>
@@ -25,8 +25,16 @@
 #include <utility>
 #include <vector>
 
-namespace neograph::async {
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
 
+namespace neograph::async {
 struct NEOGRAPH_API HttpResponse {
     int         status = 0;
     std::string body;
@@ -79,7 +87,7 @@ struct RequestOptions {
 };
 
 /// Async HTTP(S) POST. Returns the response body and status on the
-/// given executor's thread(s). Throws asio::system_error (or
+/// given executor's thread(s). Throws neograph_asio_system_error (or
 /// std::system_error wrapping SSL errors) on transport failure —
 /// caller decides retry policy.
 ///
@@ -97,27 +105,27 @@ struct RequestOptions {
 ///                TLS handshake with SNI=host, and verify the peer
 ///                certificate against the system trust store.
 NEOGRAPH_API asio::awaitable<HttpResponse> async_post(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
-    std::string_view body,
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
+    std::string_view                                 body,
     std::vector<std::pair<std::string, std::string>> headers = {},
-    bool tls = false,
-    RequestOptions opts = {});
+    bool                                             tls     = false,
+    RequestOptions                                   opts    = {});
 
 /// Async HTTP(S) GET. Same shape as async_post but issues a GET
 /// request with an empty body and no Content-Length / Content-Type
 /// headers — used for resources like the A2A `/.well-known/agent-card.json`
 /// discovery endpoint.
 NEOGRAPH_API asio::awaitable<HttpResponse> async_get(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
     std::vector<std::pair<std::string, std::string>> headers = {},
-    bool tls = false,
-    RequestOptions opts = {});
+    bool                                             tls     = false,
+    RequestOptions                                   opts    = {});
 
 /// Metadata returned by async_post_stream after the body has been
 /// fully delivered via the callback. No `body` member — the body
@@ -132,7 +140,7 @@ struct HttpStreamResponse {
 /// status line. Used for LLM streaming endpoints (OpenAI chat
 /// completions, Anthropic messages in `stream: true` mode).
 ///
-/// Throws asio::system_error on transport failure or
+/// Throws neograph_asio_system_error on transport failure or
 /// std::runtime_error if the response isn't chunked. HTTP-level
 /// errors (4xx, 5xx) surface as status + their usually-small body
 /// delivered to on_chunk — the caller decides what to do.
@@ -145,14 +153,14 @@ struct HttpStreamResponse {
 /// The bytes passed to `on_chunk` are only valid for the duration
 /// of the callback invocation; copy them out if you need to retain.
 NEOGRAPH_API asio::awaitable<HttpStreamResponse> async_post_stream(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
-    std::string_view body,
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
+    std::string_view                                 body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    std::function<void(std::string_view chunk)> on_chunk,
-    RequestOptions opts = {});
+    bool                                             tls,
+    std::function<void(std::string_view chunk)>      on_chunk,
+    RequestOptions                                   opts = {});
 
-} // namespace neograph::async
+}  // namespace neograph::async

@@ -25,8 +25,8 @@
 //   - No HTTP/2. Keep-alive on HTTP/1.1 only.
 
 #include <neograph/async/conn_pool.h>
-#include "http_exchange_detail.h"
 
+#include "http_exchange_detail.h"
 #include <asio/connect.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
 #include <asio/ip/tcp.hpp>
@@ -96,23 +96,21 @@ struct ConnPool::Impl {
     // before `idle`. Unordered_map destroys its elements before its
     // own destructor runs, so this ordering guarantees the ssl::stream
     // destructors see a live context.
-    asio::ssl::context    ssl_ctx;
+    asio::ssl::context ssl_ctx;
 
     mutable std::mutex                                                        mu;
     std::unordered_map<Key, std::deque<std::unique_ptr<Connection>>, KeyHash> idle;
     std::size_t                                                               total_idle = 0;
 
     Impl(asio::any_io_executor e, ConnPoolOptions o)
-        : ex(std::move(e)),
-          opts(o),
-          ssl_ctx(asio::ssl::context::tls_client) {
+        : ex(std::move(e)), opts(o), ssl_ctx(asio::ssl::context::tls_client) {
         ssl_ctx.set_default_verify_paths();
         ssl_ctx.set_verify_mode(asio::ssl::verify_peer);
     }
 
     std::unique_ptr<Connection> checkout(const Key& k) {
         std::lock_guard lk(mu);
-        auto it = idle.find(k);
+        auto            it = idle.find(k);
         if (it == idle.end()) return nullptr;
         auto now = std::chrono::steady_clock::now();
         while (!it->second.empty()) {
@@ -128,7 +126,7 @@ struct ConnPool::Impl {
     void checkin(const Key& k, std::unique_ptr<Connection> c) {
         c->idle_since = std::chrono::steady_clock::now();
         std::lock_guard lk(mu);
-        auto& bucket = idle[k];
+        auto&           bucket = idle[k];
         if (bucket.size() >= opts.max_idle_per_host) return;  // drop
         bucket.push_back(std::move(c));
         ++total_idle;
@@ -147,17 +145,14 @@ struct ConnPool::Impl {
 namespace {
 
 // Open + (for TLS) handshake a fresh connection for the given key.
-asio::awaitable<std::unique_ptr<Connection>> open(
-    asio::any_io_executor ex,
-    asio::ssl::context&   ssl_ctx,
-    const Key&            k) {
-
+asio::awaitable<std::unique_ptr<Connection>> open(asio::any_io_executor ex,
+                                                  asio::ssl::context&   ssl_ctx,
+                                                  const Key&            k) {
     asio::ip::tcp::resolver resolver{ex};
-    auto endpoints = co_await resolver.async_resolve(
-        k.host, k.port, asio::use_awaitable);
+    auto endpoints = co_await resolver.async_resolve(k.host, k.port, asio::use_awaitable);
 
     asio::ip::tcp::socket sock{ex};
-    co_await asio::async_connect(sock, endpoints, asio::use_awaitable);
+    co_await              asio::async_connect(sock, endpoints, asio::use_awaitable);
 
     auto conn = std::make_unique<Connection>();
     if (!k.tls) {
@@ -170,14 +165,13 @@ asio::awaitable<std::unique_ptr<Connection>> open(
 
     // SNI: Anthropic/OpenAI require it for TLS 1.3 cert selection.
     if (!SSL_set_tlsext_host_name(s.native_handle(), k.host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
-                             asio::error::get_ssl_category()},
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
+                                     asio::error::get_ssl_category()},
             "SNI setup"};
     }
     s.set_verify_callback(asio::ssl::host_name_verification{k.host});
-    co_await s.async_handshake(asio::ssl::stream_base::client,
-                               asio::use_awaitable);
+    co_await  s.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
     co_return conn;
 }
 
@@ -209,15 +203,15 @@ bool is_safe_method(const std::string& req) {
 // replay; otherwise the exception propagates so the caller can
 // surface it (rather than silently double-applying a non-idempotent
 // side effect on the retry path).
-asio::awaitable<std::optional<detail::ExchangeResult>> try_exchange(
-    Connection& conn, const std::string& req) {
+asio::awaitable<std::optional<detail::ExchangeResult>> try_exchange(Connection&        conn,
+                                                                    const std::string& req) {
     try {
         if (conn.plain) {
             auto r = co_await detail::run_exchange(*conn.plain, req);
-            co_return r;
+            co_return         r;
         }
         auto r = co_await detail::run_exchange(*conn.tls, req);
-        co_return r;
+        co_return         r;
     } catch (const std::exception&) {
         if (is_safe_method(req)) co_return std::nullopt;
         throw;
@@ -226,20 +220,18 @@ asio::awaitable<std::optional<detail::ExchangeResult>> try_exchange(
 
 // Exchange on a fresh connection. No internal catch: a failure on
 // a brand-new conn is a real network error worth surfacing.
-asio::awaitable<detail::ExchangeResult> exchange_fresh(
-    Connection& conn, const std::string& req) {
+asio::awaitable<detail::ExchangeResult> exchange_fresh(Connection& conn, const std::string& req) {
     if (conn.plain) {
         auto r = co_await detail::run_exchange(*conn.plain, req);
-        co_return r;
+        co_return         r;
     }
     auto r = co_await detail::run_exchange(*conn.tls, req);
-    co_return r;
+    co_return         r;
 }
 
 }  // namespace
 
-asio::awaitable<HttpResponse> ConnPool::Impl::dispatch(
-    Key key, const std::string& req) {
+asio::awaitable<HttpResponse> ConnPool::Impl::dispatch(Key key, const std::string& req) {
     auto reused = checkout(key);
     if (reused) {
         auto maybe = co_await try_exchange(*reused, req);
@@ -253,7 +245,7 @@ asio::awaitable<HttpResponse> ConnPool::Impl::dispatch(
     }
 
     auto fresh = co_await open(ex, ssl_ctx, key);
-    auto r = co_await exchange_fresh(*fresh, req);
+    auto r     = co_await exchange_fresh(*fresh, req);
     if (r.server_directive == detail::ConnDirective::keep_alive) {
         checkin(key, std::move(fresh));
     }
@@ -271,17 +263,16 @@ std::size_t ConnPool::idle_count() const {
 }
 
 asio::awaitable<HttpResponse> ConnPool::async_post(
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
-    std::string_view body,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
+    std::string_view                                 body,
     std::vector<std::pair<std::string, std::string>> headers,
-    bool tls,
-    RequestOptions opts) {
-
-    Key key{ std::string(host), std::string(port), tls };
-    std::string req = detail::build_request(
-        host, path, body, headers, detail::ConnDirective::keep_alive);
+    bool                                             tls,
+    RequestOptions                                   opts) {
+    Key         key{std::string(host), std::string(port), tls};
+    std::string req =
+        detail::build_request(host, path, body, headers, detail::ConnDirective::keep_alive);
 
     if (opts.timeout.count() <= 0) {
         co_return co_await impl_->dispatch(std::move(key), req);
@@ -294,12 +285,10 @@ asio::awaitable<HttpResponse> ConnPool::async_post(
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(impl_->ex);
     timer.expires_after(opts.timeout);
-    auto res = co_await (
-        impl_->dispatch(std::move(key), req)
-        || timer.async_wait(asio::use_awaitable));
+    auto res =
+        co_await(impl_->dispatch(std::move(key), req) || timer.async_wait(asio::use_awaitable));
     if (res.index() == 1) {
-        throw asio::system_error(asio::error::timed_out,
-                                 "ConnPool::async_post: timeout");
+        throw neograph_asio_system_error(asio::error::timed_out, "ConnPool::async_post: timeout");
     }
     co_return std::get<0>(std::move(res));
 }

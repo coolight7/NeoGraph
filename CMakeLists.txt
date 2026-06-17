@@ -257,8 +257,19 @@ target_include_directories(cppdotenv INTERFACE ${DEPS_DIR})
 # turns off the Boost.System coupling. Any TU linking this must also
 # link a threads lib (std::thread backend).
 add_library(asio INTERFACE)
-target_include_directories(asio INTERFACE ${DEPS_DIR}/asio/include)
-target_compile_definitions(asio INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+add_definitions(-DBOOST_ASIO_STANDALONE=1)
+add_definitions(-DASIO_STANDALONE=1)
+add_definitions(-DBOOST_ASIO_NO_DEPRECATED=1)
+add_definitions(-DASIO_NO_DEPRECATED=1)
+if ("${Boost_ROOT}" STREQUAL "")
+    message("USE deps/asio: ${DEPS_DIR}")
+    target_include_directories(asio INTERFACE ${DEPS_DIR}/asio/include/)
+else()
+    message("USE BOOST/asio: ${Boost_ROOT}")
+    target_include_directories(asio INTERFACE ${Boost_ROOT}/include/boost/ ${Boost_ROOT}/include/)
+    add_definitions(-DNEOGRAPH_USE_BOODT_ASIO=1)
+endif()
+target_compile_definitions(asio INTERFACE BOOST_ASIO_STANDALONE ASIO_STANDALONE BOOST_ASIO_NO_DEPRECATED ASIO_NO_DEPRECATED)
 # Windows: target Windows 10+ so httplib compiles (it hard-errors on
 # _WIN32_WINNT < 0x0A00) and asio's newer overlapped/pipe paths light up.
 # Also scrub min/max macros from <windows.h> that clobber std::min/max.

@@ -46,6 +46,15 @@
 #include <utility>
 #include <vector>
 
+#ifdef NEOGRAPH_USE_BOODT_ASIO
+namespace asio                   = ::boost::asio;
+using neograph_asio_system_error = ::boost::system::system_error;
+using neograph_asio_error_code   = ::boost::system::error_code;
+#else
+using neograph_asio_system_error = ::asio::system_error;
+using neograph_asio_error_code   = ::asio::error_code;
+#endif
+
 namespace neograph::async {
 
 enum class WsOpcode : std::uint8_t {
@@ -73,9 +82,9 @@ struct WsMessage {
 /// unconditionally (no graceful close unless you called send_close
 /// first).
 class NEOGRAPH_API WsClient {
-  public:
+public:
     ~WsClient();
-    WsClient(const WsClient&) = delete;
+    WsClient(const WsClient&)            = delete;
     WsClient& operator=(const WsClient&) = delete;
     WsClient(WsClient&&) noexcept;
     WsClient& operator=(WsClient&&) noexcept;
@@ -93,28 +102,29 @@ class NEOGRAPH_API WsClient {
     /// until it returns an op==Close frame (peer echo), then let the
     /// destructor close the socket. Calling send_close twice is a
     /// no-op.
-    asio::awaitable<void> send_close(
-        std::uint16_t code = 1000, std::string_view reason = "");
+    asio::awaitable<void> send_close(std::uint16_t code = 1000, std::string_view reason = "");
 
     /// Block until the next application message arrives. Pings are
     /// auto-replied with pongs and consumed; close frames are echoed
     /// back and surfaced to the caller as op==Close (after which the
     /// connection is no longer usable).
     ///
-    /// Throws asio::system_error on transport failure or
+    /// Throws neograph_asio_system_error on transport failure or
     /// std::runtime_error on malformed frames (reserved bits set,
     /// masked server-to-client frame, unknown opcode).
     asio::awaitable<WsMessage> recv();
 
-  private:
+private:
     // Friend forward-declaration; the trailing standalone declaration
     // (further down) also carries NEOGRAPH_API. MSVC C2375 fires if
     // the two declarations disagree on linkage, so the macro must
     // appear here too even though it's redundant on POSIX.
-    friend NEOGRAPH_API asio::awaitable<std::unique_ptr<WsClient>>
-    ws_connect(
-        asio::any_io_executor, std::string_view, std::string_view,
-        std::string_view, std::vector<std::pair<std::string, std::string>>,
+    friend NEOGRAPH_API asio::awaitable<std::unique_ptr<WsClient>> ws_connect(
+        asio::any_io_executor,
+        std::string_view,
+        std::string_view,
+        std::string_view,
+        std::vector<std::pair<std::string, std::string>>,
         bool);
 
     struct Impl;
@@ -136,15 +146,15 @@ class NEOGRAPH_API WsClient {
 ///                the client sets those itself.
 /// @param tls     Use wss:// (TLS) vs ws:// (plain TCP).
 ///
-/// Throws asio::system_error on transport failure, std::runtime_error
+/// Throws neograph_asio_system_error on transport failure, std::runtime_error
 /// if the server refuses the upgrade (non-101 status or bad Accept).
 NEOGRAPH_API asio::awaitable<std::unique_ptr<WsClient>> ws_connect(
-    asio::any_io_executor ex,
-    std::string_view host,
-    std::string_view port,
-    std::string_view path,
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
     std::vector<std::pair<std::string, std::string>> headers = {},
-    bool tls = true);
+    bool                                             tls     = true);
 
 namespace detail {
 
@@ -156,7 +166,7 @@ struct WsFrameHeader {
     std::uint64_t payload_len;
     std::uint8_t  mask_key[4];
     /// Offset past the header where payload bytes begin.
-    std::size_t   header_size;
+    std::size_t header_size;
 };
 
 /// Parse a frame header from the front of `buf`. Returns nullopt if
@@ -167,13 +177,12 @@ NEOGRAPH_API std::optional<WsFrameHeader> parse_frame_header(std::string_view bu
 
 /// Append an encoded frame header to `out`. Writes either 2, 4, 6,
 /// 10, or 14 bytes depending on payload_len and the `masked` flag.
-NEOGRAPH_API void encode_frame_header(
-    std::string& out,
-    WsOpcode opcode,
-    bool fin,
-    bool masked,
-    std::uint64_t payload_len,
-    const std::uint8_t mask_key[4] = nullptr);
+NEOGRAPH_API void encode_frame_header(std::string&       out,
+                                      WsOpcode           opcode,
+                                      bool               fin,
+                                      bool               masked,
+                                      std::uint64_t      payload_len,
+                                      const std::uint8_t mask_key[4] = nullptr);
 
 /// XOR `data` in place with the 4-byte `mask_key` per §5.3.
 NEOGRAPH_API void apply_mask(char* data, std::size_t len, const std::uint8_t mask_key[4]) noexcept;
