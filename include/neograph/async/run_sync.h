@@ -24,6 +24,7 @@
  */
 #pragma once
 
+#include <neograph/define.h>
 #include <neograph/graph/cancel.h>
 
 #include <asio/awaitable.hpp>
@@ -37,15 +38,6 @@
 #include <exception>
 #include <optional>
 #include <utility>
-
-#ifdef NEOGRAPH_USE_BOODT_ASIO
-namespace asio                   = ::boost::asio;
-using neograph_asio_system_error = ::boost::system::system_error;
-using neograph_asio_error_code   = ::boost::system::error_code;
-#else
-using neograph_asio_system_error = ::asio::system_error;
-using neograph_asio_error_code   = ::asio::error_code;
-#endif
 
 namespace neograph::async {
 

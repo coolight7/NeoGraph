@@ -9,6 +9,7 @@
  * of provider.h.
  */
 #include <neograph/async/run_sync.h>
+#include <neograph/define.h>
 #include <neograph/graph/cancel.h>
 #include <neograph/provider.h>
 
@@ -23,15 +24,6 @@
 #include <memory>
 #include <optional>
 #include <thread>
-
-#ifdef NEOGRAPH_USE_BOODT_ASIO
-namespace asio                   = ::boost::asio;
-using neograph_asio_system_error = ::boost::system::system_error;
-using neograph_asio_error_code   = ::boost::system::error_code;
-#else
-using neograph_asio_system_error = ::asio::system_error;
-using neograph_asio_error_code   = ::asio::error_code;
-#endif
 
 namespace neograph {
 

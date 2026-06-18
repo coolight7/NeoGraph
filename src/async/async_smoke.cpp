@@ -7,6 +7,8 @@
 // Not production code. The real async_http_client lives alongside this
 // once the PoC bench confirms the approach.
 
+#include <neograph/define.h>
+
 #include <asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
@@ -15,15 +17,6 @@
 
 #include <chrono>
 #include <iostream>
-
-#ifdef NEOGRAPH_USE_BOODT_ASIO
-namespace asio                   = ::boost::asio;
-using neograph_asio_system_error = ::boost::system::system_error;
-using neograph_asio_error_code   = ::boost::system::error_code;
-#else
-using neograph_asio_system_error = ::asio::system_error;
-using neograph_asio_error_code   = ::asio::error_code;
-#endif
 
 namespace neograph::async {
 

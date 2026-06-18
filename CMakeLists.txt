@@ -267,7 +267,7 @@ if ("${Boost_ROOT}" STREQUAL "")
 else()
     message("USE BOOST/asio: ${Boost_ROOT}")
     target_include_directories(asio INTERFACE ${Boost_ROOT}/include/boost/ ${Boost_ROOT}/include/)
-    add_definitions(-DNEOGRAPH_USE_BOODT_ASIO=1)
+    target_compile_definitions(asio INTERFACE NEOGRAPH_USE_BOODT_ASIO)
 endif()
 target_compile_definitions(asio INTERFACE BOOST_ASIO_STANDALONE ASIO_STANDALONE BOOST_ASIO_NO_DEPRECATED ASIO_NO_DEPRECATED)
 # Windows: target Windows 10+ so httplib compiles (it hard-errors on

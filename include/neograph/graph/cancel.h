@@ -31,6 +31,7 @@
 #pragma once
 
 #include <neograph/api.h>
+#include <neograph/define.h>
 
 #include <asio/any_io_executor.hpp>
 #include <asio/cancellation_signal.hpp>
@@ -45,15 +46,6 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-
-#ifdef NEOGRAPH_USE_BOODT_ASIO
-namespace asio                   = ::boost::asio;
-using neograph_asio_system_error = ::boost::system::system_error;
-using neograph_asio_error_code   = ::boost::system::error_code;
-#else
-using neograph_asio_system_error = ::asio::system_error;
-using neograph_asio_error_code   = ::asio::error_code;
-#endif
 
 namespace neograph::graph {
 /**

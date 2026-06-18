@@ -14,6 +14,7 @@
 #pragma once
 
 #include <neograph/api.h>
+#include <neograph/define.h>
 #include <neograph/tool.h>
 
 #include <asio/awaitable.hpp>
