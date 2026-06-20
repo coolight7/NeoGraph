@@ -38,10 +38,10 @@ namespace neograph::graph {
  * @brief Configuration for a graph execution run.
  */
 struct RunConfig {
-    std::string thread_id;                          ///< Thread ID for checkpoint association.
-    json        input;                              ///< Initial channel writes (e.g., {"messages": [...]}).
-    int         max_steps  = 50;                    ///< Safety limit for maximum super-steps per run.
-    StreamMode  stream_mode = StreamMode::ALL;      ///< Which event types to emit during streaming.
+    std::string thread_id;         ///< Thread ID for checkpoint association.
+    json        input;             ///< Initial channel writes (e.g., {"messages": [...]}).
+    int         max_steps   = 50;  ///< Safety limit for maximum super-steps per run.
+    StreamMode  stream_mode = StreamMode::ALL;  ///< Which event types to emit during streaming.
 
     /**
      * @brief Optional cooperative cancel handle (v0.3+).
@@ -207,12 +207,12 @@ struct RunContext {
  * graphs (channels-wrapped + flat-key projections) alike.
  */
 struct RunResult {
-    json        output;                             ///< Final serialized graph state. See struct docstring for shape details.
-    bool        interrupted       = false;          ///< True if execution was interrupted (HITL).
-    std::string interrupt_node;                     ///< Name of the node that triggered the interrupt.
-    json        interrupt_value;                    ///< Value associated with the interrupt.
-    std::string checkpoint_id;                      ///< ID of the last checkpoint saved.
-    std::vector<std::string> execution_trace;       ///< Ordered list of executed node names.
+    json        output;  ///< Final serialized graph state. See struct docstring for shape details.
+    bool        interrupted = false;           ///< True if execution was interrupted (HITL).
+    std::string interrupt_node;                ///< Name of the node that triggered the interrupt.
+    json        interrupt_value;               ///< Value associated with the interrupt.
+    std::string checkpoint_id;                 ///< ID of the last checkpoint saved.
+    std::vector<std::string> execution_trace;  ///< Ordered list of executed node names.
 
     /// @brief Read a channel value as type ``T`` (issue #25).
     ///
@@ -250,9 +250,10 @@ struct RunResult {
             if (wrapped.contains("value")) return wrapped["value"];
         }
         if (output.contains(name)) return output[name];
-        throw json::out_of_range(
-            "RunResult::channel: no such channel '" + name + "' in output "
-            "(checked output[\"channels\"][\"" + name + "\"][\"value\"] and output[\"" + name + "\"])");
+        throw json::out_of_range("RunResult::channel: no such channel '" + name +
+                                 "' in output "
+                                 "(checked output[\"channels\"][\"" +
+                                 name + "\"][\"value\"] and output[\"" + name + "\"])");
     }
 
     /// @brief Test whether a channel value exists in either shape.
@@ -262,8 +263,8 @@ struct RunResult {
     /// ``channel<T>`` when the graph may or may not have written the
     /// channel (e.g. early HITL interrupt before a node ran).
     bool has_channel(const std::string& name) const noexcept {
-        if (output.contains("channels") && output["channels"].contains(name)
-            && output["channels"][name].contains("value")) {
+        if (output.contains("channels") && output["channels"].contains(name) &&
+            output["channels"][name].contains("value")) {
             return true;
         }
         return output.contains(name);
@@ -354,10 +355,9 @@ public:
      * @return A compiled GraphEngine ready for execution.
      * @throws std::runtime_error If the graph definition is invalid.
      */
-    static std::unique_ptr<GraphEngine> compile(
-        const json& definition,
-        const NodeContext& default_context,
-        std::shared_ptr<CheckpointStore> store = nullptr);
+    static std::unique_ptr<GraphEngine> compile(const json&                      definition,
+                                                const NodeContext&               default_context,
+                                                std::shared_ptr<CheckpointStore> store = nullptr);
 
     /**
      * @brief Execute the graph synchronously (blocking).
@@ -397,14 +397,12 @@ public:
      * @param cb Callback invoked for each graph event (filtered by config.stream_mode).
      * @return Execution result.
      */
-    RunResult run_stream(const RunConfig& config,
-                         const GraphStreamCallback& cb);
+    RunResult run_stream(const RunConfig& config, const GraphStreamCallback& cb);
 
     /// Async peer of run_stream — non-blocking coroutine surface.
     /// `config` and `cb` are taken by value for the same reason as
     /// run_async() — see that overload's docstring.
-    asio::awaitable<RunResult> run_stream_async(
-        RunConfig config, GraphStreamCallback cb);
+    asio::awaitable<RunResult> run_stream_async(RunConfig config, GraphStreamCallback cb);
 
     /**
      * @brief Resume execution from a HITL interrupt.
@@ -417,15 +415,14 @@ public:
      * @param cb Optional streaming callback.
      * @return Execution result after resumption.
      */
-    RunResult resume(const std::string& thread_id,
-                     const json& resume_value = json(),
-                     const GraphStreamCallback& cb = nullptr);
+    RunResult resume(const std::string&         thread_id,
+                     const json&                resume_value = json(),
+                     const GraphStreamCallback& cb           = nullptr);
 
     /// Async peer of resume — non-blocking coroutine surface.
-    asio::awaitable<RunResult> resume_async(
-        const std::string& thread_id,
-        const json& resume_value = json(),
-        const GraphStreamCallback& cb = nullptr);
+    asio::awaitable<RunResult> resume_async(const std::string&         thread_id,
+                                            const json&                resume_value = json(),
+                                            const GraphStreamCallback& cb           = nullptr);
 
     // ── State inspection & manipulation (LangGraph Checkpointer API) ──
 
@@ -442,8 +439,7 @@ public:
      * @param limit Maximum number of checkpoints to return (default: 100).
      * @return Vector of Checkpoint objects, newest first.
      */
-    std::vector<Checkpoint> get_state_history(const std::string& thread_id,
-                                              int limit = 100) const;
+    std::vector<Checkpoint> get_state_history(const std::string& thread_id, int limit = 100) const;
 
     /**
      * @brief Update the state for a thread by applying channel writes.
@@ -456,8 +452,13 @@ public:
      * @param as_node Optional node name to attribute the update to (for tracing).
      */
     void update_state(const std::string& thread_id,
-                      const json& channel_writes,
+                      const json&        channel_writes,
                       const std::string& as_node = "");
+
+    /// [@coolight] 方便直接修改
+    void update_state(const std::string&                      thread_id,
+                      const std::function<void(GraphState&)>& onUpdate,
+                      const std::string&                      as_node = "");
 
     /**
      * @brief Fork a thread, creating a new thread from an existing checkpoint.
@@ -602,11 +603,10 @@ private:
     /// Delegates: node invocation to NodeExecutor, checkpoint
     /// lifecycle to CheckpointCoordinator, routing decisions to
     /// Scheduler. All internal I/O is non-blocking via co_await.
-    asio::awaitable<RunResult> execute_graph_async(
-        const RunConfig& config,
-        const GraphStreamCallback& cb,
-        const std::vector<std::string>& resume_from = {},
-        const json& resume_value = json());
+    asio::awaitable<RunResult> execute_graph_async(const RunConfig&                config,
+                                                   const GraphStreamCallback&      cb,
+                                                   const std::vector<std::string>& resume_from = {},
+                                                   const json& resume_value = json());
 
     RetryPolicy get_retry_policy(const std::string& node_name) const;
 
@@ -618,8 +618,8 @@ private:
     std::vector<ChannelDef> channel_defs_;
 
     std::map<std::string, std::unique_ptr<GraphNode>> nodes_;
-    std::vector<Edge>            edges_;
-    std::vector<ConditionalEdge> conditional_edges_;
+    std::vector<Edge>                                 edges_;
+    std::vector<ConditionalEdge>                      conditional_edges_;
 
     /// Owns routing decisions. Constructed after edges_ /
     /// conditional_edges_ are populated in compile(); holds references
@@ -636,12 +636,12 @@ private:
     std::set<std::string> interrupt_before_;
     std::set<std::string> interrupt_after_;
 
-    std::shared_ptr<CheckpointStore> checkpoint_store_;
-    std::shared_ptr<Store>           store_;
+    std::shared_ptr<CheckpointStore>   checkpoint_store_;
+    std::shared_ptr<Store>             store_;
     std::vector<std::unique_ptr<Tool>> owned_tools_;
 
     // Retry policies
-    RetryPolicy default_retry_policy_;
+    RetryPolicy                        default_retry_policy_;
     std::map<std::string, RetryPolicy> node_retry_policies_;
 
     /// Optional fan-out worker pool. Null by default; populated only
@@ -666,4 +666,4 @@ private:
     std::atomic<int> active_runs_{0};
 };
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
