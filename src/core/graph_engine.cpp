@@ -1,15 +1,14 @@
+#include <neograph/async/run_sync.h>
+#include <neograph/graph/coordinator.h>
 #include <neograph/graph/engine.h>
 #include <neograph/graph/loader.h>
-#include <neograph/graph/coordinator.h>
-
-#include <neograph/async/run_sync.h>
 
 #include <asio/thread_pool.hpp>
 
-#include <stdexcept>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <stdexcept>
 #include <thread>
 
 namespace neograph::graph {
@@ -23,7 +22,7 @@ std::size_t default_worker_count() {
     auto n = std::thread::hardware_concurrency();
     return n > 0 ? static_cast<std::size_t>(n) : 4u;
 }
-} // namespace
+}  // namespace
 
 // =========================================================================
 // compile(): JSON definition -> GraphEngine
@@ -33,14 +32,12 @@ std::size_t default_worker_count() {
 // engine's runtime home, then construct the Scheduler from the resulting
 // edge topology + barrier specs.
 // =========================================================================
-std::unique_ptr<GraphEngine> GraphEngine::compile(
-    const json& definition,
-    const NodeContext& default_context,
-    std::shared_ptr<CheckpointStore> store) {
-
+std::unique_ptr<GraphEngine> GraphEngine::compile(const json&                      definition,
+                                                  const NodeContext&               default_context,
+                                                  std::shared_ptr<CheckpointStore> store) {
     auto cg = GraphCompiler::compile(definition, default_context);
 
-    auto engine = std::unique_ptr<GraphEngine>(new GraphEngine());
+    auto engine                = std::unique_ptr<GraphEngine>(new GraphEngine());
     engine->name_              = std::move(cg.name);
     engine->channel_defs_      = std::move(cg.channel_defs);
     engine->nodes_             = std::move(cg.nodes);
@@ -59,8 +56,8 @@ std::unique_ptr<GraphEngine> GraphEngine::compile(
     // and deadlock conditional self-loops. Explicitly-declared barriers
     // (via the node's "barrier": {"wait_for": [...]} field) opt back
     // into AND-join semantics for those specific nodes.
-    engine->scheduler_ = std::make_unique<Scheduler>(
-        engine->edges_, engine->conditional_edges_, std::move(cg.barrier_specs));
+    engine->scheduler_ = std::make_unique<Scheduler>(engine->edges_, engine->conditional_edges_,
+                                                     std::move(cg.barrier_specs));
 
     // NodeExecutor owns retry + fan-out + Send invocation. Bind the
     // retry-policy lookup to this engine's per-node override map so
@@ -144,29 +141,26 @@ void GraphEngine::set_worker_count(std::size_t n) {
     // thread_pool — rebuild it because asio::thread_pool isn't
     // resizable. Dtor joins the old pool's workers, so callers must
     // not resize across an in-flight run() (documented on declaration).
-    GraphEngine* self = this;
-    auto retry_lookup = [self](const std::string& node_name) {
+    GraphEngine* self         = this;
+    auto         retry_lookup = [self](const std::string& node_name) {
         return self->get_retry_policy(node_name);
     };
     if (n == 1) {
         pool_.reset();
-        executor_ = std::make_unique<NodeExecutor>(
-            nodes_, channel_defs_, std::move(retry_lookup),
-            nullptr, &node_cache_);
+        executor_ = std::make_unique<NodeExecutor>(nodes_, channel_defs_, std::move(retry_lookup),
+                                                   nullptr, &node_cache_);
         return;
     }
-    pool_ = std::make_unique<asio::thread_pool>(n);
-    executor_ = std::make_unique<NodeExecutor>(
-        nodes_, channel_defs_, std::move(retry_lookup),
-        pool_.get(), &node_cache_);
+    pool_     = std::make_unique<asio::thread_pool>(n);
+    executor_ = std::make_unique<NodeExecutor>(nodes_, channel_defs_, std::move(retry_lookup),
+                                               pool_.get(), &node_cache_);
 }
 
 void GraphEngine::set_worker_count_auto() {
     set_worker_count(default_worker_count());
 }
 
-void GraphEngine::set_node_cache_enabled(const std::string& node_name,
-                                          bool enabled) {
+void GraphEngine::set_node_cache_enabled(const std::string& node_name, bool enabled) {
     node_cache_.set_enabled(node_name, enabled);
 }
 
@@ -191,21 +185,20 @@ std::optional<json> GraphEngine::get_state(const std::string& thread_id) const {
     return cp_opt->channel_values;
 }
 
-std::vector<Checkpoint> GraphEngine::get_state_history(
-    const std::string& thread_id, int limit) const {
+std::vector<Checkpoint> GraphEngine::get_state_history(const std::string& thread_id,
+                                                       int                limit) const {
     if (!checkpoint_store_) return {};
     return checkpoint_store_->list(thread_id, limit);
 }
 
 void GraphEngine::update_state(const std::string& thread_id,
-                                const json& channel_writes,
-                                const std::string& as_node) {
+                               const json&        channel_writes,
+                               const std::string& as_node) {
     if (!checkpoint_store_)
         throw std::runtime_error("Cannot update_state: no checkpoint store configured");
 
     auto cp_opt = checkpoint_store_->load_latest(thread_id);
-    if (!cp_opt)
-        throw std::runtime_error("No checkpoint found for thread: " + thread_id);
+    if (!cp_opt) throw std::runtime_error("No checkpoint found for thread: " + thread_id);
     auto& cp = *cp_opt;
 
     GraphState state;
@@ -233,19 +226,19 @@ void GraphEngine::update_state(const std::string& thread_id,
     // update_states during an in-flight AND-join, dropping barrier_state
     // would silently discard partial arrivals. Coordinator-driven
     // super-step saves propagate this for the same reason.
-    new_cp.barrier_state   = cp.barrier_state;
-    new_cp.step            = cp.step;
-    new_cp.timestamp       = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    new_cp.barrier_state = cp.barrier_state;
+    new_cp.step          = cp.step;
+    new_cp.timestamp     = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
 
     checkpoint_store_->save(new_cp);
 }
 
 std::string GraphEngine::fork(const std::string& source_thread_id,
-                               const std::string& new_thread_id,
-                               const std::string& checkpoint_id) {
-    if (!checkpoint_store_)
-        throw std::runtime_error("Cannot fork: no checkpoint store configured");
+                              const std::string& new_thread_id,
+                              const std::string& checkpoint_id) {
+    if (!checkpoint_store_) throw std::runtime_error("Cannot fork: no checkpoint store configured");
 
     std::optional<Checkpoint> cp_opt;
     if (checkpoint_id.empty()) {
@@ -253,28 +246,26 @@ std::string GraphEngine::fork(const std::string& source_thread_id,
     } else {
         cp_opt = checkpoint_store_->load_by_id(checkpoint_id);
     }
-    if (!cp_opt)
-        throw std::runtime_error("No checkpoint found for fork source");
+    if (!cp_opt) throw std::runtime_error("No checkpoint found for fork source");
 
     Checkpoint forked;
-    forked.id              = Checkpoint::generate_id();
-    forked.thread_id       = new_thread_id;
-    forked.channel_values  = cp_opt->channel_values;
+    forked.id               = Checkpoint::generate_id();
+    forked.thread_id        = new_thread_id;
+    forked.channel_values   = cp_opt->channel_values;
     forked.channel_versions = cp_opt->channel_versions;
-    forked.parent_id       = cp_opt->id;
-    forked.current_node    = cp_opt->current_node;
-    forked.next_nodes      = cp_opt->next_nodes;
-    forked.interrupt_phase = cp_opt->interrupt_phase;
+    forked.parent_id        = cp_opt->id;
+    forked.current_node     = cp_opt->current_node;
+    forked.next_nodes       = cp_opt->next_nodes;
+    forked.interrupt_phase  = cp_opt->interrupt_phase;
     // Copy barrier_state so a fork taken mid-AND-join resumes with the
     // same partial-arrival accumulator as its source.
-    forked.barrier_state   = cp_opt->barrier_state;
-    forked.metadata        = {{"forked_from", {
-        {"thread_id", source_thread_id},
-        {"checkpoint_id", cp_opt->id}
-    }}};
-    forked.step            = cp_opt->step;
-    forked.timestamp       = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+    forked.barrier_state = cp_opt->barrier_state;
+    forked.metadata      = {
+        {"forked_from", {{"thread_id", source_thread_id}, {"checkpoint_id", cp_opt->id}}}};
+    forked.step      = cp_opt->step;
+    forked.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
 
     checkpoint_store_->save(forked);
     return forked.id;
@@ -328,35 +319,30 @@ RunResult GraphEngine::run(const RunConfig& config) {
 // internal `execute_graph_async` still takes const& because its
 // callers (run_sync, run_async, resume_async) all keep the config
 // alive on their own stack frame.
-asio::awaitable<RunResult>
-GraphEngine::run_async(RunConfig config) {
+asio::awaitable<RunResult> GraphEngine::run_async(RunConfig config) {
     co_return co_await execute_graph_async(config, nullptr);
 }
 
-RunResult GraphEngine::run_stream(const RunConfig& config,
-                                   const GraphStreamCallback& cb) {
+RunResult GraphEngine::run_stream(const RunConfig& config, const GraphStreamCallback& cb) {
     return neograph::async::run_sync(execute_graph_async(config, cb));
 }
 
-asio::awaitable<RunResult>
-GraphEngine::run_stream_async(RunConfig config,
-                              GraphStreamCallback cb) {
+asio::awaitable<RunResult> GraphEngine::run_stream_async(RunConfig config, GraphStreamCallback cb) {
     // Same lifetime concern as run_async — both config and cb might
     // be stack-local at the callsite, captured into a co_spawn'd
     // awaitable that outlives the callsite. Take both by value.
     co_return co_await execute_graph_async(config, cb);
 }
 
-RunResult GraphEngine::resume(const std::string& thread_id,
-                               const json& resume_value,
-                               const GraphStreamCallback& cb) {
+RunResult GraphEngine::resume(const std::string&         thread_id,
+                              const json&                resume_value,
+                              const GraphStreamCallback& cb) {
     return neograph::async::run_sync(resume_async(thread_id, resume_value, cb));
 }
 
-asio::awaitable<RunResult>
-GraphEngine::resume_async(const std::string& thread_id,
-                          const json& resume_value,
-                          const GraphStreamCallback& cb) {
+asio::awaitable<RunResult> GraphEngine::resume_async(const std::string&         thread_id,
+                                                     const json&                resume_value,
+                                                     const GraphStreamCallback& cb) {
     // Sem 3.7.5: real async resume. Mirrors sync resume() but the
     // load_latest and the downstream super-step loop go through
     // their *_async peers, so the whole resume path is non-blocking.
@@ -364,13 +350,11 @@ GraphEngine::resume_async(const std::string& thread_id,
         throw std::runtime_error("Cannot resume: no checkpoint store configured");
 
     auto cp_opt = co_await checkpoint_store_->load_latest_async(thread_id);
-    if (!cp_opt)
-        throw std::runtime_error("No checkpoint found for thread: " + thread_id);
+    if (!cp_opt) throw std::runtime_error("No checkpoint found for thread: " + thread_id);
 
-    if (cp_opt->next_nodes.size() == 1 &&
-        cp_opt->next_nodes[0] == std::string(END_NODE)) {
+    if (cp_opt->next_nodes.size() == 1 && cp_opt->next_nodes[0] == std::string(END_NODE)) {
         RunResult result;
-        result.output = cp_opt->channel_values;
+        result.output        = cp_opt->channel_values;
         result.checkpoint_id = cp_opt->id;
         co_return result;
     }
@@ -379,8 +363,7 @@ GraphEngine::resume_async(const std::string& thread_id,
     config.thread_id = thread_id;
     config.max_steps = 50;
 
-    co_return co_await execute_graph_async(
-        config, cb, cp_opt->next_nodes, resume_value);
+    co_return co_await execute_graph_async(config, cb, cp_opt->next_nodes, resume_value);
 }
 
 // =========================================================================
@@ -397,11 +380,11 @@ GraphEngine::resume_async(const std::string& thread_id,
 // and blocks via std::future. Async callers on their own executor
 // co_await it directly.
 
-asio::awaitable<RunResult>
-GraphEngine::execute_graph_async(const RunConfig& config,
-                                 const GraphStreamCallback& cb,
-                                 const std::vector<std::string>& resume_from,
-                                 const json& resume_value) {
+asio::awaitable<RunResult> GraphEngine::execute_graph_async(
+    const RunConfig&                config,
+    const GraphStreamCallback&      cb,
+    const std::vector<std::string>& resume_from,
+    const json&                     resume_value) {
     const bool is_resume = !resume_from.empty();
 
     // RAII inc/dec on the inflight-run counter — set_worker_count()
@@ -423,7 +406,7 @@ GraphEngine::execute_graph_async(const RunConfig& config,
     // gone — cancel flows through `RunContext::cancel_token` (set just
     // below) on every NodeInput.
 
-    StreamMode stream_mode = config.stream_mode;
+    StreamMode            stream_mode = config.stream_mode;
     CheckpointCoordinator coord(checkpoint_store_, config.thread_id);
 
     // PR 1 (v0.4.0): build the per-run RunContext from RunConfig and
@@ -438,15 +421,15 @@ GraphEngine::execute_graph_async(const RunConfig& config,
     ctx.cancel_token = config.cancel_token;
     ctx.thread_id    = config.thread_id;
     ctx.stream_mode  = stream_mode;
-    ctx.store        = store_;   // issue #27 — node bodies reach Store via in.ctx.store
+    ctx.store        = store_;  // issue #27 — node bodies reach Store via in.ctx.store
     // ctx.deadline / ctx.trace_id stay default-constructed for now —
     // RunConfig has no source field for either. Future PRs add them.
 
     std::string last_checkpoint_id;
-    int start_step = 0;
+    int         start_step = 0;
 
     std::unordered_map<std::string, NodeResult> replay_results;
-    BarrierState barrier_state;
+    BarrierState                                barrier_state;
 
     if (is_resume) {
         auto ctx = co_await coord.load_for_resume_async();
@@ -461,10 +444,9 @@ GraphEngine::execute_graph_async(const RunConfig& config,
                 // Build the resume message outside the brace-init that
                 // would otherwise nest inside the coroutine body. Same
                 // GCC 13 ICE shape; same workaround.
-                std::string content = resume_value.is_string()
-                    ? resume_value.get<std::string>()
-                    : resume_value.dump();
-                json resume_msg;
+                std::string content = resume_value.is_string() ? resume_value.get<std::string>()
+                                                               : resume_value.dump();
+                json        resume_msg;
                 resume_msg["role"]    = "user";
                 resume_msg["content"] = content;
                 state.write("messages", json::array({resume_msg}));
@@ -479,8 +461,7 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         // checkpoint's recorded step so per-thread step numbering
         // stays meaningful in the trace.
         if (config.resume_if_exists && checkpoint_store_) {
-            auto cp_opt =
-                co_await checkpoint_store_->load_latest_async(config.thread_id);
+            auto cp_opt = co_await checkpoint_store_->load_latest_async(config.thread_id);
             if (cp_opt) {
                 state.restore(cp_opt->channel_values);
                 last_checkpoint_id = cp_opt->id;
@@ -490,11 +471,10 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         apply_input(state, config.input);
     }
 
-    std::vector<std::string> ready =
-        is_resume ? resume_from : scheduler_->plan_start_step();
+    std::vector<std::string> ready = is_resume ? resume_from : scheduler_->plan_start_step();
 
     std::vector<std::string> trace;
-    bool hit_end = false;
+    bool                     hit_end = false;
 
     std::vector<Send> pending_sends;
 
@@ -507,8 +487,7 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         // bind_graph.cpp::run_async wiring) — both layers needed to
         // close the cost-leak gap reported in v0.2.3.
         if (config.cancel_token) {
-            config.cancel_token->throw_if_cancelled(
-                "step " + std::to_string(step));
+            config.cancel_token->throw_if_cancelled("step " + std::to_string(step));
         }
 
         // hit_end is informational only — a Send target with no outgoing
@@ -527,17 +506,16 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         if (!is_resume_entry) {
             for (const auto& node_name : ready) {
                 if (interrupt_before_.count(node_name) && coord.enabled()) {
-                    auto cp_id = co_await coord.save_super_step_async(state,
-                        node_name, ready,
-                        CheckpointPhase::Before, step, last_checkpoint_id,
+                    auto cp_id = co_await coord.save_super_step_async(
+                        state, node_name, ready, CheckpointPhase::Before, step, last_checkpoint_id,
                         barrier_state);
 
                     RunResult result;
-                    result.output          = state.serialize();
-                    result.interrupted     = true;
-                    result.interrupt_node  = node_name;
+                    result.output         = state.serialize();
+                    result.interrupted    = true;
+                    result.interrupt_node = node_name;
                     json iv;
-                    iv["message"] = "Interrupt before node: " + node_name;
+                    iv["message"]          = "Interrupt before node: " + node_name;
                     result.interrupt_value = iv;
                     result.checkpoint_id   = cp_id;
                     result.execution_trace = std::move(trace);
@@ -559,14 +537,13 @@ GraphEngine::execute_graph_async(const RunConfig& config,
 
         // Capture NodeInterrupt outside the catch (GCC-13-safe) so the
         // checkpoint lookup that follows can do its own work.
-        bool interrupted = false;
+        bool        interrupted = false;
         std::string interrupt_reason;
 
         try {
             if (ready.size() == 1) {
                 step_results.push_back(co_await executor_->run_one_async(
-                    ready[0], step, state, replay_results,
-                    coord, last_checkpoint_id, barrier_state,
+                    ready[0], step, state, replay_results, coord, last_checkpoint_id, barrier_state,
                     trace, cb, stream_mode, ctx));
             } else {
                 // Sem 3.7: full async fan-out via
@@ -574,23 +551,22 @@ GraphEngine::execute_graph_async(const RunConfig& config,
                 // io_context's worker thread now stays free for other
                 // coroutines while the parallel branches run.
                 step_results = co_await executor_->run_parallel_async(
-                    ready, step, state, replay_results,
-                    coord, last_checkpoint_id, barrier_state,
+                    ready, step, state, replay_results, coord, last_checkpoint_id, barrier_state,
                     trace, cb, stream_mode, ctx);
             }
         } catch (const NodeInterrupt& ni) {
-            interrupted = true;
+            interrupted      = true;
             interrupt_reason = ni.reason();
         }
 
         if (interrupted) {
             RunResult result;
-            result.output          = state.serialize();
-            result.interrupted     = true;
-            result.interrupt_node  = interrupt_reason;
+            result.output         = state.serialize();
+            result.interrupted    = true;
+            result.interrupt_node = interrupt_reason;
             json iv;
-            iv["reason"] = interrupt_reason;
-            iv["type"]   = "NodeInterrupt";
+            iv["reason"]           = interrupt_reason;
+            iv["type"]             = "NodeInterrupt";
             result.interrupt_value = iv;
             result.execution_trace = std::move(trace);
 
@@ -613,13 +589,12 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         // 4.x: per-task StepRoutings flow back so each spawned task's
         //      Command.goto / default outgoing edge contribute to the
         //      next super-step routing decision (LangGraph parity).
-        auto send_routings = co_await executor_->run_sends_async(
-            pending_sends, step, state, replay_results,
-            coord, last_checkpoint_id, trace, cb, stream_mode, ctx);
+        auto         send_routings =
+            co_await executor_->run_sends_async(pending_sends, step, state, replay_results, coord,
+                                                last_checkpoint_id, trace, cb, stream_mode, ctx);
 
         if (cb && has_mode(stream_mode, StreamMode::VALUES)) {
-            cb(GraphEvent{GraphEvent::Type::CHANNEL_WRITE, "__state__",
-                          state.serialize()});
+            cb(GraphEvent{GraphEvent::Type::CHANNEL_WRITE, "__state__", state.serialize()});
         }
 
         // --- interrupt_after check ---
@@ -639,8 +614,7 @@ GraphEngine::execute_graph_async(const RunConfig& config,
                     if (sr.command_goto) {
                         union_next.insert(*sr.command_goto);
                     } else {
-                        for (const auto& nx :
-                                scheduler_->resolve_next_nodes(sr.node_name, state)) {
+                        for (const auto& nx : scheduler_->resolve_next_nodes(sr.node_name, state)) {
                             union_next.insert(nx);
                         }
                     }
@@ -648,16 +622,16 @@ GraphEngine::execute_graph_async(const RunConfig& config,
                 std::vector<std::string> nexts(union_next.begin(), union_next.end());
                 if (nexts.empty()) nexts.push_back(std::string(END_NODE));
 
-                auto cp_id = co_await coord.save_super_step_async(state,
-                    node_name, nexts, CheckpointPhase::After, step,
-                    last_checkpoint_id, barrier_state);
+                auto cp_id = co_await coord.save_super_step_async(
+                    state, node_name, nexts, CheckpointPhase::After, step, last_checkpoint_id,
+                    barrier_state);
 
                 RunResult result;
-                result.output          = state.serialize();
-                result.interrupted     = true;
-                result.interrupt_node  = node_name;
+                result.output         = state.serialize();
+                result.interrupted    = true;
+                result.interrupt_node = node_name;
                 json iv;
-                iv["message"] = "Interrupt after node: " + node_name;
+                iv["message"]          = "Interrupt after node: " + node_name;
                 result.interrupt_value = iv;
                 result.checkpoint_id   = cp_id;
                 result.execution_trace = std::move(trace);
@@ -682,8 +656,7 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         for (size_t i = 0; i < step_results.size(); ++i) {
             StepRouting r;
             r.node_name = ready[i];
-            if (step_results[i].command
-                && !step_results[i].command->goto_node.empty()) {
+            if (step_results[i].command && !step_results[i].command->goto_node.empty()) {
                 r.command_goto = step_results[i].command->goto_node;
             }
             unified_routings.push_back(std::move(r));
@@ -692,10 +665,9 @@ GraphEngine::execute_graph_async(const RunConfig& config,
             unified_routings.push_back(std::move(sr));
         }
 
-        auto plan = scheduler_->plan_next_step(
-            unified_routings, state, barrier_state);
-        hit_end = hit_end || plan.hit_end;
-        ready  = std::move(plan.ready);
+        auto plan = scheduler_->plan_next_step(unified_routings, state, barrier_state);
+        hit_end   = hit_end || plan.hit_end;
+        ready     = std::move(plan.ready);
 
         if (cb && has_mode(stream_mode, StreamMode::DEBUG)) {
             if (plan.winning_command_goto) {
@@ -705,7 +677,8 @@ GraphEngine::execute_graph_async(const RunConfig& config,
             }
             if (!ready.empty()) {
                 json next_nodes_arr = json::array();
-                for (const auto& n : ready) next_nodes_arr.push_back(n);
+                for (const auto& n : ready)
+                    next_nodes_arr.push_back(n);
                 json data;
                 data["next_nodes"] = next_nodes_arr;
                 data["step"]       = step;
@@ -715,8 +688,7 @@ GraphEngine::execute_graph_async(const RunConfig& config,
 
         if (coord.enabled()) {
             std::vector<std::string> next_nodes_for_cp =
-                ready.empty() ? std::vector<std::string>{std::string(END_NODE)}
-                              : ready;
+                ready.empty() ? std::vector<std::string>{std::string(END_NODE)} : ready;
             const std::string parent_cp_id = last_checkpoint_id;
             // Guard against an executor path that returns without
             // pushing to `trace` (e.g. all-Send-targets-missing in
@@ -725,12 +697,11 @@ GraphEngine::execute_graph_async(const RunConfig& config,
             // a synthesised __step__<N> tag keeps the invariant
             // "every super-step's checkpoint has a non-empty key"
             // without crashing on UB.
-            const std::string trace_tag = trace.empty()
-                ? (std::string("__step__") + std::to_string(step))
-                : trace.back();
-            auto cp_id = co_await coord.save_super_step_async(state,
-                trace_tag, next_nodes_for_cp, CheckpointPhase::Completed,
-                step, parent_cp_id, barrier_state);
+            const std::string trace_tag =
+                trace.empty() ? (std::string("__step__") + std::to_string(step)) : trace.back();
+            auto cp_id = co_await coord.save_super_step_async(state, trace_tag, next_nodes_for_cp,
+                                                              CheckpointPhase::Completed, step,
+                                                              parent_cp_id, barrier_state);
             last_checkpoint_id = cp_id;
 
             co_await coord.clear_pending_writes_async(parent_cp_id);
@@ -745,12 +716,18 @@ GraphEngine::execute_graph_async(const RunConfig& config,
         result.checkpoint_id = last_checkpoint_id;
     }
 
-    auto messages = state.get_messages();
-    if (!messages.empty() && messages.back().role == "assistant") {
-        result.output["final_response"] = messages.back().content;
+    // [@coolight] 减少 from_json
+    auto messages = state.get("messages");
+    if (!messages.empty()) {
+        auto                  lastJson = messages.back();
+        neograph::ChatMessage last;
+        neograph::from_json(lastJson, last);
+        if (last.role == "assistant") {
+            result.output["final_response"] = last.content;
+        }
     }
 
     co_return result;
 }
 
-} // namespace neograph::graph
+}  // namespace neograph::graph
