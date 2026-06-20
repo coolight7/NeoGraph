@@ -93,6 +93,14 @@ void GraphState::overwrite(const std::string& channel, const json& value) {
     ch.version = ++global_version_;
 }
 
+void GraphState::remove(const std::string& channel) {
+    std::unique_lock lock(mutex_);
+    auto             it = channels_.find(channel);
+    if (it == channels_.end()) {
+        channels_.erase(it);
+    }
+}
+
 void GraphState::apply_writes(const std::vector<ChannelWrite>& writes) {
     std::unique_lock lock(mutex_);
     for (const auto& w : writes) {

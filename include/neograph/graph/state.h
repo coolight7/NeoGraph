@@ -60,6 +60,8 @@ public:
 
     void overwrite(const std::string& channel, const json& value);
 
+    void remove(const std::string& channel);
+
     /**
      * @brief Apply a batch of channel writes atomically (exclusive lock).
      *
