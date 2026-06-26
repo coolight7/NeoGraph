@@ -1,4 +1,6 @@
 #include <neograph/async/run_sync.h>
+#include <neograph/graph/engine.h>
+#include <neograph/graph/node.h>
 
 #include <asio/co_spawn.hpp>
 #include <asio/deferred.hpp>
@@ -128,9 +130,6 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     json results = json::array();
 
     auto onExecTool = [&](const neograph::ToolCall& tc) -> asio::awaitable<ChatMessage> {
-        auto it = std::find_if(tools_.begin(), tools_.end(),
-                               [&](Tool* t) { return t->get_name() == tc.name; });
-
         ChatMessage tool_msg;
         tool_msg.role         = "tool";
         tool_msg.tool_call_id = tc.id;
