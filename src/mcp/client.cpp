@@ -3,6 +3,8 @@
 #include <neograph/async/run_sync.h>
 #include <neograph/mcp/client.h>
 
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/read_until.hpp>
 #include <asio/streambuf.hpp>
@@ -31,6 +33,8 @@
 #include <chrono>
 #include <cstring>
 #include <istream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -71,23 +75,24 @@ public:
     json rpc_call(const std::string& method, const json& params);
 
     /// Async variant — wraps the subprocess pipes in
-    /// asio::posix::stream_descriptor for non-blocking I/O. The
-    /// awaitable serialises concurrent rpc_call_async() invocations
-    /// on the same session via an asio::experimental::channel-backed
-    /// lock (capacity 1, token-passing). A second coroutine's
-    /// acquire suspends at its own `co_await async_receive` — no OS
-    /// thread is held, so other coroutines on the io_context keep
-    /// progressing and the first call's I/O completions fire normally.
+    /// asio::posix::stream_descriptor for non-blocking I/O. Concurrent
+    /// rpc_call_async() calls on the same session OVERLAP their in-flight
+    /// I/O via a correlation-id demultiplexer: each caller serialises
+    /// only its frame write (a capacity-1 channel held for microseconds),
+    /// registers a response sink keyed by its JSON-RPC id, then awaits
+    /// that sink. A single reader coroutine owns the read side, routing
+    /// each response line to the matching sink. Wall time for N siblings
+    /// is therefore max(latency), not sum — provided the MCP server
+    /// itself processes concurrently (a serial server is the Amdahl floor
+    /// and gains nothing here).
     ///
-    /// The lock is lazy-initialised on first call using the caller's
-    /// executor. Subsequent calls on executors that can't interoperate
-    /// with that executor would break the serialisation — in practice
-    /// all callers of one session go through one engine and thus one
-    /// io_context, so this isn't a concern.
+    /// All callers of one session are assumed to share one io_context
+    /// (in practice the engine's), so the reader and the writers run on
+    /// the same executor.
     ///
     /// Sync rpc_call() continues to use the std::mutex mtx_ and must
     /// NOT be mixed with rpc_call_async on the same session (the two
-    /// locks don't know about each other).
+    /// paths don't know about each other).
     asio::awaitable<json> rpc_call_async(const std::string& method, const json& params);
 
     // Send a JSON-RPC notification (no id, no response expected).
@@ -101,6 +106,12 @@ private:
 
     asio::awaitable<std::string> async_read_line_locked(AsyncHandle& out);
     asio::awaitable<void>        async_write_frame_locked(AsyncHandle& in, const json& j);
+
+    /// Demux reader loop. Owns async_out_, reads every response line and
+    /// routes it to the waiter keyed by its JSON-RPC id. Lazily spawned
+    /// while ≥1 call is in flight; exits once no waiters remain so a
+    /// private run_sync io_context can drain and return.
+    asio::awaitable<void> run_reader();
 
 #ifdef _WIN32
     HANDLE process_  = nullptr;  ///< child process handle (CloseHandle on dtor)
@@ -152,6 +163,18 @@ private:
     std::unique_ptr<AsyncHandle> async_in_;
     std::unique_ptr<AsyncHandle> async_out_;
     std::mutex                   async_handles_init_mtx_;
+
+    // ── Demux multiplexer ───────────────────────────────────────────
+    // `async_lock_` above is repurposed as a WRITE-ONLY lock (held only
+    // around the frame write). One reader coroutine owns async_out_ and
+    // fans each response to the waiter registered under its JSON-RPC id,
+    // so N in-flight calls overlap their reads instead of serialising
+    // behind one round-trip lock.
+    using RespChan =
+        asio::experimental::channel<void(neograph_asio_error_code, std::shared_ptr<json>)>;
+    std::mutex                               demux_mu_;  ///< guards the two fields below
+    std::map<int, std::shared_ptr<RespChan>> waiters_;   ///< id → response sink
+    bool reader_running_ = false;                        ///< a run_reader() coroutine is live
 };
 
 #ifdef _WIN32
@@ -607,6 +630,70 @@ asio::awaitable<std::string> StdioSession::async_read_line_locked(AsyncHandle& o
     co_return line;
 }
 
+asio::awaitable<void> StdioSession::run_reader() {
+    std::exception_ptr fail;
+    try {
+        for (;;) {
+            std::string line = co_await async_read_line_locked(*async_out_);
+            if (!line.empty()) {
+                json resp;
+                bool parsed = true;
+                try {
+                    resp = json::parse(line);
+                } catch (const std::exception&) {
+                    parsed = false;
+                }
+                if (parsed && resp.contains("id") && resp["id"].is_number_integer()) {
+                    const int                 rid = resp["id"].get<int>();
+                    std::shared_ptr<RespChan> chan;
+                    {
+                        std::lock_guard<std::mutex> lk(demux_mu_);
+                        auto                        it = waiters_.find(rid);
+                        if (it != waiters_.end()) {
+                            chan = it->second;
+                            waiters_.erase(it);
+                        }
+                    }
+                    // Unknown / late ids are dropped. Capacity-1 sink is
+                    // empty, so this send always lands for the matched id.
+                    if (chan) {
+                        auto p = std::make_shared<json>(std::move(resp));
+                        chan->try_send(neograph_asio_error_code{}, p);
+                    }
+                }
+            }
+            // Stop once nothing is outstanding so a private run_sync
+            // io_context can drain and return; a later call lazily
+            // restarts the reader.
+            bool stop = false;
+            {
+                std::lock_guard<std::mutex> lk(demux_mu_);
+                if (waiters_.empty()) {
+                    reader_running_ = false;
+                    stop            = true;
+                }
+            }
+            if (stop) break;
+        }
+    } catch (const std::exception&) {
+        // Pipe EOF / read error (e.g. child died): fail every waiter so
+        // awaiting callers throw instead of hanging on a dead server.
+        fail = std::current_exception();
+    }
+
+    if (fail) {
+        std::map<int, std::shared_ptr<RespChan>> remaining;
+        {
+            std::lock_guard<std::mutex> lk(demux_mu_);
+            remaining.swap(waiters_);
+            reader_running_ = false;
+        }
+        for (auto& kv : remaining)
+            kv.second->close();
+    }
+    co_return;
+}
+
 asio::awaitable<json> StdioSession::rpc_call_async(const std::string& method, const json& params) {
     const int id = ++next_id_;
 
@@ -614,11 +701,10 @@ asio::awaitable<json> StdioSession::rpc_call_async(const std::string& method, co
 
     auto ex = co_await asio::this_coro::executor;
 
-    // Lazy-init the awaitable lock on first call. Bound to this
-    // caller's executor; subsequent calls assume a compatible executor
-    // (in practice: the engine's single io_context — no cross-executor
-    // mix for one session). std::mutex guards only the one-time
-    // init, not the lock itself.
+    // Lazy-init the WRITE lock on first call (capacity-1 channel = binary
+    // semaphore). Unlike the pre-demux design it is NOT held across the
+    // round trip — only around the frame write below — so concurrent
+    // calls overlap their reads. std::mutex guards only the one-time init.
     {
         std::lock_guard<std::mutex> g(async_lock_init_mtx_);
         if (!async_lock_) {
@@ -1072,6 +1158,64 @@ bool MCPClient::initialize(const std::string& client_name) {
     }
 
     return true;
+}
+
+asio::awaitable<bool> MCPClient::initialize_async(const std::string& client_name) {
+    json params;
+    params["protocolVersion"] = "2025-11-25";
+    params["capabilities"]    = json::object();
+    params["clientInfo"]      = {{"name", client_name}, {"version", "0.1.0"}};
+
+    auto init_result = co_await rpc_call_async("initialize", params);
+    {
+        std::lock_guard lk(http_state_mu_);
+        if (init_result.contains("protocolVersion") && init_result["protocolVersion"].is_string()) {
+            negotiated_protocol_version_ = init_result["protocolVersion"].get<std::string>();
+        } else {
+            negotiated_protocol_version_ = "2025-11-25";
+        }
+    }
+
+    if (stdio_session_) {
+        stdio_session_->notify("notifications/initialized", json::object());
+        co_return true;
+    }
+
+    // HTTP initialized notification — same envelope/headers as the sync
+    // initialize(), but awaited directly instead of through run_sync.
+    json notify;
+    notify["jsonrpc"] = "2.0";
+    notify["method"]  = "notifications/initialized";
+    notify["params"]  = json::object();
+
+    auto endpoint = async::split_async_endpoint(server_url_);
+    std::vector<std::pair<std::string, std::string>> headers;
+    {
+        std::lock_guard lk(http_state_mu_);
+        headers = {
+            {"Content-Type", "application/json"},
+            {"Accept", "application/json, text/event-stream"},
+            {"Host", "localhost"},
+        };
+        if (!session_id_.empty()) {
+            headers.emplace_back("Mcp-Session-Id", session_id_);
+        }
+        if (!negotiated_protocol_version_.empty()) {
+            headers.emplace_back("MCP-Protocol-Version", negotiated_protocol_version_);
+        }
+    }
+
+    auto notify_body = notify.dump();
+    auto ex          = co_await asio::this_coro::executor;
+    auto               res =
+        co_await       async::async_post(ex, endpoint.host, endpoint.port, endpoint.prefix + "/mcp",
+                                         notify_body, headers, endpoint.tls);
+
+    if (res.status != 200 && res.status != 202 && res.status != 204) {
+        throw std::runtime_error("MCP initialize notification returned HTTP " +
+                                 std::to_string(res.status) + ": " + res.body);
+    }
+    co_return true;
 }
 
 std::vector<std::unique_ptr<Tool>> MCPClient::get_tools() {

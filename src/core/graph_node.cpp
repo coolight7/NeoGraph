@@ -1,10 +1,15 @@
 #include <neograph/async/run_sync.h>
-#include <neograph/graph/engine.h>  // RunContext (forward-declared in node.h)
-#include <neograph/graph/node.h>
+
+#include <asio/co_spawn.hpp>
+#include <asio/deferred.hpp>
+#include <asio/experimental/parallel_group.hpp>
+#include <asio/this_coro.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
 
 namespace neograph::graph {
 
@@ -131,12 +136,15 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
         tool_msg.tool_call_id = tc.id;
         tool_msg.tool_name    = tc.name;
 
+        auto it = std::find_if(tools_.begin(), tools_.end(),
+                               [&](Tool* t) { return t->get_name() == tc.name; });
         if (it == tools_.end()) {
             tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
         } else {
             try {
                 auto args = json::parse(tc.arguments);
                 if (args.is_object() && args["thread_id"].is_null()) {
+                    // append arg `thread_id`
                     args["thread_id"] = in.ctx.thread_id;
                 }
                 tool_msg.content = co_await execTool(*it, args);
