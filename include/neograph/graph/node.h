@@ -216,6 +216,11 @@ public:
     /// HTTP socket without the legacy thread-local smuggling.
     asio::awaitable<NodeOutput> run(NodeInput in) override;
 
+    virtual void onReceiveToken(const GraphStreamCallback& callback,
+                                neograph::graph::NodeInput in,
+                                const std::string&         nodeName,
+                                const std::string&         token);
+
     std::string get_name() const override { return name_; }
 
 private:

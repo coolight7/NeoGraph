@@ -84,10 +84,8 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     // default. See PR #40.
     StreamCallback on_token;
     if (in.stream_cb) {
-        const GraphStreamCallback& cb        = *in.stream_cb;
-        std::string                node_name = name_;
-        on_token                             = [&cb, node_name](const std::string& token) {
-            cb(GraphEvent{GraphEvent::Type::LLM_TOKEN, node_name, json(token)});
+        on_token = [input = in, stream_cb = in.stream_cb, this](const std::string& token) {
+            onReceiveToken(*stream_cb, input, name_, token);
         };
     }
     auto completion = co_await provider_->invoke(params, on_token);
@@ -98,6 +96,17 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     NodeOutput out;
     out.writes.push_back(ChannelWrite{"messages", json::array({msg_json})});
     co_return out;
+}
+
+void LLMCallNode::onReceiveToken(const GraphStreamCallback& callback,
+                                 neograph::graph::NodeInput in,
+                                 const std::string&         nodeName,
+                                 const std::string&         token) {
+    callback(neograph::graph::GraphEvent{
+        GraphEvent::Type::LLM_TOKEN,
+        nodeName,
+        json(token),
+    });
 }
 
 // =========================================================================
