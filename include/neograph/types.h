@@ -10,10 +10,45 @@
 
 #include <neograph/json.h>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace neograph {
+
+/**
+ * @brief 消息标记位掩码，用于标识 ChatMessage 的特殊属性。
+ *
+ * 使用位掩码保持内存紧凑且易于组合判断。
+ * 这些标记不会被序列化到 OpenAI API 请求中（由 messages_to_json 过滤）。
+ */
+enum class MessageFlag : uint32_t {
+    None = 0,
+    /// 由 Agent 运行时自动插入的提示/修复消息（非用户/LLM 原生产出）
+    AutoInserted = 1 << 0,
+    /// share_store toolcall 的结果已被缩略/截断处理
+    ShareStoreTruncated = 1 << 1,
+    /// 消息内容已被卸载到 share_store（content 中仅保留 id 引用）
+    ContentOffloaded = 1 << 2,
+    /// 消息已被总结压缩（原始内容在 summaryContent 中）
+    Summarized = 1 << 3,
+    /// 消息因过期被标记为无效（如 outdated toolcall）
+    Outdated = 1 << 4,
+};
+
+inline MessageFlag operator|(MessageFlag a, MessageFlag b) {
+    return static_cast<MessageFlag>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+inline MessageFlag operator&(MessageFlag a, MessageFlag b) {
+    return static_cast<MessageFlag>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+inline MessageFlag& operator|=(MessageFlag& a, MessageFlag b) {
+    a = a | b;
+    return a;
+}
+inline bool hasFlag(MessageFlag flags, MessageFlag test) {
+    return (static_cast<uint32_t>(flags & test)) != 0;
+}
 
 /**
  * @brief Represents a single tool invocation requested by the LLM.
@@ -45,6 +80,11 @@ struct ChatMessage {
     /// [@coolight] 用于支持 修改、重新生成 消息历史
     std::vector<std::string> history_contents;
     std::string              summaryContent;
+
+    /// 消息标记位掩码（不序列化到 LLM API 请求）
+    MessageFlag flags = MessageFlag::None;
+    /// 扩展元数据，用于存储标记相关的附加信息（如 share_store id 等）
+    json extra;
 };
 
 /**
@@ -110,6 +150,8 @@ inline void to_json(json& j, const ChatMessage& msg) {
     if (!msg.tool_name.empty()) j["tool_name"] = msg.tool_name;
     if (!msg.image_urls.empty()) j["image_urls"] = msg.image_urls;
     if (!msg.history_contents.empty()) j["history_contents"] = msg.history_contents;
+    if (msg.flags != MessageFlag::None) j["flags"] = static_cast<uint32_t>(msg.flags);
+    if (!msg.extra.empty()) j["extra"] = msg.extra;
 }
 
 inline void to_json(json& j, const std::vector<ChatMessage>& msgs) {
@@ -141,6 +183,12 @@ inline void from_json(const json& j, ChatMessage& msg) {
     }
     if (j.contains("history_contents") && j["history_contents"].is_array()) {
         msg.history_contents = j["history_contents"].get<std::vector<std::string>>();
+    }
+    if (j.contains("flags")) {
+        msg.flags = static_cast<MessageFlag>(j["flags"].get<uint32_t>());
+    }
+    if (j.contains("extra")) {
+        msg.extra = j["extra"];
     }
 }
 
