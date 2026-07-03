@@ -59,6 +59,7 @@ public:
     void write(const std::string& channel, const json& value);
 
     void overwrite(const std::string& channel, const json& value);
+    void overwrite(const std::string& channel, json&& value);
 
     void remove(const std::string& channel);
 

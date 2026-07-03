@@ -82,13 +82,7 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     // site. Native providers that override invoke() get one dispatch
     // path; legacy 4-virtual subclasses get the chain via the additive
     // default. See PR #40.
-    StreamCallback on_token;
-    if (in.stream_cb) {
-        on_token = [input = in, stream_cb = in.stream_cb, this](const std::string& token) {
-            onReceiveToken(*stream_cb, input, name_, token);
-        };
-    }
-    auto completion = co_await provider_->invoke(params, on_token);
+    auto completion = co_await onReceiveToken(params, in);
 
     json msg_json;
     to_json(msg_json, completion.message);
@@ -98,15 +92,21 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     co_return out;
 }
 
-void LLMCallNode::onReceiveToken(const GraphStreamCallback& callback,
-                                 neograph::graph::NodeInput in,
-                                 const std::string&         nodeName,
-                                 const std::string&         token) {
-    callback(neograph::graph::GraphEvent{
-        GraphEvent::Type::LLM_TOKEN,
-        nodeName,
-        json(token),
-    });
+asio::awaitable<ChatCompletion> LLMCallNode::onReceiveToken(CompletionParams&          params,
+                                                            neograph::graph::NodeInput in) {
+    auto                                          callback = in.stream_cb;
+    std::function<void(const std::string& chunk)> onToken;
+    if (nullptr != callback) {
+        onToken = [&in, callback, this](const std::string& token) {
+            (*callback)(neograph::graph::GraphEvent{
+                GraphEvent::Type::LLM_TOKEN,
+                name_,
+                json(token),
+            });
+        };
+    }
+    auto completion = co_await provider_->invoke(params, onToken);
+    co_return                  completion.message;
 }
 
 // =========================================================================

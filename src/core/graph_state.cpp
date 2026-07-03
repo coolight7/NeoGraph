@@ -93,6 +93,24 @@ void GraphState::overwrite(const std::string& channel, const json& value) {
     ch.version = ++global_version_;
 }
 
+void GraphState::overwrite(const std::string& channel, json&& value) {
+    std::unique_lock lock(mutex_);
+    auto             it = channels_.find(channel);
+    if (it == channels_.end()) {
+        throw std::runtime_error("Write to unknown channel: '" + channel +
+                                 "'. "
+                                 "Declared channels: " +
+                                 declared_channel_list(channels_) +
+                                 ". "
+                                 "Channel names are case-sensitive; add it to the graph "
+                                 "definition's \"channels\" block before writing. "
+                                 "See docs/troubleshooting.md \"Write to unknown channel\".");
+    }
+    auto& ch   = it->second;
+    ch.value   = std::move(value);
+    ch.version = ++global_version_;
+}
+
 void GraphState::remove(const std::string& channel) {
     std::unique_lock lock(mutex_);
     auto             it = channels_.find(channel);
