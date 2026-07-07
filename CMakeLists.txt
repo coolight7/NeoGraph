@@ -139,6 +139,7 @@ option(NEOGRAPH_BUILD_GRPC     "Build neograph::grpc (gRPC GraphEngine service â
 # `prefer_libcurl=true` opt-in becomes a runtime no-op (an error from
 # the SchemaProvider constructor if the user requests it).
 option(NEOGRAPH_USE_LIBCURL    "Build libcurl HTTP/2 backend (CurlH2Pool)" ON)
+option(NEOGRAPH_ENABLE_IO_URING "Build with io_uring for linux/asio" OFF)
 
 # ---------------------------------------------------------------------------
 # Shared-vs-static library mode
@@ -270,6 +271,11 @@ else()
     target_compile_definitions(asio INTERFACE NEOGRAPH_USE_BOOST_ASIO)
 endif()
 target_compile_definitions(asio INTERFACE BOOST_ASIO_STANDALONE ASIO_STANDALONE BOOST_ASIO_NO_DEPRECATED ASIO_NO_DEPRECATED)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NEOGRAPH_ENABLE_IO_URING)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(uring REQUIRED IMPORTED_TARGET liburing)
+    target_link_libraries(asio INTERFACE PkgConfig::uring)
+endif ()
 # Windows: target Windows 10+ so httplib compiles (it hard-errors on
 # _WIN32_WINNT < 0x0A00) and asio's newer overlapped/pipe paths light up.
 # Also scrub min/max macros from <windows.h> that clobber std::min/max.
