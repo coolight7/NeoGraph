@@ -26,7 +26,6 @@
 
 #include <neograph/api.h>
 #include <neograph/async/http_client.h>  // HttpResponse + RequestOptions
-#include <neograph/define.h>
 
 #include <asio/any_io_executor.hpp>
 #include <asio/awaitable.hpp>

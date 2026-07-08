@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include <neograph/define.h>
 #include <neograph/json.h>
 
 #include <cstdint>

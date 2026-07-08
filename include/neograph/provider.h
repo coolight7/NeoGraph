@@ -8,7 +8,6 @@
 #pragma once
 
 #include <neograph/api.h>
-#include <neograph/define.h>
 #include <neograph/types.h>
 
 #include <asio/awaitable.hpp>

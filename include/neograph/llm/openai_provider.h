@@ -8,7 +8,6 @@
 #pragma once
 
 #include <neograph/api.h>
-#include <neograph/define.h>
 #include <neograph/provider.h>
 
 #include <asio/executor_work_guard.hpp>

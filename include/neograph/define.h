@@ -1,5 +1,11 @@
 #pragma once
 
+#include <type_traits>
+
+static_assert(__cplusplus >= 201703, "Requires __cplusplus >= 201703 (C++17 or later)");
+static_assert(__cpp_lib_is_invocable >= 201703,
+              "Requires __cpp_lib_is_invocable >= 201703 (C++17 or later)");
+
 #include <asio/awaitable.hpp>
 
 #ifdef NEOGRAPH_USE_BOOST_ASIO

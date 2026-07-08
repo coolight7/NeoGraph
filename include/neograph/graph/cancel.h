@@ -31,7 +31,6 @@
 #pragma once
 
 #include <neograph/api.h>
-#include <neograph/define.h>
 
 #include <asio/any_io_executor.hpp>
 #include <asio/cancellation_signal.hpp>
