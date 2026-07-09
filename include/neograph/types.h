@@ -23,7 +23,7 @@ namespace neograph {
  * 使用位掩码保持内存紧凑且易于组合判断。
  * 这些标记不会被序列化到 OpenAI API 请求中（由 messages_to_json 过滤）。
  */
-enum class MessageFlag : uint32_t {
+enum class MessageFlag : uint64_t {
     None = 0,
     /// 由 Agent 运行时自动插入的提示/修复消息（非用户/LLM 原生产出）
     AutoInserted = 1 << 0,
@@ -34,21 +34,22 @@ enum class MessageFlag : uint32_t {
     /// 消息已被总结压缩（原始内容在 summaryContent 中）
     Summarized = 1 << 3,
     /// 消息因过期被标记为无效（如 outdated toolcall）
-    Outdated = 1 << 4,
+    Outdated  = 1 << 4,
+    Interrupt = 1 << 5,
 };
 
 inline MessageFlag operator|(MessageFlag a, MessageFlag b) {
-    return static_cast<MessageFlag>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+    return static_cast<MessageFlag>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
 }
 inline MessageFlag operator&(MessageFlag a, MessageFlag b) {
-    return static_cast<MessageFlag>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+    return static_cast<MessageFlag>(static_cast<uint64_t>(a) & static_cast<uint64_t>(b));
 }
 inline MessageFlag& operator|=(MessageFlag& a, MessageFlag b) {
     a = a | b;
     return a;
 }
 inline bool hasFlag(MessageFlag flags, MessageFlag test) {
-    return (static_cast<uint32_t>(flags & test)) != 0;
+    return (static_cast<uint64_t>(flags & test)) != 0;
 }
 
 /**
@@ -151,7 +152,7 @@ inline void to_json(json& j, const ChatMessage& msg) {
     if (!msg.tool_name.empty()) j["tool_name"] = msg.tool_name;
     if (!msg.image_urls.empty()) j["image_urls"] = msg.image_urls;
     if (!msg.history_contents.empty()) j["history_contents"] = msg.history_contents;
-    if (msg.flags != MessageFlag::None) j["flags"] = static_cast<uint32_t>(msg.flags);
+    if (msg.flags != MessageFlag::None) j["flags"] = static_cast<uint64_t>(msg.flags);
     if (!msg.extra.empty()) j["extra"] = msg.extra;
 }
 
@@ -186,7 +187,7 @@ inline void from_json(const json& j, ChatMessage& msg) {
         msg.history_contents = j["history_contents"].get<std::vector<std::string>>();
     }
     if (j.contains("flags")) {
-        msg.flags = static_cast<MessageFlag>(j["flags"].get<uint32_t>());
+        msg.flags = static_cast<MessageFlag>(j["flags"].get<uint64_t>());
     }
     if (j.contains("extra")) {
         msg.extra = j["extra"];

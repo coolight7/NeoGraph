@@ -261,7 +261,7 @@ public:
     asio::awaitable<NodeOutput> run(NodeInput in) override;
     std::string                 get_name() const override { return name_; }
 
-private:
+protected:
     std::string        name_;
     std::vector<Tool*> tools_;
 };

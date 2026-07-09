@@ -156,6 +156,8 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
                     args["thread_id"] = in.ctx.thread_id;
                 }
                 tool_msg.content = co_await execTool(*it, args);
+            } catch (const neograph::graph::NodeInterrupt& e) {
+                tool_msg.flags |= neograph::MessageFlag::Interrupt;
             } catch (const std::exception& e) {
                 tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
             }
@@ -169,10 +171,9 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
         toolcallResults.emplace_back(onExecTool(tc));
     }
     for (auto& item : toolcallResults) {
-        ChatMessage tool_msg = co_await std::move(item);
-
-        json msg_json;
-        to_json(msg_json, tool_msg);
+        auto msg = co_await std::move(item);
+        json                msg_json;
+        to_json(msg_json, msg);
         results.push_back(msg_json);
     }
 
