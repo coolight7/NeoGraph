@@ -9,6 +9,94 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **DSL 표면 (elaboration 계층) + 스키마 진화 게이트** (#75 M4).
+  - **Elaborator**: `vars`(`{"$var":...}`·`${...}` 보간, 비순환 강제) /
+    `templates`+`use`(파라미터 정확 일치 강제, 노드 prefix 리네임 —
+    로컬 참조·barrier·routes까지, 채널은 공유 상태라 전역 병합) /
+    `when` 조건부 포함. **non-Turing-complete·total**: 모든 DSL 문서는
+    유한 시간에 유일한 코어로 정규화되고, 코어 문서에 대해선 항등
+    (멱등). 모든 에러가 DSL 소스 좌표(`use[2].args`, `vars.model`)로
+    보고되고, 소스맵(출력 위치→생성 구문)이 동봉된다. 락파일 워크플로:
+    `./example_elaborate harness.dsl.json > harness.json` (example 53).
+  - **`GraphCompiler::upgrade_to_latest()`**: v0→v1 무손실 기계 변환 —
+    strict 가 거부할 키를 전부 `x-upgraded-<키>` 주석 네임스페이스로
+    격리(데이터 삭제 0), 빈 barrier 는 명시적으로 제거. 코퍼스 전체에
+    대해 "legacy 관용 컴파일 IR == 업그레이드 후 strict 컴파일 IR"
+    (canon 동치, 버전 스탬프 제외)을 테스트로 보증.
+  - **스키마 진화 게이트**: `tests/fixtures/schema_snapshot.json`
+    베이스라인 대비 add-only 부분집합 판정(JSON Subschema 계열의
+    결정가능 서브셋) — 노드타입/프로퍼티/reducer/condition 제거,
+    required 증가, closed 조건 라벨 변경, effect 계약 변경이 전부
+    테스트 실패 = CI 머지 차단. 비호환 변경은 버전 범프 + 업그레이더 +
+    스냅샷 재생성을 같은 리뷰 커밋에서 강제.
+
+- **PBT/차분 검증 하네스** (#75 M3). 300-시드 결정론적 topology 생성기
+  (스키마 봉투에서 유효 strict 문서 생성, 기능 커버리지 자가 계측 —
+  conditional_edges/barrier/interrupt 등장률 30% 미달 시 테스트 실패:
+  "생성기가 안 건드린 기능"이 소리 없는 구멍이 아니라 실패가 되게).
+  - **mutation 검출**: 드롭 5종(conditional_edges/edge/barrier/
+    interrupt/channel) + 오배선 3종(route 붕괴/edge 재타깃/노드 개명 =
+    드롭+날조 상쇄) 전부에 대해 translation validation 이 매 적용마다
+    검출됨을 300-시드 코퍼스에서 확증. 적용률 하한(시드의 10%)도 단언.
+  - **레퍼런스 인터프리터 차분**: 문서화된 super-step 의미론(goto
+    선점·barrier 누적·사전순 폴백·암묵 __end__)을 코드 비공유로 재구현한
+    독립 모델과 Scheduler 를 12-step × 300-graph 대조 (DESIL 교훈:
+    verifier 만으론 wrong-execution 을 못 잡는다).
+  - **엔진↔Studio 공유 코퍼스**: `tests/fixtures/topology_corpus/` 15종
+    (유효 3 + E3~E11 위반 12)이 NeoGraph-Studio `tests/corpus/` 와
+    byte-동일, 양측이 같은 verdict(code:severity multiset)를 단언 —
+    두 구현이 조용히 갈라질 수 없음.
+
+- **GraphValidator — 토폴로지 정적 의미 검사 (E3~E11 + effect)** (#75 M2).
+  파싱(M1)과 실행 사이의 패스 계층. strict 문서(schema_version>=1)에서
+  에러는 컴파일 실패, 경고는 stderr lint; 관용 문서는 에러급만 stderr
+  경고로 표면화(기존 그래프 무소음). 판정 철학 = 체커 건전성 우선:
+  엔진 의미론상 절대 옳을 수 없는 것만 에러(dangling 참조 E3, 신호
+  경로 없는 barrier E8 — goto 는 barrier 회계를 우회하므로 구제 불가,
+  빈 routes E10 — 디스패치가 rend() 역참조 UB, 미선언 채널 write E4 —
+  런타임 확정 throw), Command.goto/Send 가 정당화할 수 있는 것은 경고
+  (도달성 E7, 탈출 없는 사이클 E11, barrier 없는 plain fan-in E9,
+  overwrite 경쟁 E5, dead channel E6). 모든 진단은 기계가 읽을 수 있는
+  witness(반례) JSON 동반 — Studio 캔버스 하이라이트용(M3).
+  - **route 완전성(E10)**: `ConditionSpec` 라벨 계약 도입.
+    `register_condition` 3-인자 오버로드로 조건의 출력 라벨 집합을
+    선언하면, closed 조건의 라우트는 라벨과 정확히 일치해야 한다 —
+    미커버 라벨은 스케줄러의 "사전순 마지막 라우트" 폴백(순서 의존
+    임의 타깃)으로 떨어지므로 에러. 빌트인 `has_tool_calls` =
+    closed {false,true}, `route_channel` = open + known {default}.
+  - **채널 effect 계약**: `register_type` 4-인자 오버로드로 노드
+    타입의 reads/writes 채널을 선언. 그래프의 **모든** 노드 타입이
+    선언한 경우에만 E4/E5/E6 분석 가동(미지 타입 하나면 전체 스킵 —
+    커버리지보다 건전성). 빌트인 3종(llm_call/tool_dispatch/
+    intent_classifier) 선언 완료.
+  - `export_schema()` 에 `node_effects`·`condition_specs` 추가
+    (기존 `conditions` 배열은 하위호환 유지). 신규 테스트 22개.
+
+- **토폴로지 컴파일 정합성 게이트 — 소비 회계 + translation validation** (#75 M1).
+  "조용한 의미 소실" 클래스(v0.1.0–v0.1.7 `conditional_edges` 무언 드롭과
+  동형의 사고)를 구조적으로 봉쇄하는 2중 장치:
+  - **소비 회계(consumed-key accounting)**: `"schema_version": 1` 을 선언한
+    문서는 strict 컴파일로 전환 — 파서가 소비하지 않은 키(오타
+    `conditionnal_edges`, 미지원 필드, 빈 `wait_for` 로 무언 드롭될
+    barrier, inline conditional 의 무시되는 `to`)가 전부 컴파일 에러로
+    모아서 보고된다. 마킹은 파싱 블록 **안**에서 이뤄지므로 파싱 단계를
+    지우면 마크도 함께 사라져, 해당 기능을 쓰는 strict 문서가 즉시
+    실패한다 — 드롭 회귀가 조용할 수 없는 구조. `_`/`x-` 접두 키
+    (`_comment`, `x-studio-*`)는 주석 네임스페이스로 항상 허용.
+    `schema_version` 없는 기존 문서는 관용 동작 그대로 (바이트 단위 보존).
+  - **translation validation**: `CompiledGraph::to_json()` 역방출 +
+    `GraphCompiler::canon()` 정규형으로 매 컴파일마다
+    `canon(입력) == canon(재방출)` 을 검사한다. 불일치(= 컴파일러가
+    뭔가를 떨어뜨렸거나 오배선)는 strict 문서에서 throw, 관용 문서에서
+    stderr 경고. 등가 판정은 구조 비교 — 라우트 키 뒤바뀜 같은 오배선도
+    잡는다 (존재-여부 비교가 놓치는 클래스).
+  - `NodeFactory::config_schema(type)` 조회 추가, `export_schema()` 에
+    `schema_version` 필드 문서화. 신규 테스트 27개
+    (`tests/test_compiler_strict.cpp`) — v0.1.x 드롭 mutant 시뮬레이션
+    (conditional_edges/barrier/interrupt 드롭 + 라우트 오배선) 포함.
+
 ## [0.11.1] - 2026-06-25
 
 ### Changed
