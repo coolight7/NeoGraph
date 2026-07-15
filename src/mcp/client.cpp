@@ -108,10 +108,6 @@ private:
     /// value: they live in the coroutine frame, not in the caller's.
     asio::awaitable<json> do_exchange(std::string method, json params);
 
-    /// The actual exchange, running on THIS session's io_context. Parameters by
-    /// value: they live in the coroutine frame, not in the caller's.
-    asio::awaitable<json> do_exchange(std::string method, json params);
-
     std::string read_line_locked();                 ///< caller holds mtx_
     void        write_frame_locked(const json& j);  ///< caller holds mtx_
 
@@ -163,41 +159,6 @@ private:
     std::thread io_thread_;
     std::mutex  io_thread_mtx_;
 
-    /// Stop the worker and drop everything bound to io_, in that order. Called
-    /// from both platforms' destructors before the subprocess is reaped.
-    void shutdown_async_io();
-
-    // ── The session's OWN io_context ────────────────────────────────
-    //
-    // Every piece of asio state below (the pipe descriptors, the write
-    // lock, the reader coroutine) is bound to an executor on first use
-    // and reused on every later call. It used to be the CALLER's
-    // executor, and the header said so:
-    //
-    //     "All callers of one session are assumed to share one
-    //      io_context (in practice the engine's)"
-    //
-    // That was never true. `GraphEngine::run` goes through `run_sync`,
-    // which stands up an io_context for ONE call and destroys it on the
-    // way out. So the second run — or simply the client's destructor —
-    // touched asio state hanging off a destroyed io_context. Without a
-    // sanitizer, in plain C++, that is a core dump.
-    //
-    // Owning the context makes its lifetime the session's, and deletes
-    // the old precondition ("callers must ensure the io_context outlives
-    // the session") rather than restating it. No engine could have
-    // honoured it.
-    //
-    // Declared FIRST so it is destroyed LAST — after the descriptors and
-    // the lock that point into it.
-    asio::io_context                                           io_;
-    asio::executor_work_guard<asio::io_context::executor_type> io_guard_{
-        asio::make_work_guard(io_)};
-    std::thread io_thread_;
-    std::mutex  io_thread_mtx_;
-
-    /// Stop the worker and drop everything bound to io_, in that order. Called
-    /// from both platforms' destructors before the subprocess is reaped.
     void shutdown_async_io();
 
     std::mutex       mtx_;      ///< sync path serialisation
@@ -567,7 +528,7 @@ void StdioSession::shutdown_async_io() {
         return;
     }
     asio::post(io_, [this] {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         if (async_in_) async_in_->close(ec);
         if (async_out_) async_out_->close(ec);
         if (async_lock_) async_lock_->close();
@@ -1283,12 +1244,24 @@ bool MCPClient::initialize(const std::string& client_name) {
         }
     }
 
+    // Use the same path construction as rpc_call_async.
+    auto ends_with_mcp = [](const std::string& s) {
+        return s == "/mcp" || (s.size() > 4 && s.compare(s.size() - 4, 4, "/mcp") == 0);
+    };
+    std::string notify_path;
+    if (endpoint.prefix.empty() || endpoint.prefix == "/") {
+        notify_path = "/mcp";
+    } else if (ends_with_mcp(endpoint.prefix)) {
+        notify_path = endpoint.prefix;
+    } else {
+        notify_path = endpoint.prefix + "/mcp";
+    }
+
     auto notify_body = notify.dump();
     auto res         = async::run_sync([&]() -> asio::awaitable<async::HttpResponse> {
         auto ex = co_await asio::this_coro::executor;
-        co_return co_await async::async_post(ex, endpoint.host, endpoint.port,
-                                                     endpoint.prefix + "/mcp", notify_body, headers,
-                                                     endpoint.tls);
+        co_return co_await async::async_post(ex, endpoint.host, endpoint.port, notify_path,
+                                                     notify_body, headers, endpoint.tls);
     }());
 
     // 200 OK and 202 Accepted are both valid per MCP spec for
@@ -1346,11 +1319,22 @@ asio::awaitable<bool> MCPClient::initialize_async(const std::string& client_name
         }
     }
 
+    auto ends_with_mcp = [](const std::string& s) {
+        return s == "/mcp" || (s.size() > 4 && s.compare(s.size() - 4, 4, "/mcp") == 0);
+    };
+    std::string notify_path;
+    if (endpoint.prefix.empty() || endpoint.prefix == "/") {
+        notify_path = "/mcp";
+    } else if (ends_with_mcp(endpoint.prefix)) {
+        notify_path = endpoint.prefix;
+    } else {
+        notify_path = endpoint.prefix + "/mcp";
+    }
+
     auto notify_body = notify.dump();
     auto ex          = co_await asio::this_coro::executor;
-    auto               res =
-        co_await       async::async_post(ex, endpoint.host, endpoint.port, endpoint.prefix + "/mcp",
-                                         notify_body, headers, endpoint.tls);
+    auto res         = co_await async::async_post(ex, endpoint.host, endpoint.port, notify_path,
+                                                  notify_body, headers, endpoint.tls);
 
     if (res.status != 200 && res.status != 202 && res.status != 204) {
         throw std::runtime_error("MCP initialize notification returned HTTP " +
@@ -1364,8 +1348,6 @@ std::vector<std::unique_ptr<Tool>> MCPClient::get_tools() {
 }
 
 asio::awaitable<std::vector<std::unique_ptr<Tool>>> MCPClient::get_tools_async() {
-    initialize();
-
     auto result = co_await             rpc_call_async("tools/list", json::object());
     std::vector<std::unique_ptr<Tool>> tools;
 
