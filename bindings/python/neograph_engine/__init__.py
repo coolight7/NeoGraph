@@ -19,6 +19,7 @@ Example:
     >>> result = engine.run(ng.RunConfig(thread_id="demo", input={...}))
 """
 
+import json as _json
 import os as _os
 
 
@@ -60,6 +61,8 @@ _ensure_ssl_ca_bundle()
 
 
 from ._neograph import (
+    ToolDecision,
+    ToolGateContext,
     # Versioning
     __version__,
 
@@ -97,6 +100,7 @@ from ._neograph import (
     GraphEngine,
     RunConfig,
     RunResult,
+    UsageAccumulator,
     CheckpointStore,
     InMemoryCheckpointStore,
 
@@ -143,6 +147,16 @@ try:
     _HAVE_A2A = True
 except ImportError:
     _HAVE_A2A = False
+
+# MCP (Model Context Protocol) — present when the binding was built with
+# neograph::mcp, which the wheel now does (issue #95). Reachable as
+# `neograph_engine.mcp.MCPClient(...)`. get_tools() hands back C++ tools that go
+# straight into NodeContext(tools=[...]) and keep their concurrency there.
+try:
+    from ._neograph import mcp  # noqa: F401
+    _HAVE_MCP = True
+except ImportError:
+    _HAVE_MCP = False
 
 # Re-import the C++ Tool / NodeContext bindings under private names so
 # we can shadow them with Python-side wrappers below.
@@ -204,6 +218,57 @@ class Tool:
             "perform the tool's work and return a string result.")
 
 
+class AsyncTool(Tool):
+    """A tool that may run concurrently with its siblings (issue #96).
+
+    When the model asks for several tools in one turn, NeoGraph dispatches them
+    together. Whether they actually *overlap* is up to the tool:
+
+    - Subclass :class:`Tool` and yours will not. It runs to completion before
+      the next one starts, exactly as Python tools always have. An existing
+      tool that keeps state cannot suddenly find itself racing a copy of
+      itself — that guarantee is why concurrency is opt-in rather than default.
+
+    - Subclass ``AsyncTool`` and yours will. Write the same ``execute()``; the
+      binding runs it on a worker thread so it can overlap with its siblings.
+
+    ::
+
+        class Fetch(neograph_engine.AsyncTool):
+            def get_definition(self):
+                d = neograph_engine.ChatTool()
+                d.name = "fetch"
+                d.description = "Fetch a URL"
+                return d
+
+            def execute(self, arguments):
+                return requests.get(arguments["url"]).text   # releases the GIL
+
+            def get_name(self):
+                return "fetch"
+
+    **What the speedup depends on, plainly.** A Python function holds the GIL
+    while it runs. Your tool overlaps with its siblings only while it is *not*
+    holding it — that is, while it is blocked on I/O, which is when CPython
+    lets go. An HTTP call, a socket read, a database query, ``time.sleep``: all
+    release it, and all overlap.
+
+    A tool that burns CPU in Python holds the GIL for its whole body and will
+    **not** overlap, no matter how many threads it is handed. Declaring such a
+    tool ``AsyncTool`` buys nothing. (If the heavy work happens inside numpy, a
+    C extension, or a subprocess, the GIL is released there and it does
+    overlap.)
+
+    **Thread safety is now yours.** Two calls to the same AsyncTool can be in
+    flight at once — the model is free to ask for the same tool twice in one
+    turn. Keep per-call state on the stack, not on ``self``.
+
+    Concurrency is bounded by an internal worker pool (32 threads by default;
+    set ``NEOGRAPH_TOOL_THREADS`` to change it). These threads spend their time
+    blocked on I/O, so a generous pool costs little.
+    """
+
+
 class NodeContext(_CppNodeContext):
     """Engine context — provider, tools, model, instructions.
 
@@ -227,6 +292,62 @@ class NodeContext(_CppNodeContext):
         # Stash the Python tool list on the wrapper. compile() reads
         # it via py::hasattr / py::object.attr("_pytools").
         self._pytools = list(tools or [])
+
+
+class NodeInterrupt(Exception):
+    """Pause the graph from inside a node, resumably (issue #94).
+
+    Raise this when the node has decided — from what it is actually holding,
+    which is something no graph definition can know in advance — that a human
+    has to look before it goes on::
+
+        class ApprovalNode(neograph_engine.GraphNode):
+            def run(self, input):
+                answer = input.ctx.resume_value
+                if answer is None:
+                    raise neograph_engine.NodeInterrupt(
+                        {"tool": "shell", "cmd": "rm -rf build/"},
+                        reason="shell command needs approval")
+                if not answer.get("approved"):
+                    return [neograph_engine.ChannelWrite("result", "refused")]
+                ...
+
+    The engine catches it, checkpoints, and hands the caller a ``RunResult``
+    with ``interrupted=True``, ``interrupt_node`` naming this node, and
+    ``interrupt_value`` carrying ``{"reason": ..., "value": ...}``. The caller
+    answers with ``engine.resume(thread_id, {"approved": True})``, and the node
+    runs again — this time with the answer on ``input.ctx.resume_value``.
+
+    This is the dynamic counterpart to ``interrupt_before`` / ``interrupt_after``
+    in the graph definition, which pause at a node picked when the graph was
+    written.
+
+    A plain reason works too, and is what the C++ examples have always shown::
+
+        raise neograph_engine.NodeInterrupt("needs human approval")
+
+    Anything raised that is *not* a NodeInterrupt stays an error: a bug in a
+    node must fail the run loudly, not masquerade as a question for a human.
+    """
+
+    def __init__(self, value=None, reason=None):
+        # One positional argument covers both shapes. A string is the reason
+        # (the C++ one-argument constructor); anything else is the payload,
+        # and the reason falls back to its JSON form so logs and checkpoints
+        # still have something human-readable to show.
+        if isinstance(value, str) and reason is None:
+            self.reason = value
+            self.value = None
+        else:
+            self.value = value
+            if reason is not None:
+                self.reason = reason
+            elif value is None:
+                self.reason = ""
+            else:
+                self.reason = _json.dumps(value, ensure_ascii=False,
+                                          separators=(",", ":"))
+        super().__init__(self.reason)
 
 
 class GraphNode:
@@ -375,6 +496,10 @@ __all__ = [
     "CancelToken",
     "GraphState",
     "GraphNode",
+    "AsyncTool",
+    "NodeInterrupt",
+    "ToolDecision",
+    "ToolGateContext",
     "NodeFactory",
     "ReducerRegistry",
     "ConditionRegistry",
@@ -382,6 +507,7 @@ __all__ = [
     "node",
     "GraphEngine",
     "RunConfig",
+    "UsageAccumulator",
     "RunResult",
     "CheckpointStore",
     "InMemoryCheckpointStore",

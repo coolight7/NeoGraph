@@ -127,9 +127,10 @@ public:
         params.model    = model_;
         params.messages = std::move(prompt_msgs);
 
-        params.cancel_token                   = in.ctx.cancel_token;
-        auto completion                       = co_await provider_->invoke(params, nullptr);
-        auto                       plan_items = extract_plan(completion.message.content);
+        params.cancel_token = in.ctx.cancel_token;
+        auto completion     = co_await provider_->invoke(params, nullptr);
+        record_usage(in.ctx, completion);  // #88
+        auto plan_items = extract_plan(completion.message.content);
 
         json plan_json = json::array();
         for (auto& s : plan_items)
@@ -205,9 +206,10 @@ public:
             params.messages = convo;
             params.tools    = tool_defs;
 
-            params.cancel_token            = in.ctx.cancel_token;
-            auto completion                = co_await provider_->invoke(params, nullptr);
-            auto&                      msg = completion.message;
+            params.cancel_token = in.ctx.cancel_token;
+            auto completion     = co_await provider_->invoke(params, nullptr);
+            record_usage(in.ctx, completion);  // #88
+            auto& msg = completion.message;
             convo.push_back(msg);
 
             if (msg.tool_calls.empty()) {
@@ -317,6 +319,7 @@ public:
 
         params.cancel_token = in.ctx.cancel_token;
         auto completion     = co_await provider_->invoke(params, nullptr);
+        record_usage(in.ctx, completion);  // #88
 
         json asst_json;
         to_json(asst_json, completion.message);

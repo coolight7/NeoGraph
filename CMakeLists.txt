@@ -216,8 +216,25 @@ find_package(Threads REQUIRED)
 set(DEPS_DIR ${PROJECT_SOURCE_DIR}/deps)
 
 # yyjson (C, compiled) — used by all modules for JSON parse/write
+# GNUInstallDirs early: the vendored targets below need CMAKE_INSTALL_INCLUDEDIR
+# for their INSTALL_INTERFACE include paths. Including it twice is harmless.
+include(GNUInstallDirs)
+
+# Vendored deps that leak through NeoGraph's PUBLIC headers must be consumable
+# from an install tree, not just from the build tree (issue #92). asio appears in
+# 18 public headers (provider.h returns asio::awaitable), yyjson in json.h, and
+# concurrentqueue in util/request_queue.h — so a downstream project cannot even
+# *compile* against an installed NeoGraph unless these ship with it and the
+# exported targets point at the installed copies.
+#
+# They install under include/neograph/vendor/ rather than the include root, so a
+# consumer's own asio or httplib is not shadowed by ours.
+set(NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR ${CMAKE_INSTALL_INCLUDEDIR}/neograph/vendor)
+
 add_library(yyjson STATIC ${DEPS_DIR}/yyjson/yyjson.c)
-target_include_directories(yyjson PUBLIC ${DEPS_DIR}/yyjson)
+target_include_directories(yyjson PUBLIC
+    $<BUILD_INTERFACE:${DEPS_DIR}/yyjson>
+    $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
 set_target_properties(yyjson PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(NOT MSVC)
     target_compile_options(yyjson PRIVATE -O2)
@@ -225,7 +242,9 @@ endif()
 
 # cpp-httplib (header-only) — used by llm and mcp (PRIVATE)
 add_library(httplib INTERFACE)
-target_include_directories(httplib INTERFACE ${DEPS_DIR})
+target_include_directories(httplib INTERFACE
+    $<BUILD_INTERFACE:${DEPS_DIR}>
+    $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
 # Windows: httplib hard-errors unless _WIN32_WINNT >= 0x0A00 (Windows 10).
 # Set it on the INTERFACE so every TU that links httplib picks it up,
 # regardless of whether it also links asio.
@@ -247,11 +266,15 @@ endif()
 
 # moodycamel::ConcurrentQueue (header-only) — used by util (PRIVATE)
 add_library(concurrentqueue INTERFACE)
-target_include_directories(concurrentqueue INTERFACE ${DEPS_DIR})
+target_include_directories(concurrentqueue INTERFACE
+    $<BUILD_INTERFACE:${DEPS_DIR}>
+    $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
 
 # cppdotenv (header-only) — used by examples that read .env for API keys
 add_library(cppdotenv INTERFACE)
-target_include_directories(cppdotenv INTERFACE ${DEPS_DIR})
+target_include_directories(cppdotenv INTERFACE
+    $<BUILD_INTERFACE:${DEPS_DIR}>
+    $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
 
 # standalone asio (header-only) — used by the async runtime layer.
 # Vendored as `deps/asio/include/` so the public macro ASIO_STANDALONE
@@ -264,7 +287,9 @@ add_definitions(-DBOOST_ASIO_NO_DEPRECATED=1)
 add_definitions(-DASIO_NO_DEPRECATED=1)
 if ("${BOOST_ROOT}" STREQUAL "")
     message("USE deps/asio: ${DEPS_DIR}")
-    target_include_directories(asio INTERFACE ${DEPS_DIR}/asio/include/)
+    target_include_directories(asio INTERFACE
+        $<BUILD_INTERFACE:${DEPS_DIR}/asio/include>
+        $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
 else()
     message("USE BOOST/asio: ${BOOST_ROOT}")
     target_include_directories(asio INTERFACE ${BOOST_ROOT}/include/boost/ ${BOOST_ROOT}/include/)
@@ -397,6 +422,7 @@ add_library(neograph_core
     src/core/scheduler.cpp
     src/core/graph_state.cpp
     src/core/graph_node.cpp
+    src/core/tool_dispatch.cpp
     src/core/graph_loader.cpp
     src/core/graph_checkpoint.cpp
     src/core/react_graph.cpp
@@ -1033,6 +1059,151 @@ if(NEOGRAPH_BUILD_EXAMPLES)
                 examples/cookbook/self_evolving_chatbot/server_multi.cpp)
             target_link_libraries(cookbook_self_evolving_chatbot_multi PRIVATE
                 neograph::core neograph::llm cppdotenv)
+
+            # "The Beast" — a self-evolving agent that WRITES its own
+            # harness in the DSL surface, gates it through the three
+            # coherence gates (elaborate → strict compile + TV →
+            # validate), and spawns the survivor as a disposable
+            # sub-agent. The category only NeoGraph makes safe: the
+            # authored topology is data, and the DSL compiler proves it
+            # coherent before a single node runs. Offline, no provider
+            # (deterministic stub nodes).
+            add_executable(cookbook_the_beast
+                examples/cookbook/the-beast/the_beast.cpp)
+            target_link_libraries(cookbook_the_beast PRIVATE
+                neograph::core neograph::llm)
+
+            # Live variant: a real LLM (DeepSeek v4 flash via OpenRouter)
+            # authors the harness; the three gates validate it with a
+            # self-repair loop. Needs OPENROUTER_API_KEY in .env.
+            add_executable(cookbook_the_beast_live
+                examples/cookbook/the-beast/the_beast_live.cpp)
+            target_link_libraries(cookbook_the_beast_live PRIVATE
+                neograph::core neograph::llm cppdotenv)
+
+            # Apex variant: the model devours a tool catalog and authors a
+            # ReAct tool-calling agent (llm_call <-> tool_dispatch). Gated
+            # for coherence, then spawned WITH THE TOOLS BOUND — it calls
+            # tools autonomously. Needs OPENROUTER_API_KEY in .env.
+            add_executable(cookbook_the_beast_apex
+                examples/cookbook/the-beast/the_beast_apex.cpp)
+            target_link_libraries(cookbook_the_beast_apex PRIVATE
+                neograph::core neograph::llm cppdotenv)
+
+            # Script variant: the "universal cartridge". A single custom
+            # node type (script_node) runs model-written code that controls
+            # its own logic AND graph flow (goto). Contract-checked + runtime
+            # -enforced, zero core change. Needs OPENROUTER_API_KEY in .env.
+            add_executable(cookbook_the_beast_script
+                examples/cookbook/the-beast/the_beast_script.cpp)
+            target_link_libraries(cookbook_the_beast_script PRIVATE
+                neograph::core neograph::llm cppdotenv)
+
+            # Memetic evolution: REAL fitness (executes the harness) + Darwinian
+            # mutation/selection + optional Lamarckian LLM injection. Supplies
+            # the fitness layer evolution.h's gate-only evaluate() lacks.
+            add_executable(cookbook_the_beast_evolve
+                examples/cookbook/the-beast/the_beast_evolve.cpp)
+            target_link_libraries(cookbook_the_beast_evolve PRIVATE
+                neograph::core neograph::llm cppdotenv)
+
+            # Empirical soundness eval of the coherence gate: labeled topology
+            # corpus, validator verdict vs actual execution, cross-checked.
+            # Offline/deterministic — CI-gatable (answers "is the gate sound?").
+            add_executable(cookbook_the_beast_gate_eval
+                examples/cookbook/the-beast/the_beast_gate_eval.cpp)
+            target_link_libraries(cookbook_the_beast_gate_eval PRIVATE
+                neograph::core)
+
+            # Statistically-powered soundness of the coherence gate: fuzz a
+            # coherent seed with random mutators, tally the validator-vs-engine
+            # confusion matrix (precision/recall), gate on ZERO soundness
+            # violations over N mutants. Offline/deterministic — CI-gatable.
+            add_executable(cookbook_the_beast_gate_fuzz
+                examples/cookbook/the-beast/the_beast_gate_fuzz.cpp)
+            target_link_libraries(cookbook_the_beast_gate_fuzz PRIVATE
+                neograph::core)
+
+            # Darwinian vs Baldwinian vs Lamarckian memetic evolution of
+            # harness topologies (Hinton-Nowlan needle + Whitley deceptive
+            # landscape). Fitness = signature of the assembled harness when
+            # run. Offline/deterministic — CI-gatable on the robust Baldwin
+            # effect; the Baldwin-vs-Lamarck comparison is measured, not gated.
+            add_executable(cookbook_the_beast_baldwin
+                examples/cookbook/the-beast/the_beast_baldwin.cpp)
+            target_link_libraries(cookbook_the_beast_baldwin PRIVATE
+                neograph::core)
+
+            # Adversarial deceptive-gradient landscape + real hill-climb learning
+            # (stronger "memetic beats blind": blind is DECEIVED, not just at the
+            # chance floor). Reports the Baldwin-vs-Lamarck comparison honestly —
+            # the Whitley reversal does not reproduce here. Offline/deterministic.
+            add_executable(cookbook_the_beast_baldwin_adv
+                examples/cookbook/the-beast/the_beast_baldwin_adv.cpp)
+            target_link_libraries(cookbook_the_beast_baldwin_adv PRIVATE
+                neograph::core)
+
+            # The LLM as the literal learning operator: the Baldwin/Lamarck
+            # toggle = "does the model's fix become heritable?" Offline uses a
+            # deterministic oracle learner; OPENROUTER_API_KEY makes the model
+            # the learner. Prints the per-generation trace, not a gated claim.
+            add_executable(cookbook_the_beast_baldwin_llm
+                examples/cookbook/the-beast/the_beast_baldwin_llm.cpp)
+            target_link_libraries(cookbook_the_beast_baldwin_llm PRIVATE
+                neograph::core neograph::llm cppdotenv)
+
+            # Prompt in → a light-novel-length manuscript out as plain .txt. A
+            # graph over an explicit story state (outline/bible/summary channels)
+            # that cures "lost in the middle": each chapter is generated fresh
+            # against compact externalized state, not the whole prior text. The
+            # writer node self-loops via goto. Offline uses a deterministic stub;
+            # OPENROUTER_API_KEY makes the model write the prose.
+            add_executable(cookbook_the_beast_novelist
+                examples/cookbook/the-beast/the_beast_novelist.cpp)
+            target_link_libraries(cookbook_the_beast_novelist PRIVATE
+                neograph::core neograph::llm cppdotenv)
+
+            # Optional: run the model-written python under Google Sandbox2
+            # (own user/pid/mount/net namespaces + read-only FS view + CPU/
+            # wall/file rlimits). Default OFF — ON pulls sandboxed-api via
+            # FetchContent (needs libcap-dev, libunwind-dev, clang/gcc,
+            # ninja). Verified on Linux/WSL2. The clang header-generator is
+            # skipped (SAPI_CLANG_TOOL_EXECUTABLE) — only sandbox2 is needed.
+            # Google's sandboxed-api embeds poorly via FetchContent (its
+            # bundled Abseil demands a gtest/gmock target the parent must
+            # provide, a brittle cascade). It builds cleanly STANDALONE,
+            # though, so this option links against a pre-built tree instead:
+            #
+            #   git clone https://github.com/google/sandboxed-api.git /path/sapi
+            #   cmake -S /path/sapi -B /path/sapi/build -G Ninja \
+            #     -DSAPI_CLANG_TOOL_EXECUTABLE=/bin/true
+            #   ninja -C /path/sapi/build \
+            #     sandboxed_api/sandbox2/libsandbox2_sandbox2.a
+            #   cmake -S . -B build -DNEOGRAPH_BEAST_SANDBOX=ON \
+            #     -DSANDBOX2_SRC=/path/sapi
+            #
+            # Needs libcap-dev + libunwind-dev. See the cookbook README.
+            option(NEOGRAPH_BEAST_SANDBOX
+                "Isolate the_beast_script's python under a pre-built Google Sandbox2 (set SANDBOX2_SRC)" OFF)
+            if(NEOGRAPH_BEAST_SANDBOX)
+                if(NOT SANDBOX2_SRC OR NOT EXISTS "${SANDBOX2_SRC}/build")
+                    message(FATAL_ERROR "NEOGRAPH_BEAST_SANDBOX=ON requires -DSANDBOX2_SRC=<sandboxed-api clone with a built build/ dir>. See examples/cookbook/the-beast/README.md.")
+                endif()
+                file(GLOB_RECURSE _beast_sbx_libs
+                    "${SANDBOX2_SRC}/build/sandboxed_api/*.a"
+                    "${SANDBOX2_SRC}/build/_deps/absl-build/*.a"
+                    "${SANDBOX2_SRC}/build/_deps/protobuf-build/*.a")
+                target_include_directories(cookbook_the_beast_script PRIVATE
+                    "${SANDBOX2_SRC}" "${SANDBOX2_SRC}/build"
+                    "${SANDBOX2_SRC}/build/_deps/absl-src"
+                    "${SANDBOX2_SRC}/build/_deps/protobuf-src/src"
+                    "${SANDBOX2_SRC}/build/_deps/protobuf-src/third_party/utf8_range")
+                target_link_libraries(cookbook_the_beast_script PRIVATE
+                    -Wl,--start-group ${_beast_sbx_libs} -Wl,--end-group
+                    cap unwind pthread dl rt)
+                target_compile_definitions(cookbook_the_beast_script PRIVATE
+                    BEAST_SANDBOX2)
+            endif()
         endif()
 
         # JARVIS voice meta-orchestrator cookbook — 골격(skeleton) 단계.
@@ -1068,6 +1239,15 @@ if(NEOGRAPH_BUILD_EXAMPLES)
             # client only needs a process that speaks the wire protocol.
             add_executable(cookbook_minimal_mcp examples/cookbook/minimal-mcp/client_harness.cpp)
             target_link_libraries(cookbook_minimal_mcp PRIVATE neograph::core neograph::mcp)
+
+            # "The Beast" forge — discovers tools over MCP, writes (forges) the
+            # ones it lacks as a Python MCP server, re-discovers them, then
+            # authors + gates + spawns a ReAct agent using them all. Needs
+            # OPENROUTER_API_KEY in .env and python3 on PATH.
+            add_executable(cookbook_the_beast_forge
+                examples/cookbook/the-beast/the_beast_forge.cpp)
+            target_link_libraries(cookbook_the_beast_forge PRIVATE
+                neograph::core neograph::llm neograph::mcp cppdotenv)
 
             add_executable(example_mcp_multi examples/23_mcp_multi.cpp)
             target_link_libraries(example_mcp_multi PRIVATE neograph::core neograph::llm neograph::mcp cppdotenv)
@@ -1339,6 +1519,124 @@ if(NEOGRAPH_INSTALL_HEADERS)
 
     install(DIRECTORY schemas/
         DESTINATION ${CMAKE_INSTALL_DATADIR}/neograph/schemas)
+
+    # ── Vendored headers that leak through the public API (issue #92) ──
+    #
+    # Without these an installed NeoGraph does not compile downstream: 18 public
+    # headers include <asio/...>, json.h includes <yyjson.h>, and
+    # util/request_queue.h includes <concurrentqueue.h>. httplib and cppdotenv
+    # ship too — they appear in PRIVATE link interfaces, which still surface as
+    # $<LINK_ONLY:...> entries in the export set, so the export would be
+    # rejected without them.
+    install(DIRECTORY ${DEPS_DIR}/asio/include/asio
+        DESTINATION ${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR})
+    install(FILES
+            ${DEPS_DIR}/yyjson/yyjson.h
+            ${DEPS_DIR}/httplib.h
+            ${DEPS_DIR}/concurrentqueue.h
+        DESTINATION ${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR})
+    if(EXISTS ${DEPS_DIR}/cppdotenv)
+        install(DIRECTORY ${DEPS_DIR}/cppdotenv
+            DESTINATION ${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR})
+    endif()
+endif()
+
+# ── Export set: the libraries themselves, and find_package() support ────────
+#
+# Before this, `cmake --install` laid down headers and nothing to link against,
+# and there was no package config at all — so `find_package(NeoGraph)` failed
+# outright and the only way to consume the engine was to vendor its whole source
+# tree as a subdirectory. For a library whose pitch is "embed this in your app",
+# that was the most embarrassing gap on the list (issue #92).
+#
+# Exported target names match the in-tree ALIAS names (neograph::core, ...), so
+# the same target_link_libraries line works whether a project consumes NeoGraph
+# via add_subdirectory or via find_package.
+# Default OFF for wheel builds. scikit-build-core packages whatever
+# `cmake --install` lays down, so leaving this on would drop lib/*.a and
+# lib/cmake/NeoGraph/ into the wheel alongside the Python extension — the same
+# reason NEOGRAPH_INSTALL_HEADERS is turned off there. The wheel installs the
+# engine shared objects through its own rules further down.
+if(NEOGRAPH_BUILD_PYBIND)
+    set(_neograph_install_export_default OFF)
+else()
+    set(_neograph_install_export_default ON)
+endif()
+
+option(NEOGRAPH_INSTALL_EXPORT
+    "Install libraries + NeoGraphConfig.cmake for find_package (off for wheel builds)"
+    ${_neograph_install_export_default})
+
+if(NEOGRAPH_INSTALL_EXPORT)
+    set(NEOGRAPH_EXPORT_TARGETS neograph_core yyjson asio)
+    set(NEOGRAPH_COMPONENTS_BUILT core)
+
+    # Vendored INTERFACE targets referenced by any exported link interface must
+    # be in the export set, PRIVATE ones included.
+    foreach(_vendor httplib concurrentqueue cppdotenv)
+        if(TARGET ${_vendor})
+            list(APPEND NEOGRAPH_EXPORT_TARGETS ${_vendor})
+        endif()
+    endforeach()
+
+    foreach(_comp async llm mcp a2a acp util postgres sqlite)
+        if(TARGET neograph_${_comp})
+            list(APPEND NEOGRAPH_EXPORT_TARGETS neograph_${_comp})
+            list(APPEND NEOGRAPH_COMPONENTS_BUILT ${_comp})
+        endif()
+    endforeach()
+
+    # neograph_core -> neograph::core, asio -> neograph::asio, and so on.
+    foreach(_t ${NEOGRAPH_EXPORT_TARGETS})
+        string(REGEX REPLACE "^neograph_" "" _export_name ${_t})
+        set_target_properties(${_t} PROPERTIES EXPORT_NAME ${_export_name})
+    endforeach()
+
+    install(TARGETS ${NEOGRAPH_EXPORT_TARGETS}
+        EXPORT  NeoGraphTargets
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+    install(EXPORT NeoGraphTargets
+        FILE        NeoGraphTargets.cmake
+        NAMESPACE   neograph::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/NeoGraph)
+
+    # Re-find, in the consumer's configure, whatever the engine build actually
+    # linked. Writing these out per-build rather than hardcoding them is the
+    # point: an install that was built without libpq must not make its consumers
+    # hunt for PostgreSQL.
+    set(NEOGRAPH_CONFIG_DEPENDENCIES "find_dependency(Threads)")
+    if(TARGET neograph_async OR TARGET neograph_llm)
+        string(APPEND NEOGRAPH_CONFIG_DEPENDENCIES "\nfind_dependency(OpenSSL)")
+    endif()
+    if(TARGET neograph_postgres)
+        string(APPEND NEOGRAPH_CONFIG_DEPENDENCIES "\nfind_dependency(PostgreSQL)")
+    endif()
+    if(TARGET neograph_sqlite)
+        string(APPEND NEOGRAPH_CONFIG_DEPENDENCIES "\nfind_dependency(SQLite3)")
+    endif()
+    if(NEOGRAPH_USE_LIBCURL AND CURL_FOUND)
+        string(APPEND NEOGRAPH_CONFIG_DEPENDENCIES "\nfind_dependency(CURL)")
+    endif()
+
+    include(CMakePackageConfigHelpers)
+    configure_package_config_file(
+        ${PROJECT_SOURCE_DIR}/cmake/NeoGraphConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/NeoGraphConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/NeoGraph)
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/NeoGraphConfigVersion.cmake
+        VERSION       ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion)
+
+    install(FILES
+            ${CMAKE_CURRENT_BINARY_DIR}/NeoGraphConfig.cmake
+            ${CMAKE_CURRENT_BINARY_DIR}/NeoGraphConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/NeoGraph)
 endif()
 
 # ── Pybind11 wheel install ───────────────────────────────────────────────
@@ -1375,6 +1673,16 @@ if(NEOGRAPH_BUILD_PYBIND)
     # library libneograph_sqlite.* could not be located" during repair.
     if(TARGET neograph_sqlite)
         list(APPEND NEOGRAPH_PYBIND_LIBS neograph_sqlite)
+    endif()
+    # neograph_mcp ships when MCP is built — which, since #95, the wheel does.
+    # bindings/python/src/bind_mcp.cpp links against it, so the wheel must carry
+    # libneograph_mcp.{so,dylib,dll} next to the binding. Miss this and the
+    # wheel builds fine and then dies in repair on all four platforms with
+    # "Cannot repair wheel, because required library libneograph_mcp.so could
+    # not be located" — which is exactly what flipping NEOGRAPH_BUILD_MCP=ON in
+    # pyproject.toml without touching this list did.
+    if(TARGET neograph_mcp)
+        list(APPEND NEOGRAPH_PYBIND_LIBS neograph_mcp)
     endif()
     # neograph_a2a ships when A2A is built. Same reasoning as above:
     # bindings/python/src/bind_a2a.cpp links against it (added in

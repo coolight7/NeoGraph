@@ -253,7 +253,6 @@ public:
      */
     ToolDispatchNode(const std::string& name, const NodeContext& ctx);
 
-    virtual asio::awaitable<std::string> execTool(neograph::Tool* tool, neograph::json& args) const;
     /// v0.4 PR 9a: unified ``run`` — finds the latest assistant
     /// message with tool_calls, dispatches each call to the matching
     /// Tool, writes tool result messages back to the ``messages``

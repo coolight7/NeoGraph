@@ -52,7 +52,15 @@ void init_state(py::module_& m) {
             py::arg("tools") = std::vector<std::shared_ptr<neograph::Tool>>{},
             py::arg("model") = "",
             py::arg("instructions") = "",
-            py::arg("extra_config") = py::dict())
+            py::arg("extra_config") = py::dict(),
+            // #98: keep the Python provider alive for as long as this
+            // NodeContext. The C++ side holds a shared_ptr<Provider>, which
+            // keeps the *C++* trampoline object alive — but the Python instance
+            // carrying the overrides is a separate refcount, and when it dies
+            // the trampoline can no longer find `complete`, falls through to
+            // Provider::complete, which bridges to complete_async, which bridges
+            // back to complete: infinite recursion, stack overflow, SIGSEGV.
+            py::keep_alive<1, 2>())
         .def_readwrite("provider", &NodeContext::provider)
         .def_readwrite("model", &NodeContext::model)
         .def_readwrite("instructions", &NodeContext::instructions)
@@ -61,20 +69,37 @@ void init_state(py::module_& m) {
             [](NodeContext& c, py::object v) { c.extra_config = py_to_json(v); });
 
     // ── ChannelWrite ─────────────────────────────────────────────────────
-    py::class_<ChannelWrite>(m, "ChannelWrite",
-        "A write to a named state channel.")
-        .def(py::init([](const std::string& channel, py::object value) {
+    py::class_<ChannelWrite> channel_write(m, "ChannelWrite",
+        "A write to a named state channel.");
+
+    py::enum_<ChannelWrite::Mode>(channel_write, "Mode",
+        "What a write means for the channel's current value.")
+        .value("REDUCE", ChannelWrite::Mode::Reduce,
+               "Feed the value through the channel's reducer. The default.")
+        .value("OVERWRITE", ChannelWrite::Mode::Overwrite,
+               "Replace the channel's value outright, ignoring the reducer — "
+               "the only way to shrink an accumulating channel such as messages.")
+        .export_values();
+
+    channel_write
+        .def(py::init([](const std::string& channel, py::object value,
+                         ChannelWrite::Mode mode) {
             ChannelWrite w;
             w.channel = channel;
             w.value = py_to_json(value);
+            w.mode = mode;
             return w;
-        }), py::arg("channel"), py::arg("value"))
+        }), py::arg("channel"), py::arg("value"),
+            py::arg("mode") = ChannelWrite::Mode::Reduce)
         .def_readwrite("channel", &ChannelWrite::channel)
+        .def_readwrite("mode", &ChannelWrite::mode)
         .def_property("value",
             [](const ChannelWrite& w) { return json_to_py(w.value); },
             [](ChannelWrite& w, py::object v) { w.value = py_to_json(v); })
         .def("__repr__", [](const ChannelWrite& w) {
-            return "<ChannelWrite channel=" + w.channel + ">";
+            return "<ChannelWrite channel=" + w.channel +
+                   (w.mode == ChannelWrite::Mode::Overwrite ? " mode=OVERWRITE" : "") +
+                   ">";
         });
 
     // ── Send (dynamic fan-out) ───────────────────────────────────────────

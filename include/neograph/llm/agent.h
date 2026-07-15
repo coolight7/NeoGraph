@@ -11,6 +11,7 @@
 #include <neograph/api.h>
 #include <neograph/provider.h>
 #include <neograph/tool.h>
+#include <neograph/tool_dispatch.h>   // ToolGate (issue #89)
 #include <functional>
 #include <memory>
 #include <string>
@@ -94,6 +95,34 @@ class NEOGRAPH_API Agent {
      */
     ChatCompletion complete(const std::vector<ChatMessage>& messages);
 
+    /**
+     * @brief Token usage accumulated across every call this agent has made (#88).
+     *
+     * The graph path reports usage through ``RunResult::usage``. Agent is not a
+     * graph run and has no ``RunContext``, so it keeps its own running total —
+     * otherwise token accounting would exist on one of the two ways to drive an
+     * LLM and not the other, which is precisely the split that #87 was about.
+     *
+     * Cumulative over the agent's lifetime, not per ``run()``: an agent loop
+     * makes several LLM calls per run and the interesting number is what the
+     * whole conversation cost.
+     */
+    ChatCompletion::Usage usage() const { return usage_->snapshot(); }
+
+    /**
+     * @brief Intercept every tool call before it runs (issue #89).
+     *
+     * The same gate the graph path takes from ``RunConfig::tool_gate``. Both
+     * route through one dispatcher (issue #87), which is what stops a
+     * capability like this from landing in one path and silently missing the
+     * other — as concurrency once did.
+     *
+     * An ``Interrupt`` verdict throws ``graph::NodeInterrupt`` out of
+     * ``run()``: the Agent is standalone and has no checkpoint machinery to
+     * pause into. Callers wanting pause-and-resume want the graph path.
+     */
+    void set_tool_gate(ToolGate gate) { tool_gate_ = std::move(gate); }
+
   private:
     std::shared_ptr<Provider> provider_;
     std::vector<std::unique_ptr<Tool>> tools_;
@@ -105,8 +134,18 @@ class NEOGRAPH_API Agent {
     std::string instructions_;
     std::string model_;
 
+    /// #88 — Agent's own token accounting; see usage().
+    std::shared_ptr<UsageAccumulator> usage_ = std::make_shared<UsageAccumulator>();
+
+    /// #89 — tool interception; empty means every call runs.
+    ToolGate tool_gate_;
+
     void ensure_system_message(std::vector<ChatMessage>& messages);
     std::vector<ChatTool> get_tool_definitions() const;
+
+    /// Non-owning view of `tools_` for `dispatch_tool_calls`, the one place
+    /// tool execution is implemented (shared with graph::ToolDispatchNode).
+    std::vector<Tool*> tool_ptrs() const;
 };
 
 } // namespace neograph::llm

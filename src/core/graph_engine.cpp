@@ -519,9 +519,19 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
     // separately. See ROADMAP_v1.md "Execution plan" → PR 1.
     RunContext ctx;
     ctx.cancel_token = config.cancel_token;
-    ctx.thread_id    = config.thread_id;
-    ctx.stream_mode  = stream_mode;
-    ctx.store        = store_;  // issue #27 — node bodies reach Store via in.ctx.store
+    // #88: the caller may hand us an accumulator (to total across several runs);
+    // otherwise this run gets a fresh one. Either way ctx.usage is non-null, so
+    // node bodies never have to check.
+    ctx.usage       = config.usage ? config.usage : std::make_shared<UsageAccumulator>();
+    ctx.thread_id   = config.thread_id;
+    ctx.stream_mode = stream_mode;
+    ctx.store       = store_;  // issue #27 — node bodies reach Store via in.ctx.store
+    // issue #94 — the human's answer, readable by any node. Left empty on a
+    // fresh run, which is how a node distinguishes "nobody has answered yet"
+    // from "the answer was no". Only engaged on an actual resume, so the
+    // common path pays no json allocation.
+    if (!resume_value.is_null()) ctx.resume_value = resume_value;
+    ctx.tool_gate = tool_gate_;  // issue #89 — engine-level, so resume() keeps it
     // ctx.deadline / ctx.trace_id stay default-constructed for now —
     // RunConfig has no source field for either. Future PRs add them.
 
@@ -540,7 +550,15 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
             replay_results     = std::move(ctx.replay_results);
             barrier_state      = std::move(ctx.barrier_state);
 
-            if (!resume_value.is_null()) {
+            // Chat-shaped graphs have always received the resume value as a
+            // user turn on the "messages" channel, and still do. But a graph
+            // without that channel used to *throw* here ("Write to unknown
+            // channel: 'messages'"), which made resume-with-a-value unusable
+            // for anything that isn't a chat — including the approval prompt
+            // dynamic interrupts exist for. Every node now reads the answer
+            // from ``ctx.resume_value`` regardless; this write stays for the
+            // graphs that were relying on it (issue #94).
+            if (!resume_value.is_null() && state.has_channel("messages")) {
                 // Build the resume message outside the brace-init that
                 // would otherwise nest inside the coroutine body. Same
                 // GCC 13 ICE shape; same workaround.
@@ -611,6 +629,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
                         barrier_state);
 
                     RunResult result;
+                    result.usage          = ctx.usage->snapshot();  // #88
                     result.output         = state.serialize();
                     result.interrupted    = true;
                     result.interrupt_node = node_name;
@@ -637,8 +656,11 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
 
         // Capture NodeInterrupt outside the catch (GCC-13-safe) so the
         // checkpoint lookup that follows can do its own work.
-        bool        interrupted = false;
-        std::string interrupt_reason;
+        // One empty optional, not a bool + two strings + a json: this runs on
+        // every super-step of every run, and a default-constructed `json`
+        // allocates a yyjson document. An empty optional allocates nothing,
+        // and the NodeInterrupt inside it is only ever built on the cold path.
+        std::optional<NodeInterrupt> interrupt;
 
         try {
             if (ready.size() == 1) {
@@ -655,18 +677,26 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
                     trace, cb, stream_mode, ctx);
             }
         } catch (const NodeInterrupt& ni) {
-            interrupted      = true;
-            interrupt_reason = ni.reason();
+            interrupt = ni;
         }
 
-        if (interrupted) {
+        if (interrupt) {
             RunResult result;
-            result.output         = state.serialize();
-            result.interrupted    = true;
-            result.interrupt_node = interrupt_reason;
+            result.usage       = ctx.usage->snapshot();  // #88
+            result.output      = state.serialize();
+            result.interrupted = true;
+            // issue #94: the node that paused — not its reason. The executor
+            // stamps ni.node(); the fallback covers a NodeInterrupt that
+            // reached here without passing through it, which would otherwise
+            // leave the caller with an empty string.
+            result.interrupt_node =
+                interrupt->node().empty() ? interrupt->reason() : interrupt->node();
             json iv;
-            iv["reason"]           = interrupt_reason;
-            iv["type"]             = "NodeInterrupt";
+            iv["reason"] = interrupt->reason();
+            iv["type"]   = "NodeInterrupt";
+            // Absent — not null — when the node attached no payload, so
+            // `contains("value")` answers "did the node hand me something".
+            if (!interrupt->value().is_null()) iv["value"] = interrupt->value();
             result.interrupt_value = iv;
             result.execution_trace = std::move(trace);
 
@@ -727,6 +757,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
                     barrier_state);
 
                 RunResult result;
+                result.usage          = ctx.usage->snapshot();  // #88
                 result.output         = state.serialize();
                 result.interrupted    = true;
                 result.interrupt_node = node_name;
@@ -810,6 +841,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
     }
 
     RunResult result;
+    result.usage           = ctx.usage->snapshot();  // #88
     result.output          = state.serialize();
     result.execution_trace = std::move(trace);
     if (!last_checkpoint_id.empty()) {

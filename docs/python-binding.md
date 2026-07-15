@@ -78,7 +78,7 @@ result = engine.run(ng.RunConfig(thread_id="t1",
 | `output` | `dict` | Final state — `{"channels": {...}, "global_version": int}`. Use `output["channels"][name]["value"]` to read a channel. |
 | `interrupted` | `bool` | `True` if the run paused at an `interrupt_before` / `interrupt_after` / `NodeInterrupt`. |
 | `interrupt_node` | `str` | Name of the node that triggered the interrupt (when `interrupted`). |
-| `interrupt_value` | `dict` | Diagnostic payload — `{"reason": ...}` or `{"message": ...}`. |
+| `interrupt_value` | `dict` | `{"reason": str, "type": "NodeInterrupt", "value": ...}` for a dynamic interrupt (`"value"` present only when the node attached a payload), or `{"message": ...}` for a static `interrupt_before` / `interrupt_after`. |
 | `checkpoint_id` | `str` | ID of the latest checkpoint saved during the run. Pass to `engine.resume_async(checkpoint_id=...)` to continue. |
 | `execution_trace` | `list[str]` | Node names in the order they executed — useful for debugging routing. |
 
@@ -91,6 +91,204 @@ result = engine.run(ng.RunConfig(thread_id="t1",
 | `max_steps` | 25 | Super-step ceiling; ReAct loops typically need 10+. |
 | `stream_mode` | `StreamMode.OFF` | Bitmask: `EVENTS \| TOKENS \| DEBUG \| VALUES \| UPDATES \| ALL`. Only consulted by `run_stream` / `run_stream_async`. |
 | `resume_if_exists` | `False` | When `True` and a checkpoint store is configured, the run loads the latest checkpoint for `thread_id` (if any) and applies `input` on top via the channel reducers — multi-turn chat without manually threading prior state through `input`. Default keeps fresh-start semantics for back-compat; for HITL resume from an interrupted run, use `engine.resume_async()` instead. |
+
+## Pausing for a human, from a Python node
+
+`interrupt_before` in the graph definition pauses at a node you picked when you
+wrote the graph. That cannot express the case human-in-the-loop actually exists
+for, because whether a step is dangerous depends on what the model just asked
+for:
+
+> *"The agent wants to run `rm -rf build/`. Allow?"*
+
+For that, the node itself decides — it raises `NodeInterrupt`, attaching what
+needs approving. The engine checkpoints and hands you back a normal `RunResult`
+(nothing is raised at you), and your answer travels back to the node that asked:
+
+```python
+import neograph_engine as ng
+
+class ApprovalNode(ng.GraphNode):
+    def run(self, input):
+        # The human's answer. None until someone has actually answered — which
+        # is how you tell "nobody has looked yet" from "the answer was no".
+        verdict = input.ctx.resume_value
+
+        if verdict is None:
+            raise ng.NodeInterrupt(
+                {"tool": "shell", "cmd": "rm -rf build/"},
+                reason="shell command needs approval")
+
+        if not verdict.get("approved"):
+            return [ng.ChannelWrite("result", "refused")]
+        return [ng.ChannelWrite("result", "done")]
+
+    def get_name(self):
+        return "risky"
+```
+
+```python
+result = engine.run(cfg)
+
+if result.interrupted:
+    print(result.interrupt_node)               # "risky"      — which node paused
+    print(result.interrupt_value["reason"])    # for a human to read
+    print(result.interrupt_value["value"])     # for your code to branch on
+
+    result = engine.resume(cfg.thread_id, {"approved": True})   # the answer
+```
+
+`NodeInterrupt(reason)` with a plain string works too, and omits the `"value"`
+key. Anything else you raise stays an error: a bug in a node fails the run
+loudly rather than looking like a question for a human.
+
+Requires a checkpoint store — there is nothing to resume from otherwise.
+
+## MCP — using a remote tool server
+
+```python
+client = ng.mcp.MCPClient("http://localhost:8931")     # or ["python", "server.py"]
+client.initialize()
+
+engine = ng.GraphEngine.compile(
+    definition, ng.NodeContext(tools=client.get_tools()))
+```
+
+That is the whole integration. `get_tools()` returns the server's catalogue as
+tools the graph can dispatch, and you can mix them freely with your own Python
+tools in the same `NodeContext`.
+
+`client.call_tool(name, args)` calls one directly, outside any graph.
+
+**They overlap — over HTTP.** MCP tools are network round-trips, which is the
+case where concurrent dispatch pays, and `MCPTool` is a real C++ `AsyncTool`. But
+the two transports are not the same, and it is worth knowing which one you have:
+
+| transport | 3 calls × 0.4 s |
+|---|---|
+| HTTP | **0.41 s** — each call is its own request |
+| stdio | 1.2 s — one subprocess, one pipe; the client takes a capacity-1 lock, so calls queue |
+
+That stdio number is not a NeoGraph limitation to be optimised away; it is what
+a single pipe means. If you need MCP calls to overlap, use an HTTP server.
+
+The stdio subprocess is terminated when the last reference to the session is
+dropped — the client, or any tool it produced.
+
+Runnable, offline (it starts its own MCP server): [`examples/26_mcp_tools.py`](../bindings/python/examples/26_mcp_tools.py).
+
+## Making tools run concurrently
+
+When the model asks for several tools in one turn, NeoGraph dispatches them
+together. Whether they actually *overlap* is the tool's choice:
+
+```python
+class Fetch(ng.AsyncTool):          # ng.Tool -> serial;  ng.AsyncTool -> overlaps
+    def execute(self, arguments):
+        return requests.get(arguments["url"]).text
+    ...
+```
+
+Measured, twenty tools that each wait 300 ms:
+
+| tool base class | wall clock |
+|---|---|
+| `ng.Tool` | 6.0 s |
+| `ng.AsyncTool` | **0.30 s** (19.9×) |
+
+**Why it is opt-in.** A sync `Tool` runs to completion before the next one
+starts — so an existing tool that keeps state cannot suddenly find itself
+racing a copy of itself. Concurrency is something you declare, not something
+that happens to you. The flip side: two calls to the same `AsyncTool` can be in
+flight at once (the model may ask for it twice in one turn), so keep per-call
+state on the stack, not on `self`.
+
+**The boundary, stated plainly.** A Python function holds the GIL while it runs.
+Your tool overlaps with its siblings only while it is *not* holding it — which
+is while it is blocked on I/O, because that is when CPython lets go. An HTTP
+call, a socket read, a database query, `time.sleep`: all release it, all overlap.
+
+A tool that burns CPU **in Python** holds the GIL for its whole body and will
+not overlap, however many threads it is handed:
+
+| 3 CPU-bound `AsyncTool`s | 3.1× the time of one |
+|---|---|
+
+Declaring such a tool `AsyncTool` buys nothing. (If the heavy work happens
+inside numpy, a C extension, or a subprocess, the GIL is released there and it
+does overlap.) This is pinned by a test, so the claim cannot quietly drift.
+
+Concurrency is bounded by an internal worker pool — 32 threads by default, or
+`NEOGRAPH_TOOL_THREADS`. They spend their time blocked on I/O, so a generous
+pool costs little.
+
+Runnable, offline: [`examples/25_async_tools.py`](../bindings/python/examples/25_async_tools.py).
+
+## Gating tool calls — "the agent wants to run `rm -rf build/`. Allow?"
+
+There is one hook between *the model asked for tool X* and *tool X runs*, and it
+returns one of three verdicts:
+
+```python
+def gate(call, gctx):
+    if call.name not in DANGEROUS:
+        return ng.ToolDecision.allow()
+
+    # None until a human has actually answered — which is how the gate tells
+    # "nobody has been asked yet" from "the answer was no", and so avoids
+    # asking the same question forever.
+    if gctx.resume_value is None:
+        return ng.ToolDecision.interrupt(
+            f"{call.name} needs approval",
+            {"tool": call.name, "arguments": call.arguments})
+
+    if gctx.resume_value.get("approved"):
+        return ng.ToolDecision.allow()
+    return ng.ToolDecision.deny("the operator refused this command")
+
+engine.set_tool_gate(gate)
+```
+
+```python
+result = engine.run(cfg)
+if result.interrupted:
+    print(result.interrupt_value["reason"])   # "shell needs approval"
+    print(result.interrupt_value["value"])    # {"tool": ..., "arguments": ...}
+    result = engine.resume(cfg.thread_id, {"approved": True})
+```
+
+| Verdict | Effect |
+|---|---|
+| `ToolDecision.allow()` | Run it. |
+| `ToolDecision.allow({...})` | Run it with these arguments instead — this is where ambient values (tenant, thread, credentials) get injected, rather than every tool knowing about them. |
+| `ToolDecision.deny(reason)` | Do not run it. The reason goes back to the model as the tool's result, so it can adapt instead of asking for the same tool again next turn. |
+| `ToolDecision.interrupt(reason, payload)` | Do not run it, and pause the whole run. The payload surfaces at `RunResult.interrupt_value["value"]`. |
+
+Permission, audit, argument rewriting and the per-call interrupt are not four
+features; they are one primitive wearing four hats.
+
+**The gate sees every call before any tool runs, and that ordering is the
+design.** Suppose the model asks for `list_files` and `shell` together, and only
+`shell` needs approval. When the run pauses, `list_files` has **not** run either
+— even though the gate allowed it.
+
+That is not an oversight. `resume()` re-enters the node from the top, because a
+node that interrupted recorded no writes. Had `list_files` already run, the
+approval would run it a *second* time — swap it for `git commit` and the prompt
+for `rm -rf` has just double-committed. And if the human says **no**, anything
+already executed cannot be undone. A permission system in which "denied" does
+not mean "nothing happened" is not a permission system.
+
+Two practical notes:
+
+- **A checkpoint store is required.** An interrupt has to be resumable; without
+  a store there is nothing to resume from.
+- **The gate lives on the engine, not on `RunConfig`.** `resume()` builds its own
+  `RunConfig` internally, so a per-run gate would vanish the moment a human
+  answered the very prompt it raised — and the dangerous tool would then run
+  unchecked. Set it once on the engine and it holds for every run and resume.
+
+Runnable end to end, no API key: [`examples/24_tool_approval_gate.py`](../bindings/python/examples/24_tool_approval_gate.py).
 
 ## Built-in reducers
 
@@ -116,7 +314,7 @@ where `fn(state) -> str` returns one of the route keys.
 
 ## What's covered by the binding
 
-- **Engine surface** — `GraphEngine.compile / run / run_stream / run_async / run_stream_async / resume_async / get_state / update_state / fork`, `RunConfig`, `RunResult`, `set_worker_count`, `set_checkpoint_store`, `set_node_cache_enabled`.
+- **Engine surface** — `GraphEngine.compile / run / run_stream / run_async / run_stream_async / resume / resume_async / get_state / update_state / fork`, `RunConfig`, `RunResult`, `set_worker_count`, `set_checkpoint_store`, `set_node_cache_enabled`.
 - **Custom Python nodes** — subclass `neograph_engine.GraphNode`, register via `NodeFactory.register_type` or the `@neograph_engine.node` decorator. Engine dispatches under proper GIL handling, including from fan-out worker threads.
 - **Custom Python tools** — subclass `neograph_engine.Tool`, pass into `NodeContext(tools=[...])`. Engine takes ownership at compile time.
 - **Async** — every `*_async` binding returns an `asyncio.Future` bound to the calling thread's running loop. Stream callbacks are hopped to the loop thread via `loop.call_soon_threadsafe` so callbacks run where asyncio expects.

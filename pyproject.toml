@@ -128,7 +128,10 @@ cmake.args = [
     "-DBUILD_SHARED_LIBS=ON",
     "-DNEOGRAPH_BUILD_PYBIND=ON",
     "-DNEOGRAPH_BUILD_LLM=ON",
-    "-DNEOGRAPH_BUILD_MCP=OFF",
+    # ON since #95: the Python MCP binding is useless if `pip install`
+    # ships a wheel that compiled it out. Marginal size cost is small —
+    # the client links httplib + OpenSSL, which neograph::llm already pulls in.
+    "-DNEOGRAPH_BUILD_MCP=ON",
     # NEOGRAPH_BUILD_POSTGRES default ON (CMakeLists.txt:19). Each platform's
     # before-all installs libpq dev headers; auditwheel/delocate/delvewheel
     # bundle libpq.{so,dylib,dll} + its transitive deps into the wheel so
@@ -141,6 +144,11 @@ cmake.args = [
     # Skip the include/ + share/ install rules so they don't end up
     # in the wheel layout.
     "-DNEOGRAPH_INSTALL_HEADERS=OFF",
+    # Same reasoning for the C++ find_package export: lib/*.{a,so} plus
+    # lib/cmake/NeoGraph/ have no business in a Python wheel. CMakeLists
+    # already defaults this OFF when NEOGRAPH_BUILD_PYBIND is on; stating it
+    # here keeps the wheel's layout independent of that default.
+    "-DNEOGRAPH_INSTALL_EXPORT=OFF",
 ]
 
 # Headers + schemas would otherwise land in the wheel under

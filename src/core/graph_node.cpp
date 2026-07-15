@@ -1,6 +1,7 @@
 #include <neograph/async/run_sync.h>
 #include <neograph/graph/engine.h>
 #include <neograph/graph/node.h>
+#include <neograph/tool_dispatch.h>
 
 #include <asio/co_spawn.hpp>
 #include <asio/deferred.hpp>
@@ -40,7 +41,19 @@ LLMCallNode::LLMCallNode(const std::string& name, const NodeContext& ctx)
 CompletionParams LLMCallNode::build_params(const GraphState& state) const {
     auto messages = state.get_messages();
 
-    // Ensure system message (mirrors Agent::ensure_system_message)
+    // Ensure exactly one system message, carrying `instructions_` (issue #93).
+    //
+    // The contract: when a node is configured with instructions, the model sees
+    // those instructions as its single system prompt. State that already holds a
+    // system message — seeded by the caller, or restored from a checkpoint
+    // written when instructions_ was different — is replaced, not stacked on top
+    // of. Two system messages is malformed for a single-system-prompt API such
+    // as Anthropic's, and undefined for the OpenAI family.
+    //
+    // Replacing (rather than deferring to the state's message) is also what the
+    // previous code effectively did: it inserted instructions_ at position 0,
+    // ahead of any existing system message, so instructions already won on
+    // precedence. Only the duplicate goes away.
     if (!instructions_.empty()) {
         // [@coolight] 当存在 system 消息时不再添加
         bool has_system = !messages.empty() && messages[0].role == "system";
@@ -82,7 +95,16 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     // site. Native providers that override invoke() get one dispatch
     // path; legacy 4-virtual subclasses get the chain via the additive
     // default. See PR #40.
-    auto completion = co_await onReceiveToken(params, in);
+    StreamCallback on_token;
+    if (in.stream_cb) {
+        const GraphStreamCallback& cb        = *in.stream_cb;
+        std::string                node_name = name_;
+        on_token                             = [&cb, node_name](const std::string& token) {
+            cb(GraphEvent{GraphEvent::Type::LLM_TOKEN, node_name, json(token)});
+        };
+    }
+    auto completion = co_await provider_->invoke(params, on_token);
+    record_usage(in.ctx, completion);  // #88
 
     json msg_json;
     to_json(msg_json, completion.message);
@@ -116,11 +138,6 @@ asio::awaitable<ChatCompletion> LLMCallNode::onReceiveToken(CompletionParams&   
 ToolDispatchNode::ToolDispatchNode(const std::string& name, const NodeContext& ctx)
     : name_(name), tools_(ctx.tools) {}
 
-asio::awaitable<std::string> ToolDispatchNode::execTool(neograph::Tool* tool,
-                                                        neograph::json& args) const {
-    co_return co_await tool->real_execute_async(args);
-}
-
 asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     auto messages = in.state.get_messages();
     if (messages.empty()) co_return NodeOutput{};
@@ -135,46 +152,25 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     }
     if (!assistant_msg) co_return NodeOutput{};
 
-    // Execute each tool call (mirrors agent.cpp:80-104)
+    // Tool execution lives in exactly one place (issue #87): both this node and
+    // llm::Agent route through dispatch_tool_calls(). When the two had separate
+    // copies they drifted — this one fanned the calls out, the agent ran them
+    // one at a time — and every future capability at this boundary would have
+    // drifted the same way.
+    // The gate (issue #89) rides along on the RunContext, so it reaches both
+    // dispatch paths through the one function they share.
+    ToolGateContext gctx;
+    gctx.resume_value = in.ctx.resume_value;
+    gctx.thread_id    = in.ctx.thread_id;
+    gctx.step         = in.ctx.step;
+    auto tool_msgs    = co_await dispatch_tool_calls(assistant_msg->tool_calls, tools_,
+                                                     in.ctx.tool_gate, std::move(gctx));
+
     json results = json::array();
-
-    auto onExecTool = [&](const neograph::ToolCall& tc) -> asio::awaitable<ChatMessage> {
-        ChatMessage tool_msg;
-        tool_msg.role         = "tool";
-        tool_msg.tool_call_id = tc.id;
-        tool_msg.tool_name    = tc.name;
-
-        auto it = std::find_if(tools_.begin(), tools_.end(),
-                               [&](Tool* t) { return t->get_name() == tc.name; });
-        if (it == tools_.end()) {
-            tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
-        } else {
-            try {
-                auto args = json::parse(tc.arguments);
-                if (args.is_object() && args["thread_id"].is_null()) {
-                    // append arg `thread_id`
-                    args["thread_id"] = in.ctx.thread_id;
-                }
-                tool_msg.content = co_await execTool(*it, args);
-            } catch (const neograph::graph::NodeInterrupt& e) {
-                tool_msg.flags |= neograph::MessageFlag::Interrupt;
-            } catch (const std::exception& e) {
-                tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
-            }
-        }
-        co_return tool_msg;
-    };
-
-    /// 并发执行 toolcall
-    std::vector<asio::awaitable<ChatMessage>> toolcallResults{};
-    for (const auto& tc : assistant_msg->tool_calls) {
-        toolcallResults.emplace_back(onExecTool(tc));
-    }
-    for (auto& item : toolcallResults) {
-        auto msg = co_await std::move(item);
-        json                msg_json;
-        to_json(msg_json, msg);
-        results.push_back(msg_json);
+    for (const auto& m : tool_msgs) {
+        json mj;
+        to_json(mj, m);
+        results.push_back(mj);
     }
 
     NodeOutput out;
@@ -261,8 +257,9 @@ asio::awaitable<NodeOutput> IntentClassifierNode::run(NodeInput in) {
             cb(GraphEvent{GraphEvent::Type::LLM_TOKEN, node_name, json(token)});
         };
     }
-    auto completion                  = co_await provider_->invoke(params, on_token);
-    ChatMessage                reply = std::move(completion.message);
+    auto completion = co_await provider_->invoke(params, on_token);
+    record_usage(in.ctx, completion);  // #88 — routing costs tokens too
+    ChatMessage reply = std::move(completion.message);
 
     NodeOutput out;
     out.writes = route_from(reply.content);
@@ -327,6 +324,10 @@ asio::awaitable<NodeOutput> SubgraphNode::run(NodeInput in) {
     RunConfig config;
     config.input        = build_subgraph_input(in.state);
     config.cancel_token = in.ctx.cancel_token;
+    // #88: hand the parent's accumulator down. A subgraph runs on its own engine
+    // with its own RunConfig, so without this a graph that delegates its LLM work
+    // to a subgraph reports zero tokens — which reads as "this run was free".
+    config.usage = in.ctx.usage;
 
     json subgraph_output;
     if (in.stream_cb) {

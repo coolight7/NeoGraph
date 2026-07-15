@@ -1,11 +1,20 @@
 #include <neograph/async/run_sync.h>
 #include <neograph/llm/agent.h>
+#include <neograph/tool_dispatch.h>
 
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
 namespace neograph::llm {
+
+std::vector<Tool*> Agent::tool_ptrs() const {
+    std::vector<Tool*> ptrs;
+    ptrs.reserve(tools_.size());
+    for (const auto& t : tools_)
+        ptrs.push_back(t.get());
+    return ptrs;
+}
 
 Agent::Agent(std::shared_ptr<Provider>          provider,
              std::vector<std::unique_ptr<Tool>> tools,
@@ -57,7 +66,9 @@ ChatCompletion Agent::complete(const std::vector<ChatMessage>& messages) {
     // Candidate 6 PR3: dispatch via invoke() so the v1.0 single-
     // dispatch surface is end-to-end. run_sync drives the awaitable
     // synchronously (Agent::complete is the public sync API).
-    return neograph::async::run_sync(provider_->invoke(params, nullptr));
+    auto completion = neograph::async::run_sync(provider_->invoke(params, nullptr));
+    usage_->add(completion.usage);  // #88
+    return completion;
 }
 
 std::string Agent::run(std::vector<ChatMessage>& messages, int max_iterations) {
@@ -70,8 +81,9 @@ std::string Agent::run(std::vector<ChatMessage>& messages, int max_iterations) {
         params.messages = messages;
         params.tools    = tool_defs;
 
-        auto  completion = neograph::async::run_sync(provider_->invoke(params, nullptr));
-        auto& msg        = completion.message;
+        auto completion = neograph::async::run_sync(provider_->invoke(params, nullptr));
+        usage_->add(completion.usage);  // #88
+        auto& msg = completion.message;
 
         // Append assistant message to history
         messages.push_back(msg);
@@ -81,27 +93,15 @@ std::string Agent::run(std::vector<ChatMessage>& messages, int max_iterations) {
             return msg.content;
         }
 
-        // Execute each tool call (O(1) lookup via tools_by_name_).
-        for (const auto& tc : msg.tool_calls) {
-            auto idx_it = tools_by_name_.find(tc.name);
-
-            ChatMessage tool_msg;
-            tool_msg.role         = "tool";
-            tool_msg.tool_call_id = tc.id;
-            tool_msg.tool_name    = tc.name;
-
-            if (idx_it == tools_by_name_.end()) {
-                tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
-            } else {
-                try {
-                    auto args        = json::parse(tc.arguments);
-                    tool_msg.content = idx_it->second->execute(args);
-                } catch (const std::exception& e) {
-                    tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
-                }
-            }
-
-            messages.push_back(tool_msg);
+        // Tool execution is not implemented here — it lives in exactly one
+        // place, shared with graph::ToolDispatchNode (issue #87). This loop
+        // used to call the blocking execute() one tool at a time while the
+        // node fanned the same calls out concurrently; three 300 ms async
+        // tools took 900 ms here and 300 ms there.
+        auto tool_msgs =
+            neograph::async::run_sync(dispatch_tool_calls(msg.tool_calls, tool_ptrs(), tool_gate_));
+        for (auto& tm : tool_msgs) {
+            messages.push_back(std::move(tm));
         }
     }
 
@@ -125,6 +125,7 @@ std::string Agent::run_stream(std::vector<ChatMessage>& messages,
         // After tool execution, use streaming for the final response
         if (has_done_tool_calls) {
             auto completion = neograph::async::run_sync(provider_->invoke(params, on_chunk));
+            usage_->add(completion.usage);  // #88
             messages.push_back(completion.message);
 
             if (completion.message.tool_calls.empty()) {
@@ -134,6 +135,7 @@ std::string Agent::run_stream(std::vector<ChatMessage>& messages,
         } else {
             // Non-streaming: reliable tool call detection
             auto completion = neograph::async::run_sync(provider_->invoke(params, nullptr));
+            usage_->add(completion.usage);  // #88
             messages.push_back(completion.message);
 
             if (completion.message.tool_calls.empty()) {
@@ -141,34 +143,24 @@ std::string Agent::run_stream(std::vector<ChatMessage>& messages,
                 // Remove the non-streamed message, re-do with streaming
                 messages.pop_back();
                 auto streamed = neograph::async::run_sync(provider_->invoke(params, on_chunk));
+                usage_->add(streamed.usage);  // #88
                 messages.push_back(streamed.message);
                 return streamed.message.content;
             }
         }
 
-        auto& msg = messages.back();
+        // Copy the calls out before touching `messages`. The previous code held
+        // `auto& msg = messages.back()` and push_back'ed tool results into the
+        // same vector while iterating msg.tool_calls — a reallocation there
+        // leaves the reference dangling and the next iteration reads freed
+        // memory. It only bites with two or more tool calls, which is why it
+        // survived this long.
+        auto calls = messages.back().tool_calls;
 
-        // Execute tool calls
-        for (const auto& tc : msg.tool_calls) {
-            auto idx_it = tools_by_name_.find(tc.name);
-
-            ChatMessage tool_msg;
-            tool_msg.role         = "tool";
-            tool_msg.tool_call_id = tc.id;
-            tool_msg.tool_name    = tc.name;
-
-            if (idx_it == tools_by_name_.end()) {
-                tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
-            } else {
-                try {
-                    auto args        = json::parse(tc.arguments);
-                    tool_msg.content = idx_it->second->execute(args);
-                } catch (const std::exception& e) {
-                    tool_msg.content = std::string(R"({"error": ")") + e.what() + "\"}";
-                }
-            }
-
-            messages.push_back(tool_msg);
+        auto tool_msgs = neograph::async::run_sync(
+            dispatch_tool_calls(std::move(calls), tool_ptrs(), tool_gate_));
+        for (auto& tm : tool_msgs) {
+            messages.push_back(std::move(tm));
         }
 
         has_done_tool_calls = true;

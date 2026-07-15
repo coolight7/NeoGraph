@@ -41,13 +41,17 @@
 #include <neograph/graph/types.h>
 
 #include <asio/awaitable.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/thread_pool.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/functional.h>
 #include <pybind11/stl.h>
 
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -141,15 +145,116 @@ NodeResult coerce_to_node_result(py::handle obj) {
         std::string(py::str(obj.get_type()).cast<std::string>()));
 }
 
+// Translate a Python `neograph_engine.NodeInterrupt` into the C++ exception
+// the engine understands (issue #94).
+//
+// Without this, a Python node had no way to pause a run: the exception fell
+// through as a generic Python error, the engine treated it as a failure, and
+// there was no checkpoint and nothing to resume.
+//
+// The translation happens *here*, inside the trampoline, rather than by
+// registering an exception translator and letting things propagate: a C++
+// exception crossing the pybind11 boundary trips ASan's __cxa_throw
+// interceptor (see the sanitizer CI job's deselect list). Catching the Python
+// error, reading its fields under the GIL, and throwing a fresh C++ exception
+// afterwards keeps each exception on one side of the boundary.
+//
+// Narrow on purpose: only NodeInterrupt is converted. Every other exception
+// stays an error, because a bug in a node must fail the run loudly instead of
+// looking like a graceful "waiting for a human".
+std::optional<neograph::graph::NodeInterrupt>
+translate_node_interrupt(py::error_already_set& e) {
+    py::object type;
+    try {
+        type = py::module_::import("neograph_engine").attr("NodeInterrupt");
+    } catch (const py::error_already_set&) {
+        return std::nullopt;   // module half-initialised; treat as a plain error
+    }
+    if (!e.matches(type)) return std::nullopt;
+
+    py::object exc = e.value();
+    std::string reason;
+    if (py::hasattr(exc, "reason")) {
+        reason = py::str(exc.attr("reason")).cast<std::string>();
+    }
+    json value;   // stays null when the node attached no payload
+    if (py::hasattr(exc, "value")) {
+        py::object v = exc.attr("value");
+        if (!v.is_none()) value = py_to_json(v);
+    }
+    return neograph::graph::NodeInterrupt(reason, std::move(value));
+}
+
 // PyToolOwner: bridges the C++ Tool interface to a held Python user
 // object. Created at GraphEngine.compile() time from the
 // `_pytools` attribute on the Python NodeContext wrapper, then
 // transferred to the engine via own_tools(). Pattern parallels
 // PyGraphNodeOwner — same GIL handshake, same destructor caveat.
+// Worker pool for AsyncTool bodies (issue #96).
+//
+// Overlapping Python tools means running their bodies on separate threads —
+// there is no other way, since a Python function holds the GIL while it runs
+// and only lets go when it blocks on I/O. These threads therefore spend their
+// lives blocked on sockets, so the pool is sized generously rather than to the
+// core count: it bounds how many tool calls can be in flight, not how much CPU
+// is used.
+asio::thread_pool& async_tool_pool() {
+    static asio::thread_pool pool([] {
+        if (const char* env = std::getenv("NEOGRAPH_TOOL_THREADS")) {
+            long n = std::strtol(env, nullptr, 10);
+            if (n > 0 && n <= 1024) return static_cast<std::size_t>(n);
+        }
+        return static_cast<std::size_t>(32);
+    }());
+    return pool;
+}
+
+// Lets a Python-owned C++ tool (an MCPTool, say) satisfy the engine's
+// `unique_ptr<Tool>` ownership while Python keeps its shared_ptr. Forwards
+// everything, and — the point — forwards `execute_async` to the real tool, so a
+// tool that genuinely suspends still does (issue #95).
+class SharedToolRef final : public neograph::Tool {
+public:
+    explicit SharedToolRef(std::shared_ptr<neograph::Tool> tool)
+        : tool_(std::move(tool)) {}
+
+    neograph::ChatTool get_definition() const override {
+        return tool_->get_definition();
+    }
+
+    std::string execute(const json& arguments) override {
+        return tool_->execute(arguments);
+    }
+
+    // Plain forwarding, NOT a coroutine: `co_await tool_->execute_async(args)`
+    // here would build a second frame for no reason, and `arguments` is a
+    // reference the caller keeps alive across the await either way.
+    asio::awaitable<std::string> execute_async(const json& arguments) override {
+        return tool_->execute_async(arguments);
+    }
+
+    std::string get_name() const override { return tool_->get_name(); }
+
+private:
+    std::shared_ptr<neograph::Tool> tool_;
+};
+
 class PyToolOwner final : public neograph::Tool {
 public:
     explicit PyToolOwner(py::object py_obj)
-        : py_obj_(std::move(py_obj)) {}
+        : py_obj_(std::move(py_obj)) {
+        // Does this tool opt in to running concurrently? Decided once, here,
+        // rather than on every call — the answer cannot change, and the check
+        // needs the GIL.
+        py::gil_scoped_acquire g;
+        try {
+            py::object base =
+                py::module_::import("neograph_engine").attr("AsyncTool");
+            concurrent_ = py::isinstance(py_obj_, base);
+        } catch (const py::error_already_set&) {
+            concurrent_ = false;   // conservative: serial is always correct
+        }
+    }
 
     ~PyToolOwner() override {
         py::gil_scoped_acquire g;
@@ -164,9 +269,28 @@ public:
 
     std::string execute(const json& arguments) override {
         py::gil_scoped_acquire g;
-        py::object args_py = json_to_py(arguments);
-        return py_obj_.attr("execute")(args_py)
-            .cast<std::string>();
+        return call_python(arguments);
+    }
+
+    // The whole of issue #96 is this override.
+    //
+    // Tool::execute_async's default body is `co_return execute(arguments)` —
+    // it runs to completion before the coroutine's first suspension, so a
+    // sync tool never overlaps with its siblings even inside the dispatcher's
+    // parallel group. That is not an accident; it is the guarantee that let
+    // #87 land concurrency without racing anybody's existing stateful tool.
+    //
+    // A tool that subclassed ng.AsyncTool has said it is safe to overlap. For
+    // those, and only those, we hop onto a worker thread, which is where the
+    // GIL can actually be released while the tool waits on I/O.
+    asio::awaitable<std::string> execute_async(const json& arguments) override {
+        if (!concurrent_) {
+            co_return execute(arguments);   // unchanged: serial, as before
+        }
+        co_return co_await asio::co_spawn(
+            async_tool_pool().get_executor(),
+            offload(this, arguments),
+            asio::use_awaitable);
     }
 
     std::string get_name() const override {
@@ -175,7 +299,25 @@ public:
     }
 
 private:
+    /// GIL must be held.
+    std::string call_python(const json& arguments) {
+        py::object args_py = json_to_py(arguments);
+        return py_obj_.attr("execute")(args_py).cast<std::string>();
+    }
+
+    // `arguments` is a coroutine PARAMETER, taken by value, and not a lambda
+    // capture: a lambda's closure dies as soon as it has handed back the
+    // awaitable, so a captured argument would dangle. A parameter lives in the
+    // coroutine frame. (`self` is a raw pointer on purpose — the tool outlives
+    // the run, and copying a py::object here would touch a CPython refcount
+    // without the GIL.)
+    static asio::awaitable<std::string> offload(PyToolOwner* self, json arguments) {
+        py::gil_scoped_acquire g;
+        co_return self->call_python(arguments);
+    }
+
     py::object py_obj_;
+    bool       concurrent_ = false;
 };
 
 // PyGraphNodeOwner: bridges the C++ GraphNode interface to a held
@@ -214,11 +356,24 @@ public:
     // receives `input.ctx.cancel_token` directly and pins it onto its
     // own provider calls. No thread_local smuggling.
     asio::awaitable<NodeResult> run(NodeInput in) override {
-        py::gil_scoped_acquire g;
-        py::object py_input = py::cast(&in,
-            py::return_value_policy::reference);
-        py::object res = py_obj_.attr("run")(py_input);
-        co_return coerce_to_node_result(res);
+        NodeResult result;
+        // Captured under the GIL, thrown after releasing it — see
+        // translate_node_interrupt.
+        std::optional<neograph::graph::NodeInterrupt> interrupt;
+        {
+            py::gil_scoped_acquire g;
+            py::object py_input = py::cast(&in,
+                py::return_value_policy::reference);
+            try {
+                py::object res = py_obj_.attr("run")(py_input);
+                result = coerce_to_node_result(res);
+            } catch (py::error_already_set& e) {
+                interrupt = translate_node_interrupt(e);
+                if (!interrupt) throw;   // a real error, not a pause
+            }
+        }
+        if (interrupt) throw *interrupt;
+        co_return result;
     }
 
 private:
@@ -281,6 +436,18 @@ wrap_python_tools(py::handle tools_list) {
     std::vector<std::unique_ptr<neograph::Tool>> out;
     if (tools_list.is_none()) return out;
     for (auto t : tools_list) {
+        // A tool that is ALREADY a C++ Tool — an MCPTool from
+        // MCPClient.get_tools(), say (issue #95) — must pass through as what it
+        // is. Wrapping it in a PyToolOwner would compile, run, and pass a
+        // functional test, while quietly serializing it: a PyToolOwner only
+        // runs concurrently when it holds a Python ng.AsyncTool, and a C++ tool
+        // is not one. MCP calls are network round-trips, so that would deliver
+        // the feature without the reason anyone wants it (#96).
+        if (py::isinstance<neograph::Tool>(t)) {
+            auto shared = t.cast<std::shared_ptr<neograph::Tool>>();
+            out.push_back(std::make_unique<SharedToolRef>(std::move(shared)));
+            continue;
+        }
         out.push_back(std::make_unique<PyToolOwner>(
             py::reinterpret_borrow<py::object>(t)));
     }
@@ -411,7 +578,16 @@ void init_node(py::module_& m) {
             [](const RunContext& c) {
                 return static_cast<uint8_t>(c.stream_mode);
             },
-            "Mirrors ``RunConfig.stream_mode`` as the underlying flag bits.");
+            "Mirrors ``RunConfig.stream_mode`` as the underlying flag bits.")
+        .def_property_readonly("resume_value",
+            [](const RunContext& c) -> py::object {
+                if (!c.resume_value) return py::none();
+                return json_to_py(*c.resume_value);
+            },
+            "The value passed to ``engine.resume(thread_id, value)`` — the "
+            "human's answer to a NodeInterrupt. ``None`` on a fresh run, so a "
+            "node can tell \"nobody has answered yet\" from \"the answer was "
+            "no\" (issue #94).");
 
     // ── NodeInput (per-call bundle, v0.4 PR 7) ──────────────────────────
     py::class_<NodeInput>(m, "NodeInput",

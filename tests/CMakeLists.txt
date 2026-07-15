@@ -8,6 +8,8 @@ add_executable(neograph_tests
     test_schema_export.cpp
     test_json_path.cpp
     test_pending_writes.cpp
+    test_channel_write_mode.cpp
+    test_usage_accounting.cpp
     test_plan_execute_graph.cpp
     test_signal_dispatch.cpp
     test_multi_node_resume.cpp
@@ -16,6 +18,7 @@ add_executable(neograph_tests
     test_live_llm_cancel_fanout_cpp.cpp
     test_scheduler.cpp
     test_node_execution.cpp
+    test_tool_dispatch_parity.cpp
     test_compiler.cpp
     test_compiler_strict.cpp
     test_validator.cpp
@@ -28,6 +31,8 @@ add_executable(neograph_tests
     test_barrier_persistence.cpp
     test_coordinator.cpp
     test_sends_interrupt_order.cpp
+    test_dynamic_interrupt.cpp
+    test_tool_gate.cpp
     test_multi_send_events.cpp
     test_multi_send_routing.cpp
     test_schema_provider_concurrent.cpp
@@ -68,6 +73,10 @@ add_executable(neograph_tests
 )
 
 if(NEOGRAPH_BUILD_MCP)
+    # A stdio MCP tool used from inside a graph run — the combination nothing
+    # covered, and a use-after-free until the session stopped depending on an
+    # io_context it does not own.
+    target_sources(neograph_tests PRIVATE test_mcp_stdio_in_graph.cpp)
     target_sources(neograph_tests PRIVATE
         test_mcp_client_async.cpp
         test_mcp_stdio_async.cpp
@@ -97,12 +106,20 @@ target_sources(neograph_tests PRIVATE test_async_get.cpp)
 # PostgresCheckpointStore integration tests are gated on NEOGRAPH_BUILD_POSTGRES
 # at the build level (so projects without libpqxx still build the test
 # binary) and on NEOGRAPH_TEST_POSTGRES_URL at runtime (skipped if unset).
+# The repo's habit is to gate a whole test FILE on its backend. That does not
+# fit a file whose backend cases sit next to backend-independent ones (see
+# test_channel_write_mode.cpp), so those get a compile definition to guard on
+# instead. Without it the file references SqliteCheckpointStore /
+# PostgresCheckpointStore unconditionally and the link fails on any build
+# without them — which is what the Windows and TSan jobs are.
 if(NEOGRAPH_BUILD_POSTGRES)
     target_sources(neograph_tests PRIVATE test_postgres_checkpoint.cpp)
+    target_compile_definitions(neograph_tests PRIVATE NEOGRAPH_TESTS_HAVE_POSTGRES)
 endif()
 
 if(NEOGRAPH_BUILD_SQLITE)
     target_sources(neograph_tests PRIVATE test_sqlite_checkpoint.cpp)
+    target_compile_definitions(neograph_tests PRIVATE NEOGRAPH_TESTS_HAVE_SQLITE)
 endif()
 
 target_link_libraries(neograph_tests PRIVATE
@@ -164,12 +181,18 @@ if(NEOGRAPH_BUILD_POSTGRES)
     # SetUp/TearDown — running them in parallel collides on DDL. Mark
     # them with a RESOURCE_LOCK so ctest serializes only this group
     # while the other ~200 tests still run concurrently.
+    # ChannelWriteModeTest.OverwriteSurvivesReplayThroughPostgres joins the
+    # locked group: it talks to the same database, and the Postgres suite's
+    # drop_schema() will wipe its tables mid-run otherwise. Observed exactly
+    # that — green standalone, red under `ctest -j8`.
+    set(NEOGRAPH_PG_LOCKED_TESTS
+        "PostgresCheckpointTest.*:ChannelWriteModeTest.OverwriteSurvivesReplayThroughPostgres")
     gtest_discover_tests(neograph_tests
-        TEST_FILTER "PostgresCheckpointTest.*"
+        TEST_FILTER "${NEOGRAPH_PG_LOCKED_TESTS}"
         PROPERTIES RESOURCE_LOCK postgres_test_db
     )
     gtest_discover_tests(neograph_tests
-        TEST_FILTER "-PostgresCheckpointTest.*"
+        TEST_FILTER "-${NEOGRAPH_PG_LOCKED_TESTS}"
     )
 else()
     gtest_discover_tests(neograph_tests)

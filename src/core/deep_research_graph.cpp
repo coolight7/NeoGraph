@@ -202,6 +202,7 @@ public:
 
         params.cancel_token = in.ctx.cancel_token;
         auto completion     = co_await provider_->invoke(params, nullptr);
+        record_usage(in.ctx, completion);  // #88
 
         json asst;
         to_json(asst, completion.message);
@@ -500,9 +501,10 @@ public:
             params.temperature = 0.3f;
             params.max_tokens  = 2048;
 
-            params.cancel_token            = in.ctx.cancel_token;
-            auto completion                = co_await provider_->invoke(params, nullptr);
-            auto&                      msg = completion.message;
+            params.cancel_token = in.ctx.cancel_token;
+            auto completion     = co_await provider_->invoke(params, nullptr);
+            record_usage(in.ctx, completion);  // #88
+            auto& msg = completion.message;
             convo.push_back(msg);
 
             if (msg.tool_calls.empty()) {
@@ -542,13 +544,19 @@ public:
 
         // Compress the transcript into a dense summary. Reuses the same
         // model; could be swapped for a cheaper one later.
-        std::string compressed = compress(convo, topic);
+        std::string compressed = compress(convo, topic, in.ctx);
 
         co_return NodeOutput{fanin_writes(call_id, topic, compressed)};
     }
 
 private:
-    std::string compress(const std::vector<ChatMessage>& convo, const std::string& topic) {
+    // Takes the RunContext so the compression call's tokens are counted (#88).
+    // This helper makes a real LLM call; without the context its cost would be
+    // invisible in RunResult::usage, and a deep-research run would under-report
+    // by one call per researcher per round.
+    std::string compress(const std::vector<ChatMessage>& convo,
+                         const std::string&              topic,
+                         const RunContext&               ctx) {
         std::ostringstream transcript;
         for (const auto& m : convo) {
             if (m.role == "system") continue;
@@ -579,8 +587,9 @@ private:
         cp.max_tokens  = 2048;
 
         try {
-            auto        completion = neograph::async::run_sync(provider_->invoke(cp, nullptr));
-            std::string out        = completion.message.content;
+            auto completion = neograph::async::run_sync(provider_->invoke(cp, nullptr));
+            record_usage(ctx, completion);  // #88
+            std::string out = completion.message.content;
             // Hard cap regardless of what the model produced. Protects the
             // supervisor's accumulated context from unbounded growth across
             // research rounds — each round appends one tool_result per
@@ -710,6 +719,7 @@ public:
             std::exception_ptr eptr;
             try {
                 completion = co_await provider_->invoke(params, nullptr);
+                record_usage(in.ctx, completion);  // #88
             } catch (...) {
                 eptr = std::current_exception();
             }
@@ -821,6 +831,7 @@ Output ONLY the brief, in plain markdown. No preamble. Keep it under 200 words.)
 
             try {
                 completion = co_await provider_->invoke(params, nullptr);
+                record_usage(in.ctx, completion);  // #88
             } catch (...) {
                 eptr = std::current_exception();
             }
@@ -930,7 +941,8 @@ Bias toward PROCEED — only ASK when the question would clearly fork the resear
             try {
                 params.cancel_token = in.ctx.cancel_token;
                 auto completion     = co_await provider_->invoke(params, nullptr);
-                verdict             = completion.message.content;
+                record_usage(in.ctx, completion);  // #88
+                verdict = completion.message.content;
             } catch (...) {
                 eptr = std::current_exception();
             }

@@ -20,6 +20,7 @@
 #include <neograph/graph/state.h>
 #include <neograph/graph/store.h>
 #include <neograph/graph/types.h>
+#include <neograph/tool_dispatch.h>   // ToolGate (issue #89)
 
 #include <asio/awaitable.hpp>
 #include <asio/thread_pool.hpp>
@@ -57,6 +58,12 @@ struct RunConfig {
      */
     std::shared_ptr<CancelToken> cancel_token;
 
+    /// Token accounting for this run (issue #88). Leave null and the engine
+    /// makes one; pass your own to accumulate across several runs — e.g. a
+    /// per-tenant budget that spans a whole conversation rather than one turn.
+    /// Whatever ends up here is what ``RunResult::usage`` reports.
+    std::shared_ptr<UsageAccumulator> usage;
+
     /**
      * @brief Auto-resume from latest checkpoint for ``thread_id`` (v0.3.1+).
      *
@@ -86,6 +93,7 @@ struct RunConfig {
      * is a no-op.
      */
     bool resume_if_exists = false;
+
 };
 
 /**
@@ -120,6 +128,12 @@ struct RunContext {
     /// Null when the caller did not opt in.
     std::shared_ptr<CancelToken> cancel_token;
 
+    /// Token accounting sink for this run (issue #88). The engine always sets
+    /// it, so a node body can record unconditionally via ``record_usage``.
+    /// A custom node that calls a Provider directly is responsible for doing
+    /// so — the engine only sees completions that pass through its own nodes.
+    std::shared_ptr<UsageAccumulator> usage;
+
     /// Optional absolute wall-clock deadline. Reserved for a future PR
     /// (RunConfig has no deadline field today); left ``std::nullopt``
     /// by the engine for now so existing behaviour is unchanged.
@@ -142,6 +156,32 @@ struct RunContext {
 
     /// Mirrors ``RunConfig::stream_mode``.
     StreamMode stream_mode = StreamMode::ALL;
+
+    /**
+     * @brief The value handed to ``GraphEngine::resume()`` — the human's answer.
+     *
+     * Empty on a fresh run, so a node can tell "nobody has answered yet" from
+     * "the answer was no":
+     *
+     * @code
+     * if (!in.ctx.resume_value)
+     *     throw NodeInterrupt("needs approval", payload);    // ask
+     * if (in.ctx.resume_value->value("approved", false))     // act on the reply
+     *     ...
+     * @endcode
+     *
+     * ``std::optional<json>`` rather than a plain ``json``, because a
+     * default-constructed ``json`` allocates a yyjson document — and this
+     * struct is built on every run, including the overwhelming majority that
+     * never interrupt. An empty optional allocates nothing. (Measured: a bare
+     * ``json`` member here cost ~3% of engine overhead per run.)
+     *
+     * The engine also keeps writing ``resume_value`` into a ``messages``
+     * channel when the graph has one, which is how chat-shaped graphs have
+     * always received it. That path is unchanged; this one exists because a
+     * graph without a ``messages`` channel had no way to see the answer at all.
+     */
+    std::optional<json> resume_value;
 
     /**
      * @brief Cross-thread shared memory (issue #27).
@@ -179,7 +219,27 @@ struct RunContext {
      * @endcode
      */
     std::shared_ptr<Store> store;
+
+    /// The engine's tool gate (issue #89). Empty when none was set — an empty
+    /// std::function allocates nothing, so the ungated path pays a null check
+    /// and no more.
+    ToolGate tool_gate;
 };
+
+/// @brief Fold a completion's token usage into the run's running total (#88).
+///
+/// One implementation, called from every node that receives a completion. The
+/// alternative — each node incrementing its own counters — is how the two tool
+/// dispatch paths drifted apart in #87, and it would drift the same way here:
+/// a new node type gets written, nobody remembers to count, and the run's token
+/// total silently under-reports. There is nothing in a wrong-but-plausible token
+/// number that tells you it is wrong.
+///
+/// Safe to call with a context whose accumulator is null (a node driven outside
+/// an engine run, as unit tests do).
+inline void record_usage(const RunContext& ctx, const ChatCompletion& completion) {
+    if (ctx.usage) ctx.usage->add(completion.usage);
+}
 
 /**
  * @brief Result of a graph execution run.
@@ -213,6 +273,22 @@ struct RunResult {
     json        interrupt_value;               ///< Value associated with the interrupt.
     std::string checkpoint_id;                 ///< ID of the last checkpoint saved.
     std::vector<std::string> execution_trace;  ///< Ordered list of executed node names.
+
+    /// Token usage for the whole run, subgraphs included (issue #88). Zero for
+    /// a graph that made no LLM calls — not an error, just nothing to count.
+    ///
+    /// **This is what THIS call to run() spent, not the whole bill.** A previous
+    /// attempt that threw never produced a RunResult, so its tokens are not
+    /// here — even though they were really spent. Spend 15 tokens, crash, retry,
+    /// spend 15 more, and this field says 15 against a bill of 30.
+    ///
+    /// For cost accounting that survives retries, hand the engine your own
+    /// accumulator via ``RunConfig::usage``: it outlives the failed attempt
+    /// because it is yours and the engine only borrows it.
+    ///
+    /// @see UsageAccounting.ACrashedAttemptIsInvisibleToRunResult
+    /// @see UsageAccounting.ACallerSuppliedAccumulatorSeesTheCrashedAttempt
+    ChatCompletion::Usage usage;
 
     /// @brief Read a channel value as type ``T`` (issue #25).
     ///
@@ -501,6 +577,39 @@ public:
     void set_store(std::shared_ptr<Store> store);
 
     /**
+     * @brief Intercept every tool call before it runs (issue #89).
+     *
+     * A gate returns Allow (optionally rewriting the arguments), Deny (the
+     * model is told why) or Interrupt (pause and ask a human). It is consulted
+     * for every call in a batch **before any tool runs**, so an Interrupt has
+     * no side effects to undo and the resumed node cannot double-apply a
+     * sibling's effects. Reaches both dispatch paths — graph nodes and
+     * llm::Agent — because they share one dispatcher (issue #87).
+     *
+     * **It lives on the engine, not on RunConfig, and that is deliberate.**
+     * `resume()` builds its own RunConfig internally, so a per-run gate would
+     * vanish the moment a human answered the very prompt it raised — the
+     * dangerous tool would then run unchecked, with the caller believing they
+     * had a permission system. A policy that disappears exactly when it is
+     * being exercised is worse than no policy. Set it once, here, and it holds
+     * for every run and every resume on this engine.
+     *
+     * @code
+     * engine->set_tool_gate([](ToolCall call, ToolGateContext gctx)
+     *         -> asio::awaitable<ToolDecision> {
+     *     if (call.name != "shell") co_return ToolDecision::allow();
+     *     if (!gctx.resume_value)
+     *         co_return ToolDecision::interrupt("shell needs approval",
+     *                                           json::parse(call.arguments));
+     *     if (gctx.resume_value->value("approved", false))
+     *         co_return ToolDecision::allow();
+     *     co_return ToolDecision::deny("the human said no");
+     * });
+     * @endcode
+     */
+    void set_tool_gate(ToolGate gate) { tool_gate_ = std::move(gate); }
+
+    /**
      * @brief Get the cross-thread shared memory store.
      * @return Shared pointer to the Store, or nullptr if not set.
      */
@@ -594,6 +703,10 @@ public:
 
 private:
     GraphEngine() = default;
+
+    /// #89 — set_tool_gate(). Lives on the engine rather than RunConfig so it
+    /// survives resume(), which builds its own RunConfig internally.
+    ToolGate tool_gate_;
 
     void init_state(GraphState& state) const;
     void apply_input(GraphState& state, const json& input) const;
