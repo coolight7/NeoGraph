@@ -981,8 +981,8 @@ asio::awaitable<std::string> MCPTool::execute_async(const json& arguments) {
     }
 
     // HTTP path (legacy) — one ephemeral client per call.
-    auto client = MCPClient{server_url_};
-    client.initialize();
+    auto     client = MCPClient{server_url_};
+    co_await client.initialize_async();
     auto result = co_await client.call_tool_async(name_, arguments);
     co_return              format_tool_result(result);
 }
