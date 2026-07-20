@@ -82,7 +82,8 @@ struct ChatMessage {
 
     /// [@coolight] 用于支持 修改、重新生成 消息历史
     std::vector<std::string> history_contents;
-    std::string              summaryContent;
+    std::string summaryContent;
+    std::string reasoning_content;
 
     /// 消息标记位掩码（不序列化到 LLM API 请求）
     MessageFlag flags = MessageFlag::None;
@@ -285,6 +286,10 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
             j["content"] = msg.content;
         }
 
+        if (!msg.reasoning_content.empty()) {
+            j["reasoning_content"] = msg.reasoning_content;
+        }
+
         arr.push_back(j);
     }
     return arr;
@@ -324,6 +329,14 @@ inline ChatMessage parse_response_message(const json& choice) {
     msg.role      = m.value("role", "assistant");
     msg.content =
         (m.contains("content") && !m["content"].is_null()) ? m["content"].get<std::string>() : "";
+    msg.reasoning_content =
+        (m.contains("reasoning_content") && !m["reasoning_content"].is_null())
+            ? m["reasoning_content"].get<std::string>()
+            : "";
+    if (msg.reasoning_content.empty() && m.contains("thinking") &&
+        !m["thinking"].is_null()) {
+      msg.reasoning_content = m["thinking"].get<std::string>();
+    }
 
     if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
         for (const auto& tc : m["tool_calls"]) {
