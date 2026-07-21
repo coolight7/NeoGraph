@@ -82,8 +82,8 @@ struct ChatMessage {
 
     /// [@coolight] 用于支持 修改、重新生成 消息历史
     std::vector<std::string> history_contents;
-    std::string summaryContent;
-    std::string reasoning_content;
+    std::string              summaryContent;
+    std::string              reasoning_content;
 
     /// 消息标记位掩码（不序列化到 LLM API 请求）
     MessageFlag flags = MessageFlag::None;
@@ -115,6 +115,15 @@ struct ChatCompletion {
         int completion_tokens = 0;  ///< Number of tokens in the completion.
         int total_tokens      = 0;  ///< Total tokens used (prompt + completion).
     } usage;
+};
+
+class ChatStreamChunk {
+public:
+    inline static constexpr int TYPE_CONTENT  = 1;
+    inline static constexpr int TYPE_THINKING = 2;
+
+    int         type = TYPE_CONTENT;
+    std::string data;
 };
 
 /**
@@ -243,6 +252,15 @@ inline void from_json(const json& j, ChatMessage& msg) {
     }
 }
 
+inline void to_json(json& j, const neograph::ChatStreamChunk& e) {
+    j = json{{"type", e.type}, {"data", e.data}};
+}
+
+inline void from_json(const json& j, neograph::ChatStreamChunk& e) {
+    e.type = j.value<int>("type", 0);
+    e.data = j.value<std::string>("data", "");
+}
+
 // --- JSON serialization helpers ---
 
 /**
@@ -329,13 +347,11 @@ inline ChatMessage parse_response_message(const json& choice) {
     msg.role      = m.value("role", "assistant");
     msg.content =
         (m.contains("content") && !m["content"].is_null()) ? m["content"].get<std::string>() : "";
-    msg.reasoning_content =
-        (m.contains("reasoning_content") && !m["reasoning_content"].is_null())
-            ? m["reasoning_content"].get<std::string>()
-            : "";
-    if (msg.reasoning_content.empty() && m.contains("thinking") &&
-        !m["thinking"].is_null()) {
-      msg.reasoning_content = m["thinking"].get<std::string>();
+    msg.reasoning_content = (m.contains("reasoning_content") && !m["reasoning_content"].is_null())
+                                ? m["reasoning_content"].get<std::string>()
+                                : "";
+    if (msg.reasoning_content.empty() && m.contains("thinking") && !m["thinking"].is_null()) {
+        msg.reasoning_content = m["thinking"].get<std::string>();
     }
 
     if (m.contains("tool_calls") && m["tool_calls"].is_array()) {

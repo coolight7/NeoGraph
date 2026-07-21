@@ -160,6 +160,16 @@ asio::awaitable<ChatCompletion> Provider::invoke(const CompletionParams& params,
     co_return co_await complete_async(params);
 }
 
+asio::awaitable<ChatCompletion> Provider::invoke_format_data(const CompletionParams&  params,
+                                                             FormatDataStreamCallback on_chunk) {
+    co_return co_await invoke(params, [&](const std::string& chunk) {
+        on_chunk(neograph::ChatStreamChunk{
+            .type = neograph::ChatStreamChunk::TYPE_CONTENT,
+            .data = chunk,
+        });
+    });
+}
+
 NEOGRAPH_POP_IGNORE_DEPRECATED
 
 }  // namespace neograph

@@ -52,6 +52,8 @@ private:
 /// @param chunk The token or text chunk received from the LLM.
 using StreamCallback = std::function<void(const std::string& chunk)>;
 
+using FormatDataStreamCallback = std::function<void(const neograph::ChatStreamChunk& chunk)>;
+
 /**
  * @brief Parameters for an LLM completion request.
  */
@@ -149,8 +151,9 @@ public:
      * Candidate 6.
      */
     [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate 6")]]
-    virtual ChatCompletion complete(const CompletionParams& params);
+        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate "
+        "6")]] virtual ChatCompletion
+    complete(const CompletionParams& params);
 
     /**
      * @brief Perform an LLM completion as a coroutine.
@@ -175,8 +178,9 @@ public:
      * @deprecated Use `invoke(params, nullptr)`. v1.0 removes this.
      */
     [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate 6")]]
-    virtual asio::awaitable<ChatCompletion> complete_async(const CompletionParams& params);
+        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate "
+        "6")]] virtual asio::awaitable<ChatCompletion>
+    complete_async(const CompletionParams& params);
 
     /**
      * @brief Perform a streaming LLM completion.
@@ -200,9 +204,9 @@ public:
      * sync caller). v1.0 removes this.
      */
     [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate 6")]]
-    virtual ChatCompletion complete_stream(const CompletionParams& params,
-                                           const StreamCallback&   on_chunk);
+        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate "
+        "6")]] virtual ChatCompletion
+    complete_stream(const CompletionParams& params, const StreamCallback& on_chunk);
 
     /**
      * @brief Async streaming completion. Awaitable peer of @ref complete_stream.
@@ -262,9 +266,9 @@ public:
      * @deprecated Use `invoke(params, on_chunk)`. v1.0 removes this.
      */
     [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate 6")]]
-    virtual asio::awaitable<ChatCompletion> complete_stream_async(const CompletionParams& params,
-                                                                  const StreamCallback&   on_chunk);
+        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate "
+        "6")]] virtual asio::awaitable<ChatCompletion>
+    complete_stream_async(const CompletionParams& params, const StreamCallback& on_chunk);
 
     /**
      * @brief Single-dispatch async-streaming completion (v1.0 canonical).
@@ -312,6 +316,9 @@ public:
      */
     virtual asio::awaitable<ChatCompletion> invoke(const CompletionParams& params,
                                                    StreamCallback          on_chunk = nullptr);
+
+    virtual asio::awaitable<ChatCompletion> invoke_format_data(
+        const CompletionParams& params, FormatDataStreamCallback on_chunk = nullptr);
 
     /**
      * @brief Get the provider name (e.g., "openai", "claude").
