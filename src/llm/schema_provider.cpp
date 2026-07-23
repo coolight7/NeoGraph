@@ -45,8 +45,7 @@ SchemaProvider::SchemaProvider(Config config, json schema)
     // successive calls to the same model host now amortise TCP+TLS.
     http_io_ = std::make_unique<asio::io_context>();
     http_work_.emplace(asio::make_work_guard(*http_io_));
-    http_thread_ = std::thread([io = http_io_.get()] { io->run(); });
-    conn_pool_   = std::make_unique<async::ConnPool>(http_io_->get_executor());
+    conn_pool_ = std::make_unique<async::ConnPool>(http_io_->get_executor());
     if (user_config_.prefer_libcurl) {
         curl_pool_ = std::make_unique<async::CurlH2Pool>();
     }
@@ -55,7 +54,22 @@ SchemaProvider::SchemaProvider(Config config, json schema)
     // See header comment on `bridge_io_` for the rationale.
     bridge_io_ = std::make_unique<asio::io_context>();
     bridge_work_.emplace(asio::make_work_guard(*bridge_io_));
-    bridge_thread_ = std::thread([io = bridge_io_.get()] { io->run(); });
+
+    // Threads come last so resource setup failures unwind normally. If the
+    // second thread cannot start, explicitly stop and join the first one;
+    // destroying a joinable std::thread would otherwise call std::terminate.
+    try {
+        http_thread_   = std::thread([io = http_io_.get()] { io->run(); });
+        bridge_thread_ = std::thread([io = bridge_io_.get()] { io->run(); });
+    } catch (...) {
+        http_work_.reset();
+        bridge_work_.reset();
+        http_io_->stop();
+        bridge_io_->stop();
+        if (http_thread_.joinable()) http_thread_.join();
+        if (bridge_thread_.joinable()) bridge_thread_.join();
+        throw;
+    }
 }
 
 SchemaProvider::~SchemaProvider() {
@@ -1626,42 +1640,84 @@ asio::awaitable<ChatCompletion> SchemaProvider::complete_stream_async(
     // `http_thread_`): the thread is warm after the first call, all
     // subsequent calls reuse the warmed state.
     //
-    // Tokens are still dispatched onto the awaiter's executor (so the
-    // user's `on_chunk` runs single-threaded with the awaiting
-    // coroutine — same invariant the post-PR-#10 base default
-    // provides).
+    // The bridge thread only writes to shared state. The awaiting
+    // coroutine drains queued tokens on its own executor, preserving
+    // the callback-thread invariant without letting late bridge work
+    // retain or use an executor whose io_context may be gone.
     auto exec                        = co_await asio::this_coro::executor;
     auto                 bridge_exec = bridge_io_->get_executor();
 
     struct Shared {
+        std::mutex                    mutex;
+        bool                          abandoned = false;
+        bool                          finished  = false;
+        std::vector<std::string>      chunks;
         std::optional<ChatCompletion> result;
         std::exception_ptr            err;
     };
     auto shared = std::make_shared<Shared>();
 
-    auto done = std::make_shared<asio::steady_timer>(exec);
-    done->expires_at(std::chrono::steady_clock::time_point::max());
-
-    StreamCallback wrapped = [exec, on_chunk](const std::string& chunk) {
-        asio::dispatch(exec, [on_chunk, chunk]() { on_chunk(chunk); });
+    StreamCallback wrapped = [shared](const std::string& chunk) {
+        std::lock_guard lock(shared->mutex);
+        if (!shared->abandoned) shared->chunks.push_back(chunk);
     };
+
+    struct AbandonGuard {
+        std::shared_ptr<Shared> shared;
+        ~AbandonGuard() {
+            std::lock_guard lock(shared->mutex);
+            shared->abandoned = true;
+            shared->chunks.clear();
+        }
+    } abandon_guard{shared};
 
     // params copied by value so the bridge thread's work item doesn't
     // outlive the caller's stack-allocated CompletionParams.
-    asio::dispatch(bridge_exec, [this, params, wrapped, shared, done, exec]() mutable {
+    asio::dispatch(bridge_exec, [this, params, wrapped, shared]() mutable {
+        std::optional<ChatCompletion> result;
+        std::exception_ptr            err;
         try {
-            shared->result = this->complete_stream(params, wrapped);
+            result = this->complete_stream(params, wrapped);
         } catch (...) {
-            shared->err = std::current_exception();
+            err = std::current_exception();
         }
-        asio::dispatch(exec, [done]() { done->cancel(); });
+        {
+            std::lock_guard lock(shared->mutex);
+            shared->result   = std::move(result);
+            shared->err      = err;
+            shared->finished = true;
+        }
     });
 
-    neograph_asio_error_code ec;
-    co_await                 done->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    asio::steady_timer poll(exec);
+    for (;;) {
+        std::vector<std::string>      chunks;
+        std::optional<ChatCompletion> result;
+        std::exception_ptr            err;
+        bool                          finished = false;
+        {
+            std::lock_guard lock(shared->mutex);
+            chunks.swap(shared->chunks);
+            finished = shared->finished;
+            if (finished) {
+                result = std::move(shared->result);
+                err    = shared->err;
+            }
+        }
 
-    if (shared->err) std::rethrow_exception(shared->err);
-    co_return std::move(*shared->result);
+        if (on_chunk) {
+            for (const auto& chunk : chunks)
+                on_chunk(chunk);
+        }
+        if (finished) {
+            if (err) std::rethrow_exception(err);
+            co_return std::move(*result);
+        }
+
+        poll.expires_after(std::chrono::milliseconds(1));
+        asio::error_code ec;
+        co_await         poll.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    }
 }
 
 // ============================================================================
@@ -1937,15 +1993,12 @@ asio::awaitable<ChatCompletion> SchemaProvider::complete_stream_ws_responses(
     co_return completion;
 }
 
-// Candidate 6 PR6: v1.0 single-dispatch native override. Routes
-// through the existing 4-virtual native overrides for v0.9 (no
-// behavioural change). Streaming branch goes to
+// Compatibility callback-selected override. It routes through the
+// existing native overrides without changing their supported behavior.
+// The streaming branch goes to
 // `complete_stream_async` not the sync `complete_stream` so the
 // WebSocket Responses native-async path + the HTTP/SSE worker-thread
-// bridge stay in effect (issue #4 protection). v1.0 collapses
-// complete_async + complete_stream_async bodies into invoke() and
-// deletes the legacy methods.
-NEOGRAPH_PUSH_IGNORE_DEPRECATED
+// bridge stay in effect (issue #4 protection).
 asio::awaitable<ChatCompletion> SchemaProvider::invoke(const CompletionParams& params,
                                                        StreamCallback          on_chunk) {
     if (on_chunk) {
@@ -1953,6 +2006,5 @@ asio::awaitable<ChatCompletion> SchemaProvider::invoke(const CompletionParams& p
     }
     co_return co_await complete_async(params);
 }
-NEOGRAPH_POP_IGNORE_DEPRECATED
 
 }  // namespace neograph::llm

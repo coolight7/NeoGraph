@@ -76,6 +76,7 @@ result = engine.run(ng.RunConfig(thread_id="t1",
 | Field | Type | Meaning |
 |---|---|---|
 | `output` | `dict` | Final state — `{"channels": {...}, "global_version": int}`. Use `output["channels"][name]["value"]` to read a channel. |
+| `max_steps_exhausted` | `bool` | `True` only when the step ceiling stopped execution while runnable work remained. |
 | `interrupted` | `bool` | `True` if the run paused at an `interrupt_before` / `interrupt_after` / `NodeInterrupt`. |
 | `interrupt_node` | `str` | Name of the node that triggered the interrupt (when `interrupted`). |
 | `interrupt_value` | `dict` | `{"reason": str, "type": "NodeInterrupt", "value": ...}` for a dynamic interrupt (`"value"` present only when the node attached a payload), or `{"message": ...}` for a static `interrupt_before` / `interrupt_after`. |
@@ -88,9 +89,20 @@ result = engine.run(ng.RunConfig(thread_id="t1",
 |---|---|---|
 | `thread_id` | required | Conversation / session identifier — keeps checkpoint streams separate. |
 | `input` | `{}` | Initial channel values — keys must match the graph's `channels` definition. |
-| `max_steps` | 25 | Super-step ceiling; ReAct loops typically need 10+. |
+| `max_steps` | 50 | Super-step ceiling; ReAct loops typically need 10+. |
 | `stream_mode` | `StreamMode.OFF` | Bitmask: `EVENTS \| TOKENS \| DEBUG \| VALUES \| UPDATES \| ALL`. Only consulted by `run_stream` / `run_stream_async`. |
 | `resume_if_exists` | `False` | When `True` and a checkpoint store is configured, the run loads the latest checkpoint for `thread_id` (if any) and applies `input` on top via the channel reducers — multi-turn chat without manually threading prior state through `input`. Default keeps fresh-start semantics for back-compat; for HITL resume from an interrupted run, use `engine.resume_async()` instead. |
+| `cancel_token` | `None` | Optional `CancelToken` for cooperative cancellation. Assign one before `engine.run()`, then call `token.cancel()` from another Python thread. The engine stops at the next super-step boundary; nodes doing long work should poll `input.ctx.cancel_token`. |
+
+```python
+token = ng.CancelToken()
+config = ng.RunConfig(thread_id="job-42", input={"query": "..."})
+config.cancel_token = token
+
+# Run engine.run(config) in a worker thread, then request cancellation from
+# the caller thread when the request disconnects or the user presses Stop.
+token.cancel()
+```
 
 ## Pausing for a human, from a Python node
 
@@ -167,6 +179,13 @@ under every user, and `store.search(["users", "u1"])` finds one user's items.
 
 Subclass `ng.Store` to put it in a database instead.
 
+Custom checkpoint persistence works the same way: subclass
+`ng.CheckpointStore` and implement `save`, `load_latest`, `load_by_id`, `list`,
+and `delete_thread`. The optional `put_writes`, `get_writes`, and
+`clear_writes` methods default to no-op/full-super-step replay behavior. Values
+inside `StoreItem`, `Checkpoint`, and `PendingWrite` are ordinary Python JSON
+shapes (`dict`, `list`, strings, numbers, booleans, and `None`).
+
 ## Backing off on a 429 — RateLimitedProvider
 
 ```python
@@ -239,17 +258,26 @@ tools in the same `NodeContext`.
 
 `client.call_tool(name, args)` calls one directly, outside any graph.
 
-**They overlap — over HTTP.** MCP tools are network round-trips, which is the
-case where concurrent dispatch pays, and `MCPTool` is a real C++ `AsyncTool`. But
-the two transports are not the same, and it is worth knowing which one you have:
+**They overlap when the server does.** MCP tools are network round-trips, which
+is the case where concurrent dispatch pays, and `MCPTool` is a real C++
+`AsyncTool`. HTTP uses concurrent requests; stdio frames writes and correlates
+out-of-order replies by JSON-RPC id:
 
 | transport | 3 calls × 0.4 s |
 |---|---|
 | HTTP | **0.41 s** — each call is its own request |
-| stdio | 1.2 s — one subprocess, one pipe; the client takes a capacity-1 lock, so calls queue |
+| stdio | **~0.4 s** with a concurrent server — one pipe, request-ID multiplexed |
 
-That stdio number is not a NeoGraph limitation to be optimised away; it is what
-a single pipe means. If you need MCP calls to overlap, use an HTTP server.
+A subprocess that handles requests serially still takes ~1.2 s. Multiplexing
+removes the client-side bottleneck; it cannot create server-side concurrency.
+
+Initialization is automatic for `get_tools()` and `call_tool()`, and an explicit
+`initialize()` remains valid and idempotent. `get_initialize_result()` exposes
+the negotiated protocol, capabilities, server info, and instructions.
+`get_tool_definitions()` follows all pagination cursors and retains complete MCP
+metadata. Use `call_tool_result()` or `MCPTool.execute_result()` when you need
+`structured_content`, non-text blocks, `is_error`, or `_meta`; `call_tool()` is
+the source-compatible raw JSON facade.
 
 The stdio subprocess is terminated when the last reference to the session is
 dropped — the client, or any tool it produced.
@@ -393,11 +421,11 @@ where `fn(state) -> str` returns one of the route keys.
 
 ## What's covered by the binding
 
-- **Engine surface** — `GraphEngine.compile / run / run_stream / run_async / run_stream_async / resume / resume_async / get_state / update_state / fork`, `RunConfig`, `RunResult`, `set_worker_count`, `set_checkpoint_store`, `set_node_cache_enabled`.
+- **Engine surface** — `GraphEngine.compile / run / run_stream / run_async / run_stream_async / resume / resume_async / get_state / get_state_history / update_state / fork`, `RunConfig`, `RunResult`, `set_worker_count`, `set_checkpoint_store`, `set_node_cache_enabled`.
 - **Custom Python nodes** — subclass `neograph_engine.GraphNode`, register via `NodeFactory.register_type` or the `@neograph_engine.node` decorator. Engine dispatches under proper GIL handling, including from fan-out worker threads.
 - **Custom Python tools** — subclass `neograph_engine.Tool`, pass into `NodeContext(tools=[...])`. Engine takes ownership at compile time.
 - **Async** — every `*_async` binding returns an `asyncio.Future` bound to the calling thread's running loop. Stream callbacks are hopped to the loop thread via `loop.call_soon_threadsafe` so callbacks run where asyncio expects.
-- **Checkpoints** — `InMemoryCheckpointStore` always; `PostgresCheckpointStore` when the binding is built from source with `-DNEOGRAPH_BUILD_POSTGRES=ON` (libpq bundling for the PyPI wheel is pending).
+- **Checkpoints** — subclass `CheckpointStore` for a Python backend, use `InMemoryCheckpointStore` directly, or use `PostgresCheckpointStore` when the binding is built from source with `-DNEOGRAPH_BUILD_POSTGRES=ON` (libpq bundling for the PyPI wheel is pending).
 - **OpenAI Responses over WebSocket** — `SchemaProvider(schema="openai_responses", use_websocket=True)`.
 
 Wheels: Linux x86_64 (manylinux_2_34), Linux aarch64 (manylinux_2_34),
@@ -444,12 +472,12 @@ LangGraph Python — surfaced here so you don't hit them mid-port:
   with declared fields (Pydantic v2) for typed access:
   `class ChatState(ng.StateView): messages: list[dict] = []` then
   `engine.get_state_view(thread_id, model=ChatState)`.
-- **Python `Provider` subclasses bind only `complete` (sync)** —
-  `Provider.complete_async` is not bound on Python user-defined
-  Provider subclasses, so a custom Python Provider always serves
-  through the sync entry. For async-native provider integrations
-  (HTTP/2 multiplexing, true overlap with other coroutines), stay
-  in C++ and subclass `neograph::llm::Provider` there.
+- **Python `Provider` subclasses bind only the sync `complete` and
+  `complete_stream` methods** — async virtuals are not bound on Python
+  user-defined Provider subclasses, so custom Python providers serve through
+  sync entries. For async-native provider integrations (HTTP/2 multiplexing,
+  true overlap with other coroutines), stay in C++ and derive from
+  `neograph::CompletionProvider` there.
 - **One-line token emit** — `from neograph_engine.streaming import
   emit_token`, then `emit_token(cb, self._name, token)` inside a
   streaming node. Replaces the 4-line `GraphEvent` construction

@@ -4,7 +4,7 @@
 // inference — the "edge story" that motivates NeoGraph's per-iter
 // latency tradeoff over LangGraph (130× faster engine overhead, 76×
 // lower RSS). NeoGraph itself is not an inference runtime; you bring
-// your own (ONNXRuntime, libtorch, ggml, TransformerCPP). This
+// your own (ONNXRuntime, libtorch, ggml, llama.cpp). This
 // example shows the part NeoGraph DOES handle: orchestrating N small
 // classifiers concurrently with sub-µs scheduling overhead, so the
 // wall-clock cost is `max(per-classifier latency)` not `sum(...)`.
@@ -236,14 +236,14 @@ int main(int argc, char** argv) {
     };
 
     NodeContext ctx;
-    auto engine = GraphEngine::compile(definition, ctx);
     // 5 concurrent classifiers — match the worker pool to the fan-out
     // width. v1.0 부터 기본 워커 수는 1 (engine overhead 최소화) 이므로,
     // 실제 병렬 실행이 필요한 fan-out 예제에서는 명시적으로 풀어줘야 한다.
     // 5 로 고정한 이유는 demo wall time 을 안정적으로 보기 위함 —
     // hardware_concurrency 가 더 큰 머신에서도 wide-fanout 패턴이 일정하게
     // 측정된다.
-    engine->set_worker_count(5);
+    auto engine =
+        GraphEngine::build(definition, EngineConfig{.node_context = ctx, .worker_count = 5});
 
     RunConfig cfg;
     cfg.thread_id = "edge-pipeline";

@@ -121,8 +121,10 @@ struct CompletionParams {
 /**
  * @brief Abstract base class for LLM providers.
  *
- * Subclass this to integrate any LLM backend (OpenAI, Claude, Gemini, etc.).
- * Both synchronous and streaming completion must be implemented.
+ * Existing subclasses may continue to implement any supported sync/async pair.
+ * These entry points are stable compatibility APIs with no removal planned.
+ * New backends should normally derive from `CompletionProvider` and implement
+ * its explicit request contract instead.
  *
  * @see neograph::llm::OpenAIProvider
  * @see neograph::llm::SchemaProvider
@@ -142,18 +144,8 @@ public:
      * @param params Completion parameters including model, messages, and tools.
      * @return The full completion response with message and usage statistics.
      *
-     * @deprecated v1.0 collapses the 4-virtual cross-product into the
-     * single async-streaming-superset `invoke(params, on_chunk)`. New
-     * code: `co_await provider->invoke(params, nullptr)` (async) or
-     * `neograph::async::run_sync(provider->invoke(params, nullptr))`
-     * (sync). The legacy `complete()` keeps working through the
-     * deprecation window and is removed in v1.0.0. See ROADMAP_v1.md
-     * Candidate 6.
      */
-    [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate "
-        "6")]] virtual ChatCompletion
-    complete(const CompletionParams& params);
+    virtual ChatCompletion complete(const CompletionParams& params);
 
     /**
      * @brief Perform an LLM completion as a coroutine.
@@ -175,12 +167,8 @@ public:
      * @param params Completion parameters.
      * @return An awaitable yielding the full completion response.
      *
-     * @deprecated Use `invoke(params, nullptr)`. v1.0 removes this.
      */
-    [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, nullptr) — see ROADMAP_v1.md Candidate "
-        "6")]] virtual asio::awaitable<ChatCompletion>
-    complete_async(const CompletionParams& params);
+    virtual asio::awaitable<ChatCompletion> complete_async(const CompletionParams& params);
 
     /**
      * @brief Perform a streaming LLM completion.
@@ -199,25 +187,21 @@ public:
      * @param on_chunk Callback invoked per received token.
      * @return The full completion response after streaming is complete.
      *
-     * @deprecated Use `invoke(params, on_chunk)` (or
-     * `neograph::async::run_sync(invoke(params, on_chunk))` for a
-     * sync caller). v1.0 removes this.
      */
-    [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate "
-        "6")]] virtual ChatCompletion
-    complete_stream(const CompletionParams& params, const StreamCallback& on_chunk);
+    virtual ChatCompletion complete_stream(const CompletionParams& params,
+                                           const StreamCallback&   on_chunk);
 
     /**
      * @brief Async streaming completion. Awaitable peer of @ref complete_stream.
      *
      * Default implementation (post-#4): spawns a dedicated worker
-     * thread that runs the synchronous `complete_stream`, dispatches
-     * each token onto the awaiting coroutine's executor (so the
-     * user's `on_chunk` runs single-threaded with the awaiter — no
-     * reentrancy), and resumes the coroutine via a one-shot
-     * `steady_timer.cancel()` posted on the awaiter's executor when
-     * streaming finishes. Subclasses with a fully async streaming
+     * thread that runs the synchronous `complete_stream` and writes
+     * tokens and completion state to a private queue. The awaiting
+     * coroutine polls that queue and invokes the user's `on_chunk` on
+     * its own executor (single-threaded with the awaiter — no
+     * reentrancy). If the coroutine is abandoned, late tokens are
+     * discarded and the worker finishes independently without using
+     * the awaiter's executor. Subclasses with a fully async streaming
      * transport (WebSocket Responses, native SSE coroutine, etc.)
      * SHOULD override this to drop the worker thread and stream
      * tokens straight onto the coroutine's executor.
@@ -244,8 +228,15 @@ public:
      * an extra worker thread per call. Subclasses whose
      * `complete_stream` is purely synchronous (e.g. blocking httplib)
      * can leave the default bridge in place — it routes the sync work
-     * onto a worker thread and dispatches tokens back onto the
-     * awaiter's executor.
+     * onto a worker thread and lets the awaiting coroutine drain the
+     * token queue on its own executor.
+     *
+     * @warning The default bridge calls the virtual `complete_stream`
+     * through this Provider object. If the returned awaitable is
+     * abandoned, the Provider must remain alive until that synchronous
+     * transport call returns. Abandoning the awaitable or destroying
+     * its `io_context` does not wait for the worker, and therefore does
+     * not extend the Provider object's lifetime.
      *
      * @note **`asio::io_context.run()` placement for the awaiter**
      * (issue #16): drive the outer `asio::io_context.run()` from
@@ -263,21 +254,17 @@ public:
      *                 internal worker thread).
      * @return Awaitable resolving to the full completion response.
      *
-     * @deprecated Use `invoke(params, on_chunk)`. v1.0 removes this.
      */
-    [[deprecated(
-        "v1.0 single-dispatch: use invoke(params, on_chunk) — see ROADMAP_v1.md Candidate "
-        "6")]] virtual asio::awaitable<ChatCompletion>
-    complete_stream_async(const CompletionParams& params, const StreamCallback& on_chunk);
+    virtual asio::awaitable<ChatCompletion> complete_stream_async(const CompletionParams& params,
+                                                                  const StreamCallback&   on_chunk);
 
     /**
-     * @brief Single-dispatch async-streaming completion (v1.0 canonical).
+     * @brief Compatibility callback-selected async completion entry point.
      *
-     * The unified entry point that future v1.0+ Provider subclasses
-     * override. Replaces the current `(sync/async) × (stream/non-stream)`
-     * 4-virtual cross-product (`complete` / `complete_async` /
-     * `complete_stream` / `complete_stream_async`) with one async-
-     * streaming-superset method. ROADMAP_v1.md Candidate 6.
+     * Existing Provider subclasses may override this method to combine the
+     * legacy async collect and stream paths. New implementations should derive
+     * from `CompletionProvider`, whose explicit `CompletionRequest` keeps the
+     * transport mode independent of callback presence.
      *
      * Semantics:
      *   - `on_chunk == nullptr` → caller wants the full assembled
@@ -290,24 +277,12 @@ public:
      * `on_chunk` callback runs there too (single-threaded with the
      * awaiter, same invariant `complete_stream_async` already provides).
      *
-     * **Deprecation strategy** (Candidate 6 PR sequence):
-     *   - This PR (additive): `invoke()` lands as a new virtual; default
-     *     forwards to the legacy 4-virtual chain (`complete_stream_async`
-     *     when `on_chunk` is set, `complete_async` otherwise) so every
-     *     existing Provider subclass keeps working unchanged.
-     *   - Subsequent PR: native subclasses (`OpenAIProvider`,
-     *     `SchemaProvider`, `RateLimitedProvider`) override `invoke()`
-     *     directly; their old 4 overrides become thin adapters.
-     *   - Subsequent PR: 4 legacy virtuals get `[[deprecated]]` markers.
-     *   - v1.0.0: 4 legacy virtuals removed; `invoke()` becomes the
-     *     only Provider virtual besides `get_name()`.
-     *
-     * **Override contract**: subclasses overriding `invoke()` MUST NOT
-     * call any of the 4 legacy `complete_*` methods on themselves —
-     * those default to forwarding to `invoke()` (in a future PR), which
-     * would recurse infinitely. New code: override `invoke()` and only
-     * `invoke()`. Old code: keep overriding the 4 legacy methods; the
-     * default `invoke()` here delegates to them.
+     * The default implementation forwards to `complete_stream_async()` when
+     * `on_chunk` is set and to `complete_async()` otherwise, preserving every
+     * existing Provider subclass. These compatibility methods remain supported
+     * with no removal planned. Compatibility and security fixes apply to them;
+     * new capabilities may be available only through `CompletionProvider`'s
+     * explicit request API.
      *
      * @param params   Completion parameters (model, messages, tools, ...).
      * @param on_chunk Optional per-chunk callback. `nullptr` for non-

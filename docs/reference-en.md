@@ -90,6 +90,7 @@ before a hand-written tour is worth the maintenance.
   - [IntentClassifierNode](#intentclassifiernode)
   - [SubgraphNode](#subgraphnode)
 - [7. GraphEngine](#7-graphengine)
+  - [EngineConfig and EngineResources](#engineconfig-and-engineresources)
   - [RunConfig](#runconfig)
   - [RunResult](#runresult)
   - [GraphEngine](#graphengine-1)
@@ -283,15 +284,15 @@ of missing fields.
 
 ## 2. Provider Interface
 
-**Header:** `<neograph/provider.h>`
+**Headers:** `<neograph/provider.h>`, `<neograph/completion_provider.h>`
 **Namespace:** `neograph`
 
 The abstract interface for LLM backends. Implement this to add support for any LLM API.
 
-> **Writing a custom Provider subclass?** See
-> [`ASYNC_GUIDE.md` §9.3](ASYNC_GUIDE.md#93-provider) for the
-> decision matrix on whether to override `complete()`,
-> `complete_async()`, or both.
+> **Writing a new Provider implementation?** Derive from
+> `CompletionProvider` and implement `do_invoke()`. Existing `Provider`
+> subclasses and `complete*` callers remain supported with no removal planned.
+> See [`ASYNC_GUIDE.md` §9.3](ASYNC_GUIDE.md#93-provider).
 
 ### StreamCallback
 
@@ -328,7 +329,9 @@ struct CompletionParams {
 
 ### Provider
 
-Abstract base class for LLM providers. All LLM backends must implement this interface.
+Stable compatibility base class for LLM providers. Existing implementations and
+callers may continue to use this interface. New implementations should prefer
+`CompletionProvider` below.
 
 ```cpp
 class Provider {
@@ -345,16 +348,20 @@ public:
     virtual asio::awaitable<ChatCompletion>
     complete_async(const CompletionParams& params);
 
-    // Streaming completion (sync). Default body bridges to async peer.
+    // Streaming completion (sync). Default emits the collected result once.
     virtual ChatCompletion complete_stream(const CompletionParams& params,
                                            const StreamCallback& on_chunk);
 
-    // Async streaming peer. Added in audit Round 4 so async-native
-    // backends can override only this side. Default body bridges to
-    // complete_stream via run_sync.
+    // Async streaming peer. The default runs complete_stream on a worker
+    // thread and delivers callbacks on the awaiting executor.
     virtual asio::awaitable<ChatCompletion>
     complete_stream_async(const CompletionParams& params,
                           const StreamCallback& on_chunk);
+
+    // Stable callback-selected compatibility entry point.
+    virtual asio::awaitable<ChatCompletion>
+    invoke(const CompletionParams& params,
+           StreamCallback on_chunk = nullptr);
 
     // Only pure virtual on this interface — every backend must name
     // itself.
@@ -368,12 +375,50 @@ public:
 | `complete_async(params)` | Coroutine peer. Default `co_return complete(params)`. |
 | `complete_stream(params, on_chunk)` | Streaming completion. Calls `on_chunk` per chunk, returns the assembled `ChatCompletion`. |
 | `complete_stream_async(params, on_chunk)` | Async streaming peer (Round 4). Same `on_chunk` semantics. |
+| `invoke(params, on_chunk)` | Callback-selected compatibility entry point used by existing engine code. |
 | `get_name()` | Human-readable provider identifier (only pure virtual). |
 
 **Override-at-least-one-side contract**: each `(sync, async)` pair
 defaults to the other; overriding neither yields infinite mutual
 recursion at call time. Same shape as `CheckpointStore`'s sync↔async
 bridge below.
+
+These methods have no planned removal and no deprecation warnings. Compatibility
+and security fixes continue to apply; new capabilities may be exposed only through
+the explicit request API.
+
+### CompletionProvider
+
+Recommended base class for new C++ provider implementations. It preserves every
+`Provider` entry point through final adapters while giving implementations one
+request-mode-aware override.
+
+```cpp
+class MyProvider : public neograph::CompletionProvider {
+public:
+    asio::awaitable<ChatCompletion>
+    do_invoke(CompletionRequest request) override {
+        if (request.streaming()) {
+            // Use the streaming transport even when no observer is attached.
+            // If present, request.on_chunk() receives incremental text.
+        } else {
+            // Use the collect transport.
+        }
+        co_return result;
+    }
+
+    std::string get_name() const override { return "my-provider"; }
+};
+```
+
+New direct calls should make transport mode explicit:
+
+```cpp
+auto full = co_await provider.invoke_request(
+    CompletionRequest::collect(params));
+auto streamed = co_await provider.invoke_request(
+    CompletionRequest::stream(params, on_chunk));
+```
 
 ---
 
@@ -685,12 +730,17 @@ LLM provider, tools, and configuration.
 ```cpp
 struct NodeContext {
     std::shared_ptr<Provider> provider;   // LLM provider
-    std::vector<Tool*>        tools;      // Available tools (non-owning; engine owns the unique_ptrs)
+    std::vector<Tool*>        tools;      // Available tools (non-owning)
     std::string               model;      // Model override (empty = provider default)
     std::string               instructions; // System prompt / instructions
     json                      extra_config; // Additional configuration (node-type-specific)
 };
 ```
+
+For new engines, prefer moving a `ToolSet` through `EngineResources` instead
+of managing the pointees separately. `GraphEngine::build()` binds the
+corresponding non-owning view into `NodeContext` and keeps every tool alive for
+the engine's lifetime.
 
 ### GraphEvent
 
@@ -731,6 +781,26 @@ Type alias for the graph event callback used in streaming execution.
 ```cpp
 using GraphStreamCallback = std::function<void(const GraphEvent&)>;
 ```
+
+`GraphEvent` remains the stable callback and JSON-facing shape. Code that wants
+typed payloads can adapt the same stream without changing the engine entry
+point:
+
+```cpp
+using TypedGraphEvent = std::variant<NodeStartEvent, NodeEndEvent,
+    LlmTokenEvent, ChannelWriteEvent, StateSnapshotEvent, RoutingEvent,
+    SendDispatchEvent, InterruptEvent, ErrorEvent, RawGraphEvent>;
+
+auto callback = adapt_typed_stream([](const TypedGraphEvent& event) {
+    std::visit([](const auto& typed) {
+        // Handle NodeStartEvent, LlmTokenEvent, and the other alternatives.
+    }, event);
+});
+```
+
+`to_typed_event()` performs the conversion directly. Malformed payloads and
+payload shapes introduced by future versions become `RawGraphEvent` rather
+than throwing from the streaming callback.
 
 ### NodeResult
 
@@ -909,15 +979,14 @@ public:
 };
 ```
 
-> **Legacy chain (deprecated since v0.4, removed in v1.0).** Pre-v0.4
+> **Legacy chain (removed in v1.0).** Pre-v0.4
 > code overrode one of `execute` / `execute_async` / `execute_full` /
 > `execute_full_async` / `execute_stream` / `execute_stream_async` /
 > `execute_full_stream` / `execute_full_stream_async`. Picking the
 > wrong one silently dropped `Command` / `Send`, froze the event loop,
 > or infinite-recursed — that's the seam `run()` collapses. The 8
-> legacy virtuals are marked `[[deprecated]]`; existing subclasses
-> still compile and forward through the default chain. Migrate to
-> `run(NodeInput)` at your leisure.
+> legacy virtuals are no longer members of `GraphNode`; subclasses
+> migrating from an older release must implement `run(NodeInput)`.
 
 ### LLMCallNode
 
@@ -930,6 +999,7 @@ the run was started via `run_stream` / `run_stream_async`.
 class LLMCallNode : public GraphNode {
 public:
     LLMCallNode(const std::string& name, const NodeContext& ctx);
+    asio::awaitable<NodeOutput> run(NodeInput in) override;
     std::string get_name() const override;
 };
 ```
@@ -954,7 +1024,7 @@ class ToolDispatchNode : public GraphNode {
 public:
     ToolDispatchNode(const std::string& name, const NodeContext& ctx);
 
-    std::vector<ChannelWrite> execute(const GraphState& state) override;
+    asio::awaitable<NodeOutput> run(NodeInput in) override;
     std::string get_name() const override;
 };
 ```
@@ -977,7 +1047,7 @@ public:
                          const std::string& prompt,
                          std::vector<std::string> valid_routes);
 
-    std::vector<ChannelWrite> execute(const GraphState& state) override;
+    asio::awaitable<NodeOutput> run(NodeInput in) override;
     std::string get_name() const override;
 };
 ```
@@ -1002,10 +1072,7 @@ public:
                  std::shared_ptr<GraphEngine> subgraph,
                  std::map<std::string, std::string> input_map = {},
                  std::map<std::string, std::string> output_map = {});
-
-    std::vector<ChannelWrite> execute(const GraphState& state) override;
-    std::vector<ChannelWrite> execute_stream(
-        const GraphState& state, const GraphStreamCallback& cb) override;
+    asio::awaitable<NodeOutput> run(NodeInput in) override;
     std::string get_name() const override;
 };
 ```
@@ -1029,6 +1096,35 @@ If the maps are empty, channels are mapped by name (identity mapping).
 The core execution engine. Compiles graph definitions, manages state transitions,
 and orchestrates node execution through a super-step loop.
 
+### EngineConfig and EngineResources
+
+New code should assemble construction dependencies and policies before creating
+the engine:
+
+```cpp
+struct EngineConfig {
+    NodeContext node_context;
+    std::shared_ptr<CheckpointStore> checkpoint_store;
+    std::shared_ptr<Store> store;
+    std::optional<RetryPolicy> retry_policy;
+    std::map<std::string, RetryPolicy> node_retry_policies;
+    ToolGate tool_gate;
+    std::size_t worker_count = 1;
+    std::set<std::string> cached_nodes;
+};
+
+struct EngineResources {
+    ToolSet tools;
+    std::shared_ptr<const GraphRegistry> registry;
+};
+```
+
+`ToolSet` is a move-only owner for a fixed tool collection. `GraphRegistry` is
+a per-engine reducer, condition, and node-factory overlay; names absent from the
+overlay fall back to the existing process-global registries. Configure both
+before passing them to `build()` or `link()`. Runtime mutation is intentionally
+not part of the local-registry contract.
+
 ### RunConfig
 
 Configuration for a single graph execution run.
@@ -1040,6 +1136,7 @@ struct RunConfig {
     int                         max_steps    = 50;
     StreamMode                  stream_mode  = StreamMode::ALL;
     std::shared_ptr<CancelToken> cancel_token;          // v0.3+
+    std::shared_ptr<UsageAccumulator> usage;             // optional accumulator
     bool                        resume_if_exists = false; // v0.3.1+
 };
 ```
@@ -1051,33 +1148,41 @@ struct RunConfig {
 | `max_steps` | `int` | `50` | Maximum number of super-steps before forced termination (prevents infinite loops) |
 | `stream_mode` | `StreamMode` | `ALL` | Bitfield controlling which event types are emitted during streaming |
 | `cancel_token` | `std::shared_ptr<CancelToken>` | `nullptr` | Cooperative cancel handle. Engine wraps this into a `RunContext` and threads it to every node's `run(NodeInput)` call as `in.ctx.cancel_token` |
+| `usage` | `std::shared_ptr<UsageAccumulator>` | `nullptr` | Optional token accumulator. The engine creates one when omitted and exposes the active accumulator as `in.ctx.usage` |
 | `resume_if_exists` | `bool` | `false` | If `true` and a checkpoint exists for `thread_id`, seed from it before applying `input` (multi-turn chat shape) |
 
 ### RunContext (v0.4 PR 1, exposed to nodes via `NodeInput.ctx`)
 
-Per-run dispatch metadata threaded by the engine. Constructed from
-`RunConfig`; consumed inside a node's `run(NodeInput) -> NodeOutput`
-override via `in.ctx`.
+Per-run dispatch metadata threaded by the engine. Constructed from `RunConfig`
+(with a new usage accumulator when none was supplied), the engine's Store,
+and an optional resume value. Nodes consume it inside a
+`run(NodeInput) -> NodeOutput` override via `in.ctx`.
 
 ```cpp
 struct RunContext {
     std::shared_ptr<CancelToken>  cancel_token;
-    std::optional<Deadline>       deadline;     // reserved
+    std::shared_ptr<UsageAccumulator> usage;
+    std::optional<std::chrono::steady_clock::time_point> deadline; // reserved
     std::string                   trace_id;     // reserved
     std::string                   thread_id;
     int                           step;
     StreamMode                    stream_mode;
+    std::optional<json>           resume_value;
+    std::shared_ptr<Store>        store;
 };
 ```
 
 | Field | Description |
 |-------|-------------|
 | `cancel_token` | The active token. Pass to `provider.complete(params)` so an LLM HTTP socket aborts on cancel, or poll `is_cancelled()` for your own loops |
+| `usage` | Shared token-accounting sink populated by the engine |
 | `deadline` | Reserved (no `RunConfig.deadline` field yet) |
 | `trace_id` | Reserved for OTel integration |
 | `thread_id` | Mirror of `RunConfig.thread_id` |
 | `step` | Current super-step index, updated each iteration |
 | `stream_mode` | Mirror of `RunConfig.stream_mode` |
+| `resume_value` | Value supplied to `GraphEngine::resume()`, or empty on a fresh run |
+| `store` | Store installed on the engine, or `nullptr` when none is configured |
 
 ### CancelToken
 
@@ -1085,6 +1190,16 @@ Cooperative cancel primitive shared between caller and engine. Construct
 via `std::make_shared<CancelToken>()`, hand to `RunConfig.cancel_token`,
 and call `cancel()` from any thread to abort the in-flight run —
 including the LLM HTTP socket if a node is mid-`provider.complete_async`.
+Each engine run forks its own operation child, so one parent can safely cancel
+multiple concurrent runs without sharing an asio cancellation slot.
+
+Engine operation children retain themselves until their posted cancellation
+emit executes. If application code calls `bind_executor()` directly on a token
+it constructed itself, the application must keep that token alive until the
+executor drains; the engine cannot supply ownership for an external object.
+Because these methods are inline in the public header, existing C++ consumers
+must be recompiled to receive the updated `fork()` lifetime behavior. The
+`CancelToken` object layout remains binary-compatible with 0.11.x.
 
 ```cpp
 class CancelToken {
@@ -1153,6 +1268,14 @@ struct RunResult {
     json        interrupt_value;                 // Value associated with the interrupt
     std::string checkpoint_id;                   // ID of the last checkpoint saved
     std::vector<std::string> execution_trace;    // Ordered list of executed node names
+
+    bool max_steps_exhausted() const noexcept;    // Limit stopped runnable work
+    RunStatus status() const noexcept;            // Completed, Interrupted, or StepLimit
+
+    template <typename T> T channel(const std::string& name) const;
+    template <typename T> T channel(const ChannelKey<T>& key) const;
+    template <typename T>
+    std::optional<T> try_channel(const ChannelKey<T>& key) const;
 };
 ```
 
@@ -1165,18 +1288,58 @@ struct RunResult {
 | `checkpoint_id` | `std::string` | UUID of the last saved checkpoint |
 | `execution_trace` | `std::vector<std::string>` | Ordered list of node names in execution order |
 
+`max_steps_exhausted()` returns `true` only when the step ceiling stopped the
+run while runnable work remained. A graph that reaches `__end__` exactly on its
+last permitted step returns `false`.
+
+`status()` returns `RunStatus::Completed`, `RunStatus::Interrupted`, or
+`RunStatus::StepLimit` without changing the public `RunResult` data layout.
+`ChannelKey<T>` binds a reusable channel name to its expected C++ type:
+
+```cpp
+inline const ChannelKey<std::string> Answer{"answer"};
+
+auto answer = result.channel(Answer);
+if (auto optional = result.try_channel(Answer)) {
+    std::cout << *optional << '\n';
+}
+```
+
 ### GraphEngine
 
-The main engine class. Created via the static `compile()` method.
+The main engine class. New code should use `build_strict()` for a JSON definition;
+it rejects invalid topology before any node is instantiated. Use `link()` with a
+`ValidatedTopology` when parse, validation, inspection, or transformation must be
+separate steps. The lenient `build()`, `CompiledGraph` link overloads, `compile()`,
+and post-construction setters remain compatibility paths.
 
 ```cpp
 class GraphEngine {
 public:
     // ---- Construction ----
 
-    static std::unique_ptr<GraphEngine> compile(
-        const json& definition,
-        const NodeContext& default_context,
+    static std::unique_ptr<GraphEngine> build(
+        const json& definition, EngineConfig config);
+    static std::unique_ptr<GraphEngine> build(
+        const json& definition, EngineConfig config, EngineResources resources);
+
+    static std::unique_ptr<GraphEngine> build_strict(
+        const json& definition, EngineConfig config);
+    static std::unique_ptr<GraphEngine> build_strict(
+        const json& definition, EngineConfig config, EngineResources resources);
+
+    static std::unique_ptr<GraphEngine> link(
+        ValidatedTopology topology, EngineConfig config = {});
+    static std::unique_ptr<GraphEngine> link(
+        ValidatedTopology topology, EngineConfig config, EngineResources resources);
+
+    static std::unique_ptr<GraphEngine> link(
+        CompiledGraph graph, EngineConfig config = {});
+    static std::unique_ptr<GraphEngine> link(
+        CompiledGraph graph, EngineConfig config, EngineResources resources);
+
+    static std::unique_ptr<GraphEngine> compile( // compatibility facade
+        const json& definition, const NodeContext& default_context,
         std::shared_ptr<CheckpointStore> store = nullptr);
 
     // ---- Execution (sync) ----
@@ -1204,6 +1367,8 @@ public:
 
     // ---- State Inspection & Manipulation ----
 
+    GraphAdmin admin(); // borrowed facade; must not outlive this engine
+
     std::optional<json> get_state(const std::string& thread_id) const;
 
     std::vector<Checkpoint> get_state_history(const std::string& thread_id,
@@ -1217,7 +1382,7 @@ public:
                      const std::string& new_thread_id,
                      const std::string& checkpoint_id = "");
 
-    // ---- Configuration ----
+    // ---- Compatibility configuration (prefer EngineConfig/EngineResources) ----
 
     void own_tools(std::vector<std::unique_ptr<Tool>> tools);
     void set_checkpoint_store(std::shared_ptr<CheckpointStore> store);
@@ -1228,16 +1393,15 @@ public:
 
     // Fan-out worker pool. n==1 keeps the engine on the caller's
     // executor (no engine-owned thread_pool); n>=2 installs an
-    // owned `asio::thread_pool` of size n. compile() defaults to
-    // n==1 — call this (or set_worker_count_auto()) to opt into
+    // owned `asio::thread_pool` of size n. build() defaults to
+    // n==1 — prefer EngineConfig::worker_count to opt into
     // real parallel fan-out. Throws `std::logic_error` if called
     // while a run is in flight (Round 3 guard — `active_runs_`
     // counter prevents tasks queued on the old pool from being
     // silently dropped on swap).
     void set_worker_count(std::size_t n);
 
-    // Convenience: set_worker_count(hardware_concurrency()). compile()
-    // does NOT call this — its default is set_worker_count(1).
+    // Compatibility convenience: set_worker_count(hardware_concurrency()).
     void set_worker_count_auto();
 
     // Per-node result caching. Disabled by default; opt in per node.
@@ -1249,7 +1413,36 @@ public:
 };
 ```
 
-#### `compile`
+#### `build` and `link`
+
+```cpp
+EngineConfig config;
+config.node_context.provider = provider;
+config.checkpoint_store = checkpoint_store;
+config.store = store;
+config.worker_count = 4;
+config.cached_nodes.insert("retrieve");
+
+std::vector<std::unique_ptr<Tool>> owned_tools;
+owned_tools.push_back(std::make_unique<SearchTool>());
+auto registry = std::make_shared<GraphRegistry>();
+// Register engine-local reducers, conditions, or node types on registry.
+
+EngineResources resources{
+    .tools = ToolSet(std::move(owned_tools)),
+    .registry = registry,
+};
+
+auto engine = GraphEngine::build(definition, std::move(config),
+                                 std::move(resources));
+```
+
+`build()` compiles, verifies, links, and returns a fully configured engine.
+`link()` consumes a `CompiledGraph` by move and applies runtime configuration;
+callers that compile manually remain responsible for any source-to-IR
+round-trip verification they require.
+
+#### `compile` (compatibility)
 
 ```cpp
 static std::unique_ptr<GraphEngine> compile(
@@ -1259,6 +1452,9 @@ static std::unique_ptr<GraphEngine> compile(
 ```
 
 Compiles a graph from a JSON definition and returns an engine ready for execution.
+This original signature is preserved and delegates to `build()`. Prefer
+`EngineConfig` when new code needs stores, retry policy, worker configuration,
+caching, or a tool gate.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -1271,14 +1467,14 @@ Compiles a graph from a JSON definition and returns an engine ready for executio
 ```json
 {
   "name": "my_graph",
-  "channels": [
-    {"name": "messages", "type": "append"},
-    {"name": "status", "type": "overwrite", "initial": "idle"}
-  ],
-  "nodes": [
-    {"name": "llm", "type": "llm_call"},
-    {"name": "tools", "type": "tool_dispatch"}
-  ],
+  "channels": {
+    "messages": {"reducer": "append"},
+    "status": {"reducer": "overwrite", "initial": "idle"}
+  },
+  "nodes": {
+    "llm": {"type": "llm_call"},
+    "tools": {"type": "tool_dispatch"}
+  },
   "edges": [
     {"from": "__start__", "to": "llm"},
     {"from": "tools", "to": "llm"}
@@ -1476,7 +1672,8 @@ Returns the name of the graph as specified in the definition.
 
 `GraphEngine` is a thin orchestrator that delegates to four purpose-built
 classes. Users typically never touch them directly — they are instantiated
-inside `GraphEngine::compile()` and driven from `execute_graph()` — but
+inside `GraphEngine::build()` (or its `compile()` compatibility facade) and
+driven from `execute_graph()` — but
 they are public so advanced callers can build without JSON, drive custom
 checkpoint flows, or stub pieces in tests.
 
@@ -1519,6 +1716,9 @@ struct CompiledGraph {
 
 class GraphCompiler {
 public:
+    static TopologySpec parse(const json& definition);
+    static CompiledGraph link(TopologySpec topology,
+                              const NodeContext& default_context);
     static CompiledGraph compile(const json& definition,
                                  const NodeContext& default_context);
 };
@@ -1526,10 +1726,19 @@ public:
 } // namespace neograph::graph
 ```
 
-`GraphEngine::compile()` calls `GraphCompiler::compile()` then moves
-every field of the result into the engine's runtime home. Parsing
-failures (malformed edge, unknown node type) surface here before any
-runtime state is built.
+`GraphCompiler::parse()` produces a `TopologySpec` without constructing nodes.
+`GraphValidator::validate()` returns structured diagnostics, while
+`GraphValidator::require_valid()` returns a `ValidatedTopology` or throws
+`std::runtime_error`. Only `GraphCompiler::link()` resolves factories and
+instantiates runtime nodes. `compile()` remains the compatibility composition of
+parse and link, and `GraphEngine::build()` retains its lenient warning behavior.
+New code can enforce the full boundary with `GraphEngine::build_strict()` or:
+
+```cpp
+auto spec = GraphCompiler::parse(definition);
+auto validated = GraphValidator::require_valid(std::move(spec));
+auto engine = GraphEngine::link(std::move(validated), config, resources);
+```
 
 ### Scheduler
 
@@ -1773,10 +1982,9 @@ struct Checkpoint {
 };
 
 // Wire-stable schema version. Bump on layout-incompatible changes.
-// Currently 2 (added `barrier_state`). Typed `uint32_t` (Round 5
-// fix — was a platform-variable `int` round-tripping through JSON,
-// which left an undocumented door for `-1` sentinel values).
-constexpr std::uint32_t CHECKPOINT_SCHEMA_VERSION = 2;
+// v2 added `barrier_state`; v3 records pending-write mode support.
+// Typed `uint32_t`: schema versions are non-negative wire values.
+constexpr std::uint32_t CHECKPOINT_SCHEMA_VERSION = 3;
 ```
 
 | Field | Type | Description |
@@ -1793,19 +2001,19 @@ constexpr std::uint32_t CHECKPOINT_SCHEMA_VERSION = 2;
 | `metadata` | `json` | Arbitrary user-defined data |
 | `step` | `int64_t` | Super-step counter |
 | `timestamp` | `int64_t` | Creation time in Unix epoch milliseconds |
-| `schema_version` | `std::uint32_t` | On-wire layout version (see `CHECKPOINT_SCHEMA_VERSION`, currently `2`). Round 5 widened this from `int` to fixed-width unsigned — schema versions are non-negative and a platform-variable `int` width was wrong for a value persisted to disk and round-tripped through JSON. Persistent `CheckpointStore` implementations should serialize it and treat `0` on a deserialized blob as "pre-versioned" (e.g. the field was absent — migration is the caller's responsibility) |
+| `schema_version` | `std::uint32_t` | On-wire layout version (see `CHECKPOINT_SCHEMA_VERSION`, currently `3`). Round 5 widened this from `int` to fixed-width unsigned — schema versions are non-negative and a platform-variable `int` width was wrong for a value persisted to disk and round-tripped through JSON. Persistent `CheckpointStore` implementations should serialize it and treat `0` on a deserialized blob as "pre-versioned" (e.g. the field was absent — migration is the caller's responsibility) |
 
 ### CheckpointStore
 
 Abstract interface for checkpoint persistence. Implement this to store checkpoints
 in a database, file system, or any other backend.
 
-> **Writing a custom store?** This is a fat interface (5 sync core +
-> 5 async peers + 3 sync pending-writes + 3 async pending-writes =
-> **16 virtuals**). Defaults bridge sync↔async in both directions
-> (sync calls `run_sync(async)`; async calls `execute_in_pool(sync)`)
-> so a backend can override only one side per method — but
-> overriding NEITHER yields infinite mutual recursion at call time.
+> **Writing a custom store?** New implementations should implement the smallest
+> applicable capability: `CheckpointStoreCore`, optionally
+> `AsyncCheckpointStore` and/or `PendingWritesCheckpointStore`, then pass it
+> through `adapt_checkpoint_store()`. The existing `CheckpointStore` interface
+> remains the compatibility contract. Its async defaults invoke the sync methods;
+> a sync-only backend therefore remains valid, but its async calls are blocking.
 > See [`ASYNC_GUIDE.md` §9.4](ASYNC_GUIDE.md#94-checkpointstore).
 
 ```cpp
@@ -1989,9 +2197,10 @@ public:
 **Header:** `<neograph/graph/loader.h>`
 **Namespace:** `neograph::graph`
 
-Singleton registries for reducers, conditions, and node types. These enable
-JSON-driven graph construction: the `GraphEngine::compile()` method looks up
-components by name from these registries.
+Legacy singleton registries for reducers, conditions, and node types. These
+remain the process-global fallback for JSON-driven graph construction. New
+code can pass a `GraphRegistry` through `EngineResources`; its local entries
+take precedence while missing names continue to resolve here.
 
 ### ReducerRegistry
 
@@ -2680,9 +2889,9 @@ available tools, and wraps them as NeoGraph `Tool` instances.
 
 Two transports are available:
 
-- **HTTP** — `MCPClient("http://host:port")`. Each tool call opens a short-lived
-  session against the server (Streamable HTTP transport, `Mcp-Session-Id` header
-  echoed per-request).
+- **HTTP** — `MCPClient("http://host:port")`. Discovered tools retain the
+  originating Streamable HTTP session, including `Mcp-Session-Id`, negotiated
+  protocol version, timeout, and custom headers.
 - **stdio** — `MCPClient({"python", "server.py"})`. The client `fork`+`execvp`s the
   subprocess, wires bidirectional pipes, and exchanges newline-delimited JSON-RPC
   over the child's stdin/stdout. The subprocess lives as long as the
@@ -2695,9 +2904,9 @@ Wraps a single MCP server tool as a local `Tool` implementation. Two
 constructors, one per transport; `MCPClient::get_tools()` picks the right one.
 
 ```cpp
-class MCPTool : public Tool {
+class MCPTool : public AsyncTool {
 public:
-    // HTTP mode — each execute() opens a fresh session against server_url.
+    // Legacy direct-construction mode. Discovered tools reuse their client session.
     MCPTool(const std::string& server_url,
             const std::string& name,
             const std::string& description,
@@ -2710,8 +2919,11 @@ public:
             const std::string& description,
             const json& input_schema);
 
-    ChatTool   get_definition() const override;
-    std::string execute(const json& arguments) override;
+    const ToolDefinition& get_mcp_definition() const noexcept;
+    CallToolResult execute_result(const json& arguments);
+    asio::awaitable<CallToolResult> execute_result_async(const json& arguments);
+    ChatTool get_definition() const override;
+    asio::awaitable<std::string> execute_async(const json& arguments) override;
     std::string get_name() const override;
 };
 ```
@@ -2733,19 +2945,22 @@ class MCPClient {
 public:
     // HTTP transport.
     explicit MCPClient(const std::string& server_url);
+    MCPClient(const std::string& server_url, MCPClientConfig config);
 
     // stdio transport — fork+exec the subprocess.
     explicit MCPClient(std::vector<std::string> argv);
 
     bool initialize(const std::string& client_name = "neograph");
+    bool is_initialized() const noexcept;
+    InitializeResult get_initialize_result() const;
     std::vector<std::unique_ptr<Tool>> get_tools();
+    ListToolsPage list_tools(std::optional<std::string> cursor = std::nullopt);
+    std::vector<ToolDefinition> get_tool_definitions();
     json call_tool(const std::string& name, const json& arguments);
+    CallToolResult call_tool_result(const std::string& name,
+                                    const json& arguments);
 
-    // Lower-level: arbitrary JSON-RPC method dispatch. Used internally
-    // by initialize / get_tools / call_tool; exposed for callers that
-    // want to drive a non-tool MCP method (resources/list,
-    // prompts/list, etc.) without breaking out of NeoGraph's transport.
-    json rpc_call(const std::string& method, const json& params);
+    // Low-level async dispatch retained for source compatibility.
     asio::awaitable<json>
     rpc_call_async(const std::string& method, const json& params);
 };
@@ -2762,10 +2977,13 @@ versions may reject these requests — pin server-side or upgrade.
 |--------|-------------|
 | `MCPClient(url)` | Construct an HTTP-mode client |
 | `MCPClient(argv)` | Spawn a subprocess and construct a stdio-mode client. `argv[0]` is resolved via `PATH` (execvp). Throws on fork/exec failure. Refuses Windows `.bat`/`.cmd` for safety (Round 3 hardening) |
-| `initialize(client_name)` | Perform the MCP initialization handshake. Returns `true` on success. Must be called before `get_tools()` or `call_tool()` |
-| `get_tools()` | Discovers tools from the server and returns them as `std::unique_ptr<Tool>` instances ready for use with `Agent` or `GraphEngine` |
+| `initialize(client_name)` | Perform the MCP initialization handshake once. Repeated calls are idempotent; protocol/transport failures throw |
+| `get_initialize_result()` | Return negotiated protocol, capabilities, server info, instructions, and raw result |
+| `list_tools(cursor)` | Fetch one page while treating the cursor as opaque |
+| `get_tool_definitions()` | Follow all pages and preserve complete tool metadata |
+| `get_tools()` | Discover all pages and return session-preserving `MCPTool` instances |
 | `call_tool(name, arguments)` | Invokes a tool by name with the given arguments. Returns the raw JSON response |
-| `rpc_call(method, params)` | Arbitrary JSON-RPC method on the same transport. Sync facade over `rpc_call_async`. |
+| `call_tool_result(name, arguments)` | Typed result preserving content, structured content, `isError`, and `_meta` |
 | `rpc_call_async(method, params)` | Coroutine version. The "real" implementation — `rpc_call` is a thin sync wrapper. |
 
 **HTTP usage:**
@@ -2912,22 +3130,16 @@ int main() {
     tools.push_back(std::make_unique<SearchTool>());
     tools.push_back(std::make_unique<CalculatorTool>());
 
-    // Build tool pointer list for NodeContext
-    std::vector<neograph::Tool*> tool_ptrs;
-    for (auto& t : tools) tool_ptrs.push_back(t.get());
-
-    NodeContext ctx{provider, tool_ptrs, "gpt-4o", "You are a helpful assistant."};
-
     json definition = {
         {"name", "assistant_graph"},
-        {"channels", json::array({
-            {{"name", "messages"}, {"type", "append"}},
-            {{"name", "status"},   {"type", "overwrite"}, {"initial", "idle"}}
-        })},
-        {"nodes", json::array({
-            {{"name", "llm"},   {"type", "llm_call"}},
-            {{"name", "tools"}, {"type", "tool_dispatch"}}
-        })},
+        {"channels", {
+            {"messages", {{"reducer", "append"}}},
+            {"status",   {{"reducer", "overwrite"}, {"initial", "idle"}}}
+        }},
+        {"nodes", {
+            {"llm",   {{"type", "llm_call"}}},
+            {"tools", {{"type", "tool_dispatch"}}}
+        }},
         {"edges", json::array({
             {{"from", "__start__"}, {"to", "llm"}},
             {{"from", "tools"},     {"to", "llm"}}
@@ -2940,8 +3152,14 @@ int main() {
     };
 
     auto store = std::make_shared<InMemoryCheckpointStore>();
-    auto engine = GraphEngine::compile(definition, ctx, store);
-    engine->own_tools(std::move(tools));
+    EngineConfig engine_config;
+    engine_config.node_context.provider = provider;
+    engine_config.node_context.model = "gpt-4o";
+    engine_config.node_context.instructions = "You are a helpful assistant.";
+    engine_config.checkpoint_store = store;
+    EngineResources resources{.tools = ToolSet(std::move(tools))};
+    auto engine = GraphEngine::build(definition, std::move(engine_config),
+                                     std::move(resources));
 
     RunConfig config;
     config.thread_id = "session-1";
@@ -2964,7 +3182,10 @@ Using interrupts for human approval:
 
 ```cpp
 auto store = std::make_shared<InMemoryCheckpointStore>();
-auto engine = GraphEngine::compile(definition, ctx, store);
+EngineConfig engine_config;
+engine_config.node_context = ctx;
+engine_config.checkpoint_store = store;
+auto engine = GraphEngine::build(definition, std::move(engine_config));
 
 // Configure interrupt after the "tools" node
 // (set "interrupt_after": ["tools"] in the JSON definition)
@@ -3001,17 +3222,16 @@ class FanOutNode : public GraphNode {
 public:
     std::string get_name() const override { return "fan_out"; }
 
-    // Override execute_full to return Send directives
-    NodeResult execute_full(const GraphState& state) override {
-        auto items = state.get("items");
-        NodeResult result;
+    asio::awaitable<NodeOutput> run(NodeInput in) override {
+        auto items = in.state.get("items");
+        NodeOutput result;
         for (const auto& item : items) {
             result.sends.push_back(Send{
                 "process_item",       // target node
                 {{"item", item}}      // input for that invocation
             });
         }
-        return result;
+        co_return result;
     }
 };
 ```
@@ -3029,11 +3249,11 @@ class RouterNode : public GraphNode {
 public:
     std::string get_name() const override { return "router"; }
 
-    NodeResult execute_full(const GraphState& state) override {
-        auto messages = state.get_messages();
+    asio::awaitable<NodeOutput> run(NodeInput in) override {
+        auto messages = in.state.get_messages();
         auto last = messages.back().content;
 
-        NodeResult result;
+        NodeOutput result;
 
         if (last.find("urgent") != std::string::npos) {
             result.command = Command{
@@ -3047,7 +3267,7 @@ public:
             };
         }
 
-        return result;
+        co_return result;
     }
 };
 ```
@@ -3177,7 +3397,12 @@ defaults. **Full reference:**
 `<neograph/graph/sqlite_checkpoint.h>`
 `PostgresCheckpointStore` — libpq-based, 3-table schema (`neograph_*`)
 with channel-blob deduplication keyed on
-`(thread_id, channel, version)`; LangGraph `PostgresSaver` parity.
+`(thread_id, channel, version)`; LangGraph `PostgresSaver` parity. Async
+initial/replacement connections use one global deadline across all hosts:
+positive `connect_timeout` written directly in the connection string (minimum
+2s), otherwise a 30s safety default. Environment and service-file timeout
+values are not available before initial connection setup and use that default.
+Synchronous libpq connection timeout behavior is unchanged.
 `SqliteCheckpointStore` — same shape, single-file backend, fits the
 edge / single-host deployments.
 **Full reference:**
@@ -3195,7 +3420,8 @@ edge / single-host deployments.
   coroutine-shaped (HTTP fetch, MCP call). Sync `execute()` is
   `final`-routed through `run_sync`.
 - **`neograph::graph::NodeCache`** — per-node memoization, opt-in
-  via `engine->set_node_cache_enabled(name, true)`.
+  at construction via `EngineConfig::cached_nodes` (the setter remains a
+  compatibility surface).
 - **`neograph::graph::create_deep_research_graph`** —
   open_deep_research-style supervisor + sub-researcher fan-out,
   used by `examples/25_deep_research.cpp`. Round 2 audit added

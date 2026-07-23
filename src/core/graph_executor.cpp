@@ -1,24 +1,27 @@
-#include <neograph/graph/executor.h>
-#include <neograph/graph/engine.h>   // RunContext (forward-declared in executor.h)
-#include <neograph/graph/state.h>
-#include <neograph/graph/loader.h>
 #include <neograph/graph/cancel.h>
+#include <neograph/graph/engine.h>  // RunContext (forward-declared in executor.h)
+#include <neograph/graph/executor.h>
+#include <neograph/graph/loader.h>
+#include <neograph/graph/registry.h>
+#include <neograph/graph/state.h>
 
 #include <asio/co_spawn.hpp>
 #include <asio/deferred.hpp>
+#include <asio/error.hpp>
 #include <asio/experimental/parallel_group.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
-#include <cstring>
-#include <random>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
@@ -67,21 +70,31 @@ inline std::string make_send_task_id(int step, size_t idx,
 // NodeExecutor construction + helpers
 // =========================================================================
 
-NodeExecutor::NodeExecutor(
-    const std::map<std::string, std::unique_ptr<GraphNode>>& nodes,
-    const std::vector<ChannelDef>& channel_defs,
-    RetryPolicyLookup retry_policy_for,
-    asio::thread_pool* fan_out_pool,
-    NodeCache* node_cache)
+NodeExecutor::NodeExecutor(const std::map<std::string, std::unique_ptr<GraphNode>>& nodes,
+                           const std::vector<ChannelDef>&                           channel_defs,
+                           RetryPolicyLookup  retry_policy_for,
+                           asio::thread_pool* fan_out_pool,
+                           NodeCache*         node_cache)
+    : NodeExecutor(
+          nodes, channel_defs, std::move(retry_policy_for), nullptr, fan_out_pool, node_cache) {}
+
+NodeExecutor::NodeExecutor(const std::map<std::string, std::unique_ptr<GraphNode>>& nodes,
+                           const std::vector<ChannelDef>&                           channel_defs,
+                           RetryPolicyLookup                    retry_policy_for,
+                           std::shared_ptr<const GraphRegistry> registry,
+                           asio::thread_pool*                   fan_out_pool,
+                           NodeCache*                           node_cache)
     : nodes_(nodes),
       channel_defs_(channel_defs),
       retry_policy_for_(std::move(retry_policy_for)),
+      registry_(std::move(registry)),
       fan_out_pool_(fan_out_pool),
       node_cache_(node_cache) {}
 
 void NodeExecutor::init_state(GraphState& state) const {
     for (const auto& cd : channel_defs_) {
-        auto reducer = ReducerRegistry::instance().get(cd.reducer_name);
+        auto reducer = registry_ ? registry_->reducer(cd.reducer_name)
+                                 : ReducerRegistry::instance().get(cd.reducer_name);
         json initial = cd.initial_value;
         if (cd.type == ReducerType::APPEND && initial.is_null()) {
             initial = json::array();
@@ -92,7 +105,7 @@ void NodeExecutor::init_state(GraphState& state) const {
 
 void NodeExecutor::maybe_warn_serial_fanout(std::size_t width) const {
     // Only relevant when the engine has no owned pool — that's the
-    // compile() default (set_worker_count(1)) and the case where a
+    // build() default (EngineConfig::worker_count == 1) and the case where a
     // fan-out of width >= 2 silently runs sequentially. With a pool
     // installed, real parallelism is in effect and nothing to warn
     // about.
@@ -127,11 +140,11 @@ void NodeExecutor::maybe_warn_serial_fanout(std::size_t width) const {
     std::ostringstream oss;
     oss << "[neograph] warning: fan-out of width " << width
         << " is executing serially on a single thread because no "
-        << "engine-owned worker pool is installed (compile() default "
-        << "is set_worker_count(1)).\n"
-        << "    Call engine->set_worker_count_auto() or "
-        << "engine->set_worker_count(N) once after compile() and "
-        << "before run() to enable real parallel fan-out.\n"
+        << "engine-owned worker pool is installed (build() default "
+        << "is EngineConfig::worker_count == 1).\n"
+        << "    Set EngineConfig::worker_count before build(), or call "
+           "set_worker_count(N) / set_worker_count_auto() before the first run(), "
+           "to enable real parallel fan-out.\n"
         << "    Suppress this warning with the environment variable "
         << "NEOGRAPH_SUPPRESS_FANOUT_WARNING=1.\n";
     std::fputs(oss.str().c_str(), stderr);
@@ -200,11 +213,31 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
 
     auto ex = co_await asio::this_coro::executor;
 
+    auto throw_node_error = [&](std::exception_ptr cause, int attempts) -> void {
+        if (cb && has_mode(stream_mode, StreamMode::EVENTS)) {
+            std::string what = "unknown";
+            try { std::rethrow_exception(cause); }
+            catch (const std::exception& e) { what = e.what(); }
+            catch (...) {}
+            cb(GraphEvent{GraphEvent::Type::ERROR, node_name,
+                          json{{"error", what}, {"attempts", attempts}}});
+        }
+        try {
+            std::rethrow_exception(cause);
+        } catch (const NodeExecutionError&) {
+            // A subgraph may fail inside this node. The outer retry policy has
+            // now been honored; keep the innermost dispatch context intact.
+            throw;
+        } catch (...) {}
+        throw NodeExecutionError(node_name, attempts, std::move(cause));
+    };
+
     for (int attempt = 0; attempt <= policy.max_retries; ++attempt) {
         if (cb && has_mode(stream_mode, StreamMode::EVENTS)) {
             json data;
             if (attempt > 0) data["retry_attempt"] = attempt;
-            cb(GraphEvent{GraphEvent::Type::NODE_START, node_name, data});
+            cb(GraphEvent{GraphEvent::Type::NODE_START, node_name,
+                          std::move(data)});
         }
 
         // Capture the outcome of one attempt without co_await inside a
@@ -238,6 +271,16 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
             // cancel flag, the second HTTP call would slip through,
             // and the cost leak would persist for max_retries × ~3 s.
             throw;
+        } catch (const asio::system_error& error) {
+            // Socket/timer cancellation enters node code as
+            // operation_aborted. Once this operation's token is set, that is
+            // cancellation control flow, not a retryable transport failure.
+            if (ctx.cancel_token && ctx.cancel_token->is_cancelled() &&
+                error.code() == asio::error::operation_aborted) {
+                throw CancelledException(
+                    "node " + node_name + " operation aborted");
+            }
+            retryable_err = std::current_exception();
         } catch (const std::bad_alloc&) {
             // OOM is not retryable. Sleeping then re-running won't
             // free memory; it just delays the inevitable failure
@@ -250,7 +293,7 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
             // violations. Retrying produces the same bug. Surface
             // immediately so the bug shows up loud rather than as
             // a slow retry-exhaustion timeout.
-            throw;
+            throw_node_error(std::current_exception(), attempt + 1);
         } catch (...) {
             // runtime_error, network/timeout errors, third-party
             // exceptions: assume transient and let the retry loop
@@ -273,7 +316,8 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
                         end_data["command_goto"] = nr.command->goto_node;
                     if (!nr.sends.empty())
                         end_data["sends"] = (int)nr.sends.size();
-                    cb(GraphEvent{GraphEvent::Type::NODE_END, node_name, end_data});
+                    cb(GraphEvent{GraphEvent::Type::NODE_END, node_name,
+                                  std::move(end_data)});
                 }
             }
             if (cache_eligible) {
@@ -285,15 +329,7 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
         // Retry path. retryable_err must be populated since neither the
         // result nor a NodeInterrupt path was taken.
         if (attempt >= policy.max_retries) {
-            if (cb && has_mode(stream_mode, StreamMode::EVENTS)) {
-                std::string what;
-                try { std::rethrow_exception(retryable_err); }
-                catch (const std::exception& e) { what = e.what(); }
-                catch (...) { what = "unknown"; }
-                cb(GraphEvent{GraphEvent::Type::ERROR, node_name,
-                              json{{"error", what}, {"attempts", attempt + 1}}});
-            }
-            std::rethrow_exception(retryable_err);
+            throw_node_error(retryable_err, attempt + 1);
         }
 
         if (cb && has_mode(stream_mode, StreamMode::DEBUG)) {
@@ -659,7 +695,8 @@ asio::awaitable<std::vector<StepRouting>> NodeExecutor::run_sends_async(
         }
         json data;
         data["sends"] = send_info;
-        cb(GraphEvent{GraphEvent::Type::NODE_START, "__send__", data});
+        cb(GraphEvent{GraphEvent::Type::NODE_START, "__send__",
+                      std::move(data)});
     }
 
     // --- Single Send: sequential on shared state, with retry. ---

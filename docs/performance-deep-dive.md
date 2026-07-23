@@ -160,10 +160,9 @@ valgrind --tool=cachegrind --cache-sim=yes \
 
 ### Holds end-to-end with a real LLM in the loop
 
-The L3 story survives full-stack production: we point NeoGraph at a
-locally-hosted Gemma-4 E2B (Q4_K_M, 4.65 B params, 2.9 GB GGUF) served
-by [TransformerCPP](https://github.com/fox1245/TransformerCPP)'s
-OpenAI-compatible HTTP endpoint — zero NeoGraph code changes, just
+The L3 story survives full-stack production: we pointed NeoGraph at a
+locally-hosted Gemma-4 E2B (Q4_K_M, 4.65 B params, 2.9 GB GGUF) behind
+an OpenAI-compatible HTTP endpoint — zero NeoGraph code changes, just
 `OpenAIProvider::Config::base_url = "http://localhost:8090"`. See
 [`examples/31_local_transformer.cpp`](../examples/31_local_transformer.cpp).
 
@@ -186,8 +185,8 @@ split: you can swap in a 70 B model without inflating the agent.
 Burst-tested with 5 concurrent NeoGraph agents against the same server:
 aggregate wall 1.58 s / 5 requests (2.65× speedup from coroutine
 overlap). Per-agent throughput drops under queue pressure because the
-Gemma server doesn't implement continuous batching — that's a
-TransformerCPP concern, not an agent one. NeoGraph dispatched all 5
+Gemma server didn't implement continuous batching — that's an
+inference-server concern, not an agent one. NeoGraph dispatched all 5
 cleanly with no resource pressure and the RSS stayed flat at ~7 MB.
 
 ---
@@ -306,10 +305,9 @@ Linux host with a matching libc and it runs.
 | Dynamic dependencies | `libc.so.6` only |
 
 `example_plan_executor` sleeps 120 ms per Send target to simulate an
-LLM call; the 5-way fan-out runs serially on the default
-single-threaded super-step loop. Call `engine->set_worker_count(N)`
-after `compile()` for multi-threaded fan-out (cuts this demo's wall
-time roughly in half on a 2-core host). Steady-state RSS is unaffected.
+LLM call. The example opts into a hardware-sized fan-out pool through
+`EngineConfig::worker_count` before `GraphEngine::build()`, so the five
+targets execute concurrently. Steady-state RSS is unaffected.
 
 ```bash
 cmake -B build-minsize -S . \

@@ -1,9 +1,11 @@
 add_executable(neograph_tests
     test_graph_state.cpp
     test_graph_engine.cpp
+    test_engine_config.cpp
     test_checkpoint.cpp
     test_store.cpp
     test_node.cpp
+    test_node_header.cpp
     test_loader.cpp
     test_schema_export.cpp
     test_json_path.cpp
@@ -53,8 +55,10 @@ add_executable(neograph_tests
     test_async_http_options.cpp
     test_provider_async_default.cpp
     test_provider_invoke_default.cpp
+    test_completion_provider.cpp
     test_run_context_store.cpp
     test_run_result_channel.cpp
+    test_typed_events.cpp
     test_error_messages_friendly.cpp
     test_schema_provider_extra_fields_temperature.cpp
     test_openai_provider_async.cpp
@@ -72,7 +76,7 @@ add_executable(neograph_tests
     test_schema_provider_stream_async_outer_io.cpp
 )
 
-if(NEOGRAPH_BUILD_MCP)
+if(NEOGRAPH_BUILD_MCP_CLIENT)
     # A stdio MCP tool used from inside a graph run — the combination nothing
     # covered, and a use-after-free until the session stopped depending on an
     # io_context it does not own.
@@ -81,6 +85,22 @@ if(NEOGRAPH_BUILD_MCP)
         test_mcp_client_async.cpp
         test_mcp_stdio_async.cpp
     )
+    target_compile_definitions(neograph_tests PRIVATE NEOGRAPH_TESTS_HAVE_MCP_CLIENT)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_SERVER)
+    target_sources(neograph_tests PRIVATE
+        test_mcp_server.cpp
+        test_harness_service.cpp
+    )
+endif()
+
+if(NEOGRAPH_BUILD_MCP_HTTP_SERVER)
+    target_sources(neograph_tests PRIVATE test_mcp_http_server.cpp)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_CLIENT AND NEOGRAPH_BUILD_MCP_SERVER)
+    target_sources(neograph_tests PRIVATE test_harness_mcp_backend.cpp)
 endif()
 
 if(NEOGRAPH_BUILD_A2A)
@@ -115,11 +135,20 @@ target_sources(neograph_tests PRIVATE test_async_get.cpp)
 if(NEOGRAPH_BUILD_POSTGRES)
     target_sources(neograph_tests PRIVATE test_postgres_checkpoint.cpp)
     target_compile_definitions(neograph_tests PRIVATE NEOGRAPH_TESTS_HAVE_POSTGRES)
+
+    add_executable(neograph_postgres_old_header_abi
+        test_postgres_old_header_abi.cpp)
+    target_link_libraries(neograph_postgres_old_header_abi PRIVATE
+        neograph::postgres)
 endif()
 
 if(NEOGRAPH_BUILD_SQLITE)
     target_sources(neograph_tests PRIVATE test_sqlite_checkpoint.cpp)
     target_compile_definitions(neograph_tests PRIVATE NEOGRAPH_TESTS_HAVE_SQLITE)
+endif()
+
+if(NOT NEOGRAPH_USE_LIBCURL)
+    target_sources(neograph_tests PRIVATE test_provider_constructor_exception_safety.cpp)
 endif()
 
 target_link_libraries(neograph_tests PRIVATE
@@ -131,8 +160,16 @@ target_link_libraries(neograph_tests PRIVATE
     GTest::gtest_main
 )
 
-if(NEOGRAPH_BUILD_MCP)
+if(NEOGRAPH_BUILD_MCP_CLIENT)
     target_link_libraries(neograph_tests PRIVATE neograph::mcp)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_SERVER)
+    target_link_libraries(neograph_tests PRIVATE neograph::mcp_server)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_HTTP_SERVER)
+    target_link_libraries(neograph_tests PRIVATE neograph::mcp_http_server)
 endif()
 
 if(NEOGRAPH_BUILD_A2A)
@@ -152,9 +189,19 @@ endif()
 
 if(NEOGRAPH_BUILD_SQLITE)
     target_link_libraries(neograph_tests PRIVATE neograph::sqlite)
+    if(NEOGRAPH_BUILD_MCP_SERVER)
+        target_link_libraries(neograph_tests PRIVATE neograph::mcp_sqlite SQLite::SQLite3)
+    endif()
 endif()
 
 include(GoogleTest)
+
+if(NEOGRAPH_BUILD_POSTGRES)
+    add_test(NAME PostgresCheckpointAbiTest.OldHeaderNewLibrary
+        COMMAND neograph_postgres_old_header_abi)
+    set_tests_properties(PostgresCheckpointAbiTest.OldHeaderNewLibrary
+        PROPERTIES RESOURCE_LOCK postgres_test_db)
+endif()
 
 # ThreadSanitizer ASLR notice: when CMAKE_CXX_FLAGS contains
 # `-fsanitize=thread`, the test binaries can FATAL with

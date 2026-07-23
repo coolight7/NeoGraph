@@ -10,6 +10,7 @@
 #include <asio/this_coro.hpp>
 
 #include <charconv>
+#include <exception>
 #include <iostream>
 #include <stdexcept>
 #include <sstream>
@@ -26,8 +27,10 @@ OpenAIProvider::OpenAIProvider(Config config)
     // throw-away io_context per call, so the pool can't live there.
     http_io_ = std::make_unique<asio::io_context>();
     http_work_.emplace(asio::make_work_guard(*http_io_));
-    http_thread_ = std::thread([io = http_io_.get()]{ io->run(); });
     conn_pool_ = std::make_unique<async::ConnPool>(http_io_->get_executor());
+    // Start the thread only after every other constructor step succeeds.
+    // A joinable std::thread aborts the process if a later step throws.
+    http_thread_ = std::thread([io = http_io_.get()]{ io->run(); });
 }
 
 OpenAIProvider::~OpenAIProvider()
@@ -193,27 +196,57 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
 
     // Buffer for partial SSE lines across chunk boundaries
     std::string line_buffer;
+    std::exception_ptr stream_error;
 
-    auto res = cli.Post(
-        prefix + "/v1/chat/completions", headers, body.dump(), "application/json",
-        [&](const char* data, size_t len) -> bool {
-            line_buffer.append(data, len);
+    int response_status = 0;
+    std::string error_body;
+    httplib::Request request;
+    request.method = "POST";
+    request.path = prefix + "/v1/chat/completions";
+    request.headers = headers;
+    request.body = body.dump();
+    request.set_header("Content-Type", "application/json");
+    request.response_handler = [&](const httplib::Response& response) {
+        response_status = response.status;
+        return true;
+    };
+    request.content_receiver =
+        [&](const char* data, size_t len, size_t, size_t) -> bool {
+            if (response_status != 200) {
+                error_body.append(data, len);
+                return true;
+            }
+            try {
+                line_buffer.append(data, len);
 
-            // Process complete lines only
-            size_t pos;
-            while ((pos = line_buffer.find('\n')) != std::string::npos) {
-                std::string line = line_buffer.substr(0, pos);
-                line_buffer.erase(0, pos + 1);
+                // Process complete lines only
+                size_t pos;
+                while ((pos = line_buffer.find('\n')) != std::string::npos) {
+                    std::string line = line_buffer.substr(0, pos);
+                    line_buffer.erase(0, pos + 1);
 
-                // Remove \r
-                if (!line.empty() && line.back() == '\r') line.pop_back();
+                    // Remove \r
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
 
-                if (line.rfind("data: ", 0) != 0) continue;
-                std::string payload = line.substr(6);
-                if (payload == "[DONE]") continue;
+                    if (line.rfind("data:", 0) != 0) continue;
+                    std::string payload = line.substr(5);
+                    if (!payload.empty() && payload.front() == ' ') {
+                        payload.erase(0, 1);
+                    }
+                    if (payload.empty() || payload == "[DONE]") continue;
 
-                try {
-                    auto j = json::parse(payload);
+                    json j;
+                    try {
+                        j = json::parse(payload);
+                    } catch (const json::parse_error& error) {
+                        throw std::runtime_error(
+                            "Malformed SSE data JSON: " + payload +
+                            " (" + error.what() + ")");
+                    }
+
+                    if (j.is_object() && j.contains("error")) {
+                        throw std::runtime_error("API stream error: " + payload);
+                    }
 
                     // The final chunk (after include_usage=true) has
                     // usage populated but an empty choices array. Capture
@@ -232,9 +265,7 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
                     }
 
                     if (!j.contains("choices") || !j["choices"].is_array()
-                        || j["choices"].empty()) {
-                        continue;
-                    }
+                        || j["choices"].empty()) continue;
                     auto delta = j["choices"][0]["delta"];
 
                     // Content token
@@ -259,16 +290,33 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
                             }
                         }
                     }
-                } catch (...) {
-                    // Skip malformed chunks
                 }
+            } catch (...) {
+                stream_error = std::current_exception();
+                return false;
             }
             return true; // continue receiving
-        }
-    );
+        };
+
+    auto res = cli.send(request);
+
+    if (response_status != 0 && response_status != 200) {
+        throw std::runtime_error(
+            "API error (HTTP " + std::to_string(response_status) + "): " +
+            error_body);
+    }
+
+    // Returning false from httplib's receiver becomes Error::Canceled.
+    // Preserve the actual parser, API, or user callback exception instead.
+    if (stream_error) std::rethrow_exception(stream_error);
 
     if (!res) {
         throw std::runtime_error("HTTP request failed: " + httplib::to_string(res.error()));
+    }
+
+    if (!line_buffer.empty()) {
+        throw std::runtime_error(
+            "Malformed SSE stream: unterminated line: " + line_buffer);
     }
 
     if (res->status != 200) {
@@ -284,14 +332,11 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
     return completion;
 }
 
-// Candidate 6 PR6: v1.0 single-dispatch native override. Anchors the
-// dispatch surface — by overriding invoke() here, the engine's
+// Compatibility callback-selected override. The engine's
 // `provider_->invoke(...)` calls land on this method directly instead
 // of bouncing through the base-class default that re-forwards to the
-// 4-virtual chain. Body still routes through the existing native
-// overrides for v0.9 (no behavioural change); v1.0 will collapse the
-// complete_async + complete_stream bodies into invoke() and delete
-// the legacy methods.
+// 4-virtual chain. The body routes through the existing native
+// overrides without changing their supported public behavior.
 //
 // Streaming branch deliberately uses `complete_stream_async` (not
 // the sync `complete_stream` directly) because OpenAI's streaming
@@ -299,7 +344,6 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
 // default spawns a worker thread and dispatches tokens onto the
 // awaiter's executor, which is the issue #4 fix. Skipping that
 // bridge would re-introduce the engine io_context blocker.
-NEOGRAPH_PUSH_IGNORE_DEPRECATED
 asio::awaitable<ChatCompletion>
 OpenAIProvider::invoke(const CompletionParams& params, StreamCallback on_chunk) {
     if (on_chunk) {
@@ -307,6 +351,5 @@ OpenAIProvider::invoke(const CompletionParams& params, StreamCallback on_chunk) 
     }
     co_return co_await complete_async(params);
 }
-NEOGRAPH_POP_IGNORE_DEPRECATED
 
 } // namespace neograph::llm

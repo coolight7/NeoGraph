@@ -9,18 +9,23 @@
 #pragma once
 
 #include <neograph/api.h>
+#include <neograph/graph/admin.h>
 #include <neograph/graph/cancel.h>
+#include <neograph/graph/channel_key.h>
 #include <neograph/graph/checkpoint.h>
 #include <neograph/graph/compiler.h>
 #include <neograph/graph/coordinator.h>
 #include <neograph/graph/executor.h>
 #include <neograph/graph/node.h>
 #include <neograph/graph/node_cache.h>
+#include <neograph/graph/registry.h>
+#include <neograph/graph/run_context.h>
 #include <neograph/graph/scheduler.h>
 #include <neograph/graph/state.h>
 #include <neograph/graph/store.h>
 #include <neograph/graph/types.h>
-#include <neograph/tool_dispatch.h>   // ToolGate (issue #89)
+#include <neograph/tool_dispatch.h>  // ToolGate (issue #89)
+#include <neograph/tool_set.h>
 
 #include <asio/awaitable.hpp>
 #include <asio/thread_pool.hpp>
@@ -28,12 +33,67 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace neograph::graph {
+
+class ValidatedTopology;
+
+/**
+ * @brief Construction-time configuration for a GraphEngine.
+ *
+ * This is the canonical path for new code: collect runtime dependencies and
+ * policies first, then hand the complete configuration to GraphEngine::build().
+ * The resulting engine is ready to run without a sequence of post-compile
+ * setter calls.
+ *
+ * Existing GraphEngine::compile() and configuration setters remain supported.
+ * compile() is a compatibility facade over build(), and the setters update the
+ * same internal state represented here.
+ */
+struct EngineConfig {
+    /// Provider, tools, model, and instructions used while factories create nodes.
+    NodeContext node_context;
+
+    /// Optional durable execution-state backend.
+    std::shared_ptr<CheckpointStore> checkpoint_store;
+
+    /// Optional cross-thread long-term memory exposed as RunContext::store.
+    std::shared_ptr<Store> store;
+
+    /// Optional override for the topology's default retry policy.
+    std::optional<RetryPolicy> retry_policy;
+
+    /// Per-node retry overrides applied before the first run.
+    std::map<std::string, RetryPolicy> node_retry_policies;
+
+    /// Engine-wide tool policy, preserved across run() and resume().
+    ToolGate tool_gate;
+
+    /// Fan-out worker count. One preserves the historical no-pool fast path.
+    std::size_t worker_count = 1;
+
+    /// Pure nodes whose result cache should be enabled at construction time.
+    std::set<std::string> cached_nodes;
+};
+
+/**
+ * @brief Owned construction resources layered beside EngineConfig.
+ *
+ * Kept as a sibling type so the already-public EngineConfig and NodeContext
+ * layouts remain unchanged. Empty resources preserve the legacy raw-tool and
+ * process-global registry behavior. Move this value into build() or link();
+ * ToolSet ownership transfers to the resulting engine.
+ */
+struct EngineResources {
+    ToolSet                              tools;
+    std::shared_ptr<const GraphRegistry> registry;
+};
 
 /**
  * @brief Configuration for a graph execution run.
@@ -49,9 +109,10 @@ struct RunConfig {
      *
      * When set, the engine super-step loop polls
      * ``cancel_token->is_cancelled()`` between steps and bails with
-     * ``CancelledException``. The pybind binding additionally binds
-     * the token's ``cancellation_slot`` to the run's ``co_spawn`` so
-     * an in-flight LLM HTTP request gets aborted at the socket layer.
+     * ``CancelledException``. Each engine entry point forks an operation
+     * child and binds only that child's ``cancellation_slot`` to its internal
+     * work, so an in-flight LLM HTTP request gets aborted at the socket layer
+     * without sharing one slot across concurrent runs.
      *
      * Default ``nullptr`` → no cancellation; existing behaviour
      * unchanged for callers that haven't opted in.
@@ -93,153 +154,14 @@ struct RunConfig {
      * is a no-op.
      */
     bool resume_if_exists = false;
-
 };
 
-/**
- * @brief Per-run dispatch metadata threaded through the engine and executor.
- *
- * Built from ``RunConfig`` at the top of ``execute_graph_async`` and
- * carried by reference through every internal dispatch hop
- * (``NodeExecutor::run_one_async`` / ``run_parallel_async`` /
- * ``run_sends_async`` / ``execute_node_with_retry_async``). Replaces the
- * v0.3.x-era smuggling channels — ``GraphState::run_cancel_token_`` and
- * the ``current_cancel_token()`` thread-local — with one explicit
- * argument that survives every Send-fan-out / serialize-restore /
- * thread-hop.
- *
- * **PR 1 (v0.4.0) is plumbing-only**: the struct exists, the engine
- * builds it, and ``NodeExecutor`` carries it through, but nothing yet
- * consumes it. ``GraphNode::execute_full_async`` still receives only
- * ``state``. The smuggling channels remain authoritative until
- * subsequent PRs flip the consumers (PR 2: new ``run(NodeInput)``
- * virtual; PR 3: hierarchical CancelToken; PR 4: deprecate the
- * smuggling).
- *
- * Cheap to copy (one shared_ptr + a couple of strings); workers that
- * need an isolated copy take it by value, the common path takes it by
- * const reference.
- *
- * @see RunConfig (the caller-supplied source) and ROADMAP_v1.md
- * (Candidate 2: "Explicit RunContext for per-run metadata").
- */
-struct RunContext {
-    /// Cooperative cancel handle. Mirrors ``RunConfig::cancel_token``.
-    /// Null when the caller did not opt in.
-    std::shared_ptr<CancelToken> cancel_token;
-
-    /// Token accounting sink for this run (issue #88). The engine always sets
-    /// it, so a node body can record unconditionally via ``record_usage``.
-    /// A custom node that calls a Provider directly is responsible for doing
-    /// so — the engine only sees completions that pass through its own nodes.
-    std::shared_ptr<UsageAccumulator> usage;
-
-    /// Optional absolute wall-clock deadline. Reserved for a future PR
-    /// (RunConfig has no deadline field today); left ``std::nullopt``
-    /// by the engine for now so existing behaviour is unchanged.
-    std::optional<std::chrono::steady_clock::time_point> deadline;
-
-    /// Per-run trace correlator. Reserved for OTel integration; the
-    /// engine does not populate this in PR 1 (callers can fill it via
-    /// a future ``RunConfig::trace_id`` field).
-    std::string trace_id;
-
-    /// Mirrors ``RunConfig::thread_id`` so executor-side logic (e.g.
-    /// future per-thread metric tags) does not have to hold a separate
-    /// ``RunConfig`` reference.
-    std::string thread_id;
-
-    /// Current super-step index. Updated by the engine at the top of
-    /// each super-step iteration so per-step consumers see a consistent
-    /// value without the engine threading ``int step`` separately.
-    int step = 0;
-
-    /// Mirrors ``RunConfig::stream_mode``.
-    StreamMode stream_mode = StreamMode::ALL;
-
-    /**
-     * @brief The value handed to ``GraphEngine::resume()`` — the human's answer.
-     *
-     * Empty on a fresh run, so a node can tell "nobody has answered yet" from
-     * "the answer was no":
-     *
-     * @code
-     * if (!in.ctx.resume_value)
-     *     throw NodeInterrupt("needs approval", payload);    // ask
-     * if (in.ctx.resume_value->value("approved", false))     // act on the reply
-     *     ...
-     * @endcode
-     *
-     * ``std::optional<json>`` rather than a plain ``json``, because a
-     * default-constructed ``json`` allocates a yyjson document — and this
-     * struct is built on every run, including the overwhelming majority that
-     * never interrupt. An empty optional allocates nothing. (Measured: a bare
-     * ``json`` member here cost ~3% of engine overhead per run.)
-     *
-     * The engine also keeps writing ``resume_value`` into a ``messages``
-     * channel when the graph has one, which is how chat-shaped graphs have
-     * always received it. That path is unchanged; this one exists because a
-     * graph without a ``messages`` channel had no way to see the answer at all.
-     */
-    std::optional<json> resume_value;
-
-    /**
-     * @brief Cross-thread shared memory (issue #27).
-     *
-     * Mirrors ``GraphEngine::get_store()``. Populated by the engine
-     * at the top of every run so node bodies can read / write
-     * Store-backed state through ``in.ctx.store`` without a
-     * separate plumbing channel.
-     *
-     * Default ``nullptr``. The engine sets this to whatever the
-     * caller previously passed to ``GraphEngine::set_store(...)``;
-     * if no Store is configured, ``in.ctx.store`` stays ``nullptr``
-     * and node bodies should guard accordingly.
-     *
-     * Before this field existed, the only way for a node body to
-     * reach the Store was to capture a ``shared_ptr<Store>`` in the
-     * ``NodeFactory`` registration closure. That pattern still
-     * works and is left undisturbed during the deprecation window —
-     * use whichever shape fits your code best:
-     *
-     * @code
-     * // New shape (post-#27):
-     * asio::awaitable<NodeOutput> run(NodeInput in) override {
-     *     if (in.ctx.store) {
-     *         auto v = in.ctx.store->get(ns, "user.fact");
-     *     }
-     *     ...
-     * }
-     *
-     * // Legacy factory-closure shape — still supported:
-     * NodeFactory::instance().register_type("my_node",
-     *     [store](const std::string& name, const json&, const NodeContext&) {
-     *         return std::make_unique<MyNode>(name, store);  // ← capture
-     *     });
-     * @endcode
-     */
-    std::shared_ptr<Store> store;
-
-    /// The engine's tool gate (issue #89). Empty when none was set — an empty
-    /// std::function allocates nothing, so the ungated path pays a null check
-    /// and no more.
-    ToolGate tool_gate;
+/// @brief Normal, paused, or step-limited outcome of a successful run call.
+enum class RunStatus {
+    Completed,
+    Interrupted,
+    StepLimit,
 };
-
-/// @brief Fold a completion's token usage into the run's running total (#88).
-///
-/// One implementation, called from every node that receives a completion. The
-/// alternative — each node incrementing its own counters — is how the two tool
-/// dispatch paths drifted apart in #87, and it would drift the same way here:
-/// a new node type gets written, nobody remembers to count, and the run's token
-/// total silently under-reports. There is nothing in a wrong-but-plausible token
-/// number that tells you it is wrong.
-///
-/// Safe to call with a context whose accumulator is null (a node driven outside
-/// an engine run, as unit tests do).
-inline void record_usage(const RunContext& ctx, const ChatCompletion& completion) {
-    if (ctx.usage) ctx.usage->add(completion.usage);
-}
 
 /**
  * @brief Result of a graph execution run.
@@ -262,7 +184,7 @@ inline void record_usage(const RunContext& ctx, const ChatCompletion& completion
  * Use the ``channel<T>(name)`` accessor below to read a channel value
  * without committing to either shape — it checks the channels wrapper
  * first, then falls back to a flat top-level key with the same name.
- * That way the same call site works against ``GraphEngine::compile``-
+ * That way the same call site works against ``GraphEngine::build``-
  * built graphs (channels-wrapped only) and ``react_graph``-built
  * graphs (channels-wrapped + flat-key projections) alike.
  */
@@ -290,6 +212,24 @@ struct RunResult {
     /// @see UsageAccounting.ACallerSuppliedAccumulatorSeesTheCrashedAttempt
     ChatCompletion::Usage usage;
 
+    /// True only when execution stopped at RunConfig::max_steps while work
+    /// remained ready. The status is stored in output rather than as a data
+    /// member so adding this query does not change RunResult's binary layout.
+    inline bool max_steps_exhausted() const noexcept {
+        if (!output.is_object()) return false;
+        auto* metadata = yyjson_mut_obj_get(output.raw_val(), "_neograph");
+        if (!yyjson_mut_is_obj(metadata)) return false;
+        auto* marker = yyjson_mut_obj_get(metadata, "max_steps_exhausted");
+        return yyjson_mut_is_bool(marker) && yyjson_mut_get_bool(marker);
+    }
+
+    /// @brief Return a typed outcome without changing the legacy result layout.
+    RunStatus status() const noexcept {
+        if (interrupted) return RunStatus::Interrupted;
+        if (max_steps_exhausted()) return RunStatus::StepLimit;
+        return RunStatus::Completed;
+    }
+
     /// @brief Read a channel value as type ``T`` (issue #25).
     ///
     /// Looks up the value in ``output``. Tries the canonical
@@ -309,6 +249,19 @@ struct RunResult {
     template <typename T>
     T channel(const std::string& name) const {
         return channel_raw(name).get<T>();
+    }
+
+    /// @brief Read a channel using a reusable typed key.
+    template <typename T>
+    T channel(const ChannelKey<T>& key) const {
+        return channel<T>(key.name());
+    }
+
+    /// @brief Read a typed channel when present, preserving conversion errors.
+    template <typename T>
+    std::optional<T> try_channel(const ChannelKey<T>& key) const {
+        if (!has_channel(key.name())) return std::nullopt;
+        return channel(key);
     }
 
     /// @brief Read a channel value as a raw ``json`` node (issue #25).
@@ -362,7 +315,7 @@ struct RunResult {
  *
  * ## Thread safety
  *
- * After `compile()` returns, the graph definition (nodes, edges, channels)
+ * After `build()` or `link()` returns, the graph definition (nodes, edges, channels)
  * is treated as immutable. A single GraphEngine instance is therefore safe
  * to share across user threads that invoke `run()` / `run_stream()` /
  * `resume()` concurrently with **distinct `thread_id`s** — each call
@@ -396,7 +349,10 @@ struct RunResult {
  *   implementations must be thread-safe.
  *
  * @code
- * auto engine = GraphEngine::compile(graph_json, context, checkpoint_store);
+ * EngineConfig engine_config;
+ * engine_config.node_context = context;
+ * engine_config.checkpoint_store = checkpoint_store;
+ * auto engine = GraphEngine::build(graph_json, std::move(engine_config));
  * RunConfig config;
  * config.thread_id = "session-1";
  * config.input = {{"messages", json::array({{{"role","user"},{"content","Hello"}}})}};
@@ -405,20 +361,96 @@ struct RunResult {
  *
  * @see RunConfig, RunResult, GraphNode
  *
- * @note Public surface size — this class exposes ~23 public methods
- * spanning three concerns: graph execution (run/run_async/run_stream/
- * resume), state administration (get_state/update_state/fork), and
- * runtime configuration (set_retry_policy/set_worker_count/
- * set_node_cache_enabled/set_checkpoint_store/own_tools). A future
- * major version (v1.0) is expected to split into `GraphEngine` (run
- * + resume only), `GraphAdmin` (state inspection/update/fork), and a
- * `GraphConfigBuilder` consumed at compile time. The current shape
- * is kept so existing examples and downstream consumers don't break;
- * the class-level docs above flag mutator setters as "configuration,
- * not runtime" already.
+ * @note New code can obtain state-administration operations through admin().
+ * The corresponding methods remain on GraphEngine for compatibility. Pass all
+ * construction policy through EngineConfig and EngineResources; setters remain
+ * supported but are configuration, not runtime control.
  */
 class NEOGRAPH_API GraphEngine {
 public:
+    /**
+     * @brief Link an already compiled graph into a configured runtime.
+     *
+     * This is the canonical runtime boundary for callers that explicitly run
+     * GraphCompiler and inspect or transform the resulting CompiledGraph. It
+     * performs semantic validation, consumes the graph by move, and applies
+     * every EngineConfig option without parsing the source JSON again.
+     *
+     * Translation round-trip verification requires the original JSON and is
+     * therefore performed by build() before it delegates here. Callers using
+     * link() directly are responsible for calling GraphCompiler::verify_roundtrip
+     * when they need that source-to-IR guarantee.
+     *
+     * EngineConfig::node_context is ignored because CompiledGraph already owns
+     * its instantiated nodes. The remaining runtime configuration is applied.
+     *
+     * @param graph Compiled graph to consume.
+     * @param config Runtime configuration applied before the engine is returned.
+     * @return A configured GraphEngine ready for execution.
+     * @throws std::runtime_error If semantic validation fails in strict mode.
+     */
+    static std::unique_ptr<GraphEngine> link(CompiledGraph graph, EngineConfig config = {});
+
+    /**
+     * @brief Link with owned tools and a per-engine registry overlay.
+     *
+     * For directly compiled graphs, the caller must have used tools.view() in
+     * the NodeContext and the same registry in GraphCompiler::compile(). The
+     * canonical build() overload performs both bindings automatically.
+     */
+    static std::unique_ptr<GraphEngine> link(CompiledGraph   graph,
+                                             EngineConfig    config,
+                                             EngineResources resources);
+
+    /**
+     * @brief Instantiate and link a topology already proven semantically valid.
+     */
+    static std::unique_ptr<GraphEngine> link(ValidatedTopology topology, EngineConfig config = {});
+
+    /// @brief Validated topology link with owned resources and local registry.
+    static std::unique_ptr<GraphEngine> link(ValidatedTopology topology,
+                                             EngineConfig      config,
+                                             EngineResources   resources);
+
+    /**
+     * @brief Build a ready-to-run engine from one construction-time config.
+     *
+     * New code should prefer this entry point when it needs runtime Store,
+     * retry, worker, cache, or tool-gate configuration. It applies every option
+     * before returning the engine, avoiding a partially configured interval.
+     *
+     * @param definition JSON graph definition.
+     * @param config Node construction context and engine runtime configuration.
+     * @return A configured GraphEngine ready for execution.
+     * @throws std::runtime_error If the graph definition is invalid.
+     */
+    static std::unique_ptr<GraphEngine> build(const json& definition, EngineConfig config);
+
+    /**
+     * @brief Build with exact tool ownership and a local-first registry.
+     *
+     * resources.tools replaces NodeContext::tools with pointers to the owned
+     * collection. Supplying both forms is rejected as ambiguous.
+     */
+    static std::unique_ptr<GraphEngine> build(const json&     definition,
+                                              EngineConfig    config,
+                                              EngineResources resources);
+
+    /**
+     * @brief Build using strict topology validation when schema_version is
+     *        missing or zero.
+     *
+     * The caller's JSON is not mutated. Existing malformed or unsupported
+     * schema_version values are preserved so the compiler reports them rather
+     * than silently replacing them.
+     */
+    static std::unique_ptr<GraphEngine> build_strict(const json& definition, EngineConfig config);
+
+    /// @brief Strict build overload with owned tools and a local registry.
+    static std::unique_ptr<GraphEngine> build_strict(const json&     definition,
+                                                     EngineConfig    config,
+                                                     EngineResources resources);
+
     /**
      * @brief Compile a graph from a JSON definition.
      *
@@ -430,6 +462,9 @@ public:
      * @param store Optional checkpoint store for persistence (nullptr = no checkpointing).
      * @return A compiled GraphEngine ready for execution.
      * @throws std::runtime_error If the graph definition is invalid.
+     *
+     * @note Compatibility facade. This overload retains its original signature
+     *       and behavior and delegates to build().
      */
     static std::unique_ptr<GraphEngine> compile(const json&                      definition,
                                                 const NodeContext&               default_context,
@@ -495,10 +530,28 @@ public:
                      const json&                resume_value = json(),
                      const GraphStreamCallback& cb           = nullptr);
 
+    /**
+     * @brief Resume while preserving caller cancellation and deadline settings.
+     *
+     * `config.thread_id` identifies the interrupted session. Input is ignored;
+     * the latest checkpoint remains the source of resumed graph state.
+     */
+    RunResult resume(const RunConfig&           config,
+                     const json&                resume_value = json(),
+                     const GraphStreamCallback& cb           = nullptr);
+
     /// Async peer of resume — non-blocking coroutine surface.
     asio::awaitable<RunResult> resume_async(const std::string&         thread_id,
                                             const json&                resume_value = json(),
                                             const GraphStreamCallback& cb           = nullptr);
+
+    /// Async peer of the RunConfig-preserving resume overload.
+    asio::awaitable<RunResult> resume_async(RunConfig           config,
+                                            json                resume_value = json(),
+                                            GraphStreamCallback cb           = nullptr);
+
+    /// @brief Borrow the state-administration facade for this engine.
+    GraphAdmin admin() noexcept;
 
     // ── State inspection & manipulation (LangGraph Checkpointer API) ──
 
@@ -704,6 +757,11 @@ public:
 private:
     GraphEngine() = default;
 
+    static std::unique_ptr<GraphEngine> link_impl(CompiledGraph   graph,
+                                                  EngineConfig    config,
+                                                  EngineResources resources,
+                                                  bool            validate);
+
     /// #89 — set_tool_gate(). Lives on the engine rather than RunConfig so it
     /// survives resume(), which builds its own RunConfig internally.
     ToolGate tool_gate_;
@@ -719,7 +777,7 @@ private:
     asio::awaitable<RunResult> execute_graph_async(const RunConfig&                config,
                                                    const GraphStreamCallback&      cb,
                                                    const std::vector<std::string>& resume_from = {},
-                                                   const json& resume_value = json());
+                                                   const json* resume_value = nullptr);
 
     RetryPolicy get_retry_policy(const std::string& node_name) const;
 

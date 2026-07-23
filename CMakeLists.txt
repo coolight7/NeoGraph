@@ -111,13 +111,24 @@ endif()
 # find_package() calls are skipped entirely (see line ~258).
 option(NEOGRAPH_BUILD_ASYNC    "Build neograph::async (asio::ssl HTTP/HTTPS/WS client)" ON)
 option(NEOGRAPH_BUILD_LLM      "Build neograph::llm (LLM providers)"     ON)
-option(NEOGRAPH_BUILD_MCP      "Build neograph::mcp (MCP client)"        ON)
+option(NEOGRAPH_BUILD_MCP      "Build MCP components (compatibility umbrella)" ON)
+set(_neograph_mcp_component_default ${NEOGRAPH_BUILD_MCP})
+option(NEOGRAPH_BUILD_MCP_CLIENT "Build neograph::mcp MCP client"
+       ${_neograph_mcp_component_default})
+option(NEOGRAPH_BUILD_MCP_SERVER "Build neograph::mcp_server local MCP server"
+       ${_neograph_mcp_component_default})
+option(NEOGRAPH_BUILD_MCP_HTTP_SERVER
+       "Build opt-in neograph::mcp_http_server Streamable HTTP transport"
+       OFF)
 option(NEOGRAPH_BUILD_A2A      "Build neograph::a2a (Agent-to-Agent client)" ON)
 option(NEOGRAPH_BUILD_ACP      "Build neograph::acp (Agent Client Protocol server)" ON)
 option(NEOGRAPH_BUILD_UTIL     "Build neograph::util (utilities)"        ON)
 option(NEOGRAPH_BUILD_POSTGRES "Build PostgresCheckpointStore (libpq)" ON)
 option(NEOGRAPH_BUILD_SQLITE   "Build SqliteCheckpointStore (libsqlite3)" ON)
 option(NEOGRAPH_BUILD_EXAMPLES "Build example programs"                  ON)
+option(NEOGRAPH_BUILD_HARNESS_MCP_BINARY
+       "Build and install the neograph-harness-mcp executable"
+       OFF)
 option(NEOGRAPH_BUILD_PYBIND   "Build Python bindings (pybind11)"        OFF)
 # neograph::grpc — expose a compiled GraphEngine as a gRPC service
 # (RunGraph unary + RunGraphStream server-streaming). **default OFF**
@@ -325,14 +336,15 @@ target_link_libraries(asio INTERFACE Threads::Threads)
 # fail loud — neograph_async is their link target and skipping it would
 # yield a confusing "undefined reference to OpenSSL::SSL" link error
 # many minutes into the build.
-if(NOT NEOGRAPH_BUILD_ASYNC AND (NEOGRAPH_BUILD_LLM OR NEOGRAPH_BUILD_MCP OR NEOGRAPH_BUILD_A2A OR NEOGRAPH_BUILD_PYBIND))
+if(NOT NEOGRAPH_BUILD_ASYNC AND (NEOGRAPH_BUILD_LLM OR NEOGRAPH_BUILD_MCP_CLIENT OR NEOGRAPH_BUILD_A2A OR NEOGRAPH_BUILD_PYBIND))
     message(FATAL_ERROR
         "NEOGRAPH_BUILD_ASYNC=OFF is incompatible with "
         "NEOGRAPH_BUILD_LLM/MCP/A2A/PYBIND=ON — those targets link "
         "against neograph_async. Either flip ASYNC back ON, or turn "
         "the dependent components OFF in the same configure call.")
 endif()
-if(NEOGRAPH_BUILD_ASYNC OR NEOGRAPH_BUILD_LLM OR NEOGRAPH_BUILD_MCP OR NEOGRAPH_BUILD_A2A)
+if(NEOGRAPH_BUILD_ASYNC OR NEOGRAPH_BUILD_LLM OR NEOGRAPH_BUILD_MCP_CLIENT OR
+   NEOGRAPH_BUILD_MCP_HTTP_SERVER OR NEOGRAPH_BUILD_A2A)
     find_package(OpenSSL REQUIRED)
 endif()
 
@@ -411,6 +423,7 @@ add_library(neograph_core
     src/core/json.cpp
     src/core/cancel.cpp
     src/core/provider.cpp
+    src/core/completion_provider.cpp
     src/core/tool.cpp
     src/core/graph_engine.cpp
     src/core/graph_compiler.cpp
@@ -421,6 +434,7 @@ add_library(neograph_core
     src/core/node_cache.cpp
     src/core/scheduler.cpp
     src/core/graph_state.cpp
+    src/core/graph_events.cpp
     src/core/graph_node.cpp
     src/core/tool_dispatch.cpp
     src/core/graph_loader.cpp
@@ -630,11 +644,28 @@ if(NEOGRAPH_BUILD_LLM)
 endif()
 
 # ===========================================================================
-# neograph::mcp — MCP client (JSON-RPC over HTTP/stdio)
+# MCP shared values, client, and server. The server target deliberately does
+# not link neograph::async or OpenSSL, so server-only builds stay lightweight.
 # ===========================================================================
-if(NEOGRAPH_BUILD_MCP)
+if(NEOGRAPH_BUILD_MCP_CLIENT OR NEOGRAPH_BUILD_MCP_SERVER)
+    add_library(neograph_mcp_types
+        src/mcp/types.cpp
+        src/mcp/json_schema.cpp
+    )
+    target_include_directories(neograph_mcp_types
+        PUBLIC
+            $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+    target_compile_definitions(neograph_mcp_types PRIVATE NEOGRAPH_BUILDING_LIBRARY)
+    target_link_libraries(neograph_mcp_types PUBLIC neograph_core)
+    add_library(neograph::mcp_types ALIAS neograph_mcp_types)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_CLIENT)
     add_library(neograph_mcp
         src/mcp/client.cpp
+        src/mcp/harness_mcp_backend.cpp
     )
 
     target_include_directories(neograph_mcp
@@ -645,11 +676,71 @@ if(NEOGRAPH_BUILD_MCP)
 
     target_compile_definitions(neograph_mcp PRIVATE NEOGRAPH_BUILDING_LIBRARY)
     target_link_libraries(neograph_mcp
-        PUBLIC  neograph_core
+        PUBLIC  neograph_core neograph_mcp_types
         PRIVATE neograph_async OpenSSL::SSL OpenSSL::Crypto
     )
 
     add_library(neograph::mcp ALIAS neograph_mcp)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_SERVER)
+    add_library(neograph_mcp_server
+        src/mcp/server.cpp
+        src/mcp/harness.cpp
+        src/mcp/harness_journal.cpp
+        src/mcp/harness_provider.cpp
+    )
+    target_include_directories(neograph_mcp_server
+        PUBLIC
+            $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+    target_compile_definitions(neograph_mcp_server PRIVATE
+        NEOGRAPH_BUILDING_LIBRARY NEOGRAPH_BUILDING_MCP_SERVER)
+    target_link_libraries(neograph_mcp_server
+        PUBLIC neograph_core neograph_mcp_types
+    )
+    add_library(neograph::mcp_server ALIAS neograph_mcp_server)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_SERVER AND NEOGRAPH_BUILD_SQLITE)
+    add_library(neograph_mcp_sqlite
+        src/mcp/sqlite_harness_store.cpp
+    )
+    target_include_directories(neograph_mcp_sqlite
+        PUBLIC
+            $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+    target_compile_definitions(neograph_mcp_sqlite PRIVATE NEOGRAPH_BUILDING_LIBRARY)
+    target_link_libraries(neograph_mcp_sqlite
+        PUBLIC  neograph_mcp_server
+        PRIVATE SQLite::SQLite3
+    )
+    add_library(neograph::mcp_sqlite ALIAS neograph_mcp_sqlite)
+endif()
+
+if(NEOGRAPH_BUILD_MCP_HTTP_SERVER)
+    if(NOT NEOGRAPH_BUILD_MCP_SERVER)
+        message(FATAL_ERROR
+            "NEOGRAPH_BUILD_MCP_HTTP_SERVER=ON requires "
+            "NEOGRAPH_BUILD_MCP_SERVER=ON")
+    endif()
+    add_library(neograph_mcp_http_server
+        src/mcp/http_server.cpp
+    )
+    target_include_directories(neograph_mcp_http_server
+        PUBLIC
+            $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+    target_compile_definitions(neograph_mcp_http_server PRIVATE
+        NEOGRAPH_BUILDING_LIBRARY
+        CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(neograph_mcp_http_server
+        PUBLIC neograph_mcp_server
+        PRIVATE httplib OpenSSL::SSL OpenSSL::Crypto)
+    add_library(neograph::mcp_http_server ALIAS neograph_mcp_http_server)
 endif()
 
 # ===========================================================================
@@ -661,6 +752,7 @@ if(NEOGRAPH_BUILD_A2A)
         src/a2a/client.cpp
         src/a2a/server.cpp
         src/a2a/a2a_caller_node.cpp
+        src/a2a/harness_backend.cpp
     )
 
     target_include_directories(neograph_a2a
@@ -789,6 +881,37 @@ if(NEOGRAPH_BUILD_UTIL)
 endif()
 
 # ===========================================================================
+# Installable Harness MCP host. Kept opt-in so library-only and wheel builds do
+# not silently gain an executable or provider/runtime dependencies.
+# ===========================================================================
+if(NEOGRAPH_BUILD_HARNESS_MCP_BINARY)
+    if(NOT NEOGRAPH_BUILD_MCP_SERVER OR NOT NEOGRAPH_BUILD_LLM)
+        message(FATAL_ERROR
+            "NEOGRAPH_BUILD_HARNESS_MCP_BINARY=ON requires "
+            "NEOGRAPH_BUILD_MCP_SERVER=ON and NEOGRAPH_BUILD_LLM=ON")
+    endif()
+    add_executable(neograph_harness_mcp examples/60_harness_mcp_server.cpp)
+    set_target_properties(neograph_harness_mcp PROPERTIES
+        OUTPUT_NAME neograph-harness-mcp)
+    target_link_libraries(neograph_harness_mcp PRIVATE
+        neograph::mcp_server neograph::llm)
+    if(NEOGRAPH_BUILD_SQLITE)
+        target_link_libraries(neograph_harness_mcp PRIVATE
+            neograph::sqlite neograph::mcp_sqlite)
+        target_compile_definitions(neograph_harness_mcp PRIVATE
+            NEOGRAPH_HARNESS_HAVE_SQLITE)
+    endif()
+    if(NEOGRAPH_BUILD_MCP_HTTP_SERVER)
+        target_link_libraries(neograph_harness_mcp PRIVATE
+            neograph::mcp_http_server)
+        target_compile_definitions(neograph_harness_mcp PRIVATE
+            NEOGRAPH_HARNESS_HAVE_HTTP)
+    endif()
+    install(TARGETS neograph_harness_mcp
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# ===========================================================================
 # Examples
 # ===========================================================================
 if(NEOGRAPH_BUILD_EXAMPLES)
@@ -903,50 +1026,11 @@ if(NEOGRAPH_BUILD_EXAMPLES)
         target_link_libraries(example_reasoning_effort PRIVATE neograph::core neograph::llm neograph::async cppdotenv)
 
         # Example 31: NeoGraph driving a local OpenAI-compatible inference
-        # server (TransformerCPP, llama.cpp server, vLLM OpenAI-compat,
-        # etc.). Demonstrates that the two-process agent/inference split
+        # server (llama.cpp server, vLLM OpenAI-compat, etc.).
+        # Demonstrates that the two-process agent/inference split
         # keeps the agent L3-resident even when the model is multi-GB.
         add_executable(example_local_transformer examples/31_local_transformer.cpp)
         target_link_libraries(example_local_transformer PRIVATE neograph::core neograph::llm)
-
-        # Example 32: in-process sibling of 31. Links TransformerCPP
-        # (https://github.com/fox1245/TransformerCPP) directly into the
-        # agent process so there's no HTTP round trip to the model. Both
-        # examples together show both halves of a C++ LLM-agent stack:
-        # external inference server (31) vs single-binary edge (32).
-        # Opt-in because TransformerCPP is an external dep.
-        option(NEOGRAPH_BUILD_LOCAL_INFERENCE_EXAMPLE
-            "Build example 32 (in-process local GGUF via TransformerCPP). Requires TRANSFORMERCPP_DIR pointing at a built sibling clone." OFF)
-        if(NEOGRAPH_BUILD_LOCAL_INFERENCE_EXAMPLE)
-            if(NOT TRANSFORMERCPP_DIR)
-                message(FATAL_ERROR "NEOGRAPH_BUILD_LOCAL_INFERENCE_EXAMPLE=ON requires -DTRANSFORMERCPP_DIR=/path/to/TransformerCPP (must be a built sibling clone with build/libtransformercpp.a).")
-            endif()
-            if(NOT EXISTS "${TRANSFORMERCPP_DIR}/include/transformercpp/neograph/transformer_provider.h")
-                message(FATAL_ERROR "TRANSFORMERCPP_DIR='${TRANSFORMERCPP_DIR}' does not contain include/transformercpp/neograph/transformer_provider.h — check the path.")
-            endif()
-            if(NOT EXISTS "${TRANSFORMERCPP_DIR}/build/libtransformercpp.a")
-                message(FATAL_ERROR "TRANSFORMERCPP_DIR='${TRANSFORMERCPP_DIR}' has no build/libtransformercpp.a — build TransformerCPP first.")
-            endif()
-
-            add_executable(example_inproc_gemma examples/32_inproc_gemma.cpp)
-            target_include_directories(example_inproc_gemma PRIVATE
-                ${TRANSFORMERCPP_DIR}/include)
-            # TransformerCPP's static lib carries undefined refs into
-            # llama.cpp + ggml, which live in the shared libs under
-            # build/bin/. Link those explicitly and add an RPATH so the
-            # binary finds them at run time without LD_LIBRARY_PATH.
-            target_link_libraries(example_inproc_gemma PRIVATE
-                neograph::core neograph::llm
-                ${TRANSFORMERCPP_DIR}/build/libtransformercpp.a
-                ${TRANSFORMERCPP_DIR}/build/bin/libllama.so
-                ${TRANSFORMERCPP_DIR}/build/bin/libggml.so
-                ${TRANSFORMERCPP_DIR}/build/bin/libggml-cpu.so
-                ${TRANSFORMERCPP_DIR}/build/bin/libggml-base.so)
-            set_target_properties(example_inproc_gemma PROPERTIES
-                BUILD_RPATH "${TRANSFORMERCPP_DIR}/build/bin"
-                INSTALL_RPATH "${TRANSFORMERCPP_DIR}/build/bin")
-            message(STATUS "  [+] example_inproc_gemma (TRANSFORMERCPP_DIR=${TRANSFORMERCPP_DIR})")
-        endif()
 
         # Example 26 needs both LLM (Claude provider) and the Postgres
         # backend; gate it on both build flags so a project that turns
@@ -1206,21 +1290,20 @@ if(NEOGRAPH_BUILD_EXAMPLES)
             endif()
         endif()
 
-        # JARVIS voice meta-orchestrator cookbook — 골격(skeleton) 단계.
-        # whisper.cpp + onnxruntime + miniaudio + supertonic helper + 모델 가중치
-        # (~250MB) 가 필요. 기본 OFF — ON 으로 켜면 jarvis 의 자체 CMakeLists 가
-        # 의존성 못 찾으면 조용히 return() 해서 본체 빌드를 깨뜨리지 않음.
+        # JARVIS voice meta-orchestrator cookbook.
+        # 라이브 음성에는 whisper.cpp + onnxruntime + miniaudio + supertonic helper
+        # + 모델 가중치가 필요하다. 외부 의존성이 없으면 mock으로 빌드.
         # MCP / A2A / LLM 셋 다 켜져 있어야 의미가 있음.
         option(NEOGRAPH_BUILD_COOKBOOK_JARVIS
-            "Build JARVIS voice cookbook (needs whisper.cpp + onnxruntime + miniaudio + 250MB models)"
+            "Build JARVIS voice cookbook (mock fallback without voice dependencies)"
             OFF)
         if(NEOGRAPH_BUILD_COOKBOOK_JARVIS
            AND NEOGRAPH_BUILD_LLM
-           AND NEOGRAPH_BUILD_MCP)
+           AND NEOGRAPH_BUILD_MCP_CLIENT)
             add_subdirectory(examples/cookbook/jarvis)
         endif()
 
-        if(NEOGRAPH_BUILD_MCP)
+        if(NEOGRAPH_BUILD_MCP_CLIENT)
             add_executable(example_mcp_agent examples/03_mcp_agent.cpp)
             target_link_libraries(example_mcp_agent PRIVATE neograph::core neograph::llm neograph::mcp cppdotenv)
 
@@ -1358,6 +1441,31 @@ if(NEOGRAPH_BUILD_EXAMPLES)
             target_include_directories(example_clay_chatbot PRIVATE ${DEPS_DIR})
         endif()
     endif()
+
+    # Reusable MCP server smoke target. It has no LLM or client dependency and
+    # is the same stdio binary used by Inspector and host interoperability tests.
+    if(NEOGRAPH_BUILD_MCP_SERVER)
+        add_executable(example_mcp_server examples/59_mcp_server.cpp)
+        target_link_libraries(example_mcp_server PRIVATE neograph::mcp_server)
+        if(NEOGRAPH_BUILD_LLM)
+            add_executable(example_harness_mcp_server
+                examples/60_harness_mcp_server.cpp)
+            target_link_libraries(example_harness_mcp_server PRIVATE
+                neograph::mcp_server neograph::llm)
+            if(NEOGRAPH_BUILD_SQLITE)
+                target_link_libraries(example_harness_mcp_server PRIVATE
+                    neograph::sqlite neograph::mcp_sqlite)
+                target_compile_definitions(example_harness_mcp_server PRIVATE
+                    NEOGRAPH_HARNESS_HAVE_SQLITE)
+            endif()
+            if(NEOGRAPH_BUILD_MCP_HTTP_SERVER)
+                target_link_libraries(example_harness_mcp_server PRIVATE
+                    neograph::mcp_http_server)
+                target_compile_definitions(example_harness_mcp_server PRIVATE
+                    NEOGRAPH_HARNESS_HAVE_HTTP)
+            endif()
+        endif()
+    endif()
 endif()
 
 # ===========================================================================
@@ -1427,6 +1535,10 @@ if(NEOGRAPH_BUILD_TESTS)
     set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
+
+    if(NEOGRAPH_BUILD_ACP)
+        target_compile_definitions(neograph_acp PRIVATE NEOGRAPH_ACP_TESTING)
+    endif()
 
     enable_testing()
     add_subdirectory(tests)
@@ -1579,7 +1691,11 @@ if(NEOGRAPH_INSTALL_EXPORT)
         endif()
     endforeach()
 
-    foreach(_comp async llm mcp a2a acp util postgres sqlite)
+    if(TARGET neograph_mcp_types)
+        list(APPEND NEOGRAPH_EXPORT_TARGETS neograph_mcp_types)
+    endif()
+
+    foreach(_comp async llm mcp mcp_server mcp_sqlite mcp_http_server a2a acp util postgres sqlite)
         if(TARGET neograph_${_comp})
             list(APPEND NEOGRAPH_EXPORT_TARGETS neograph_${_comp})
             list(APPEND NEOGRAPH_COMPONENTS_BUILT ${_comp})
@@ -1609,7 +1725,7 @@ if(NEOGRAPH_INSTALL_EXPORT)
     # point: an install that was built without libpq must not make its consumers
     # hunt for PostgreSQL.
     set(NEOGRAPH_CONFIG_DEPENDENCIES "find_dependency(Threads)")
-    if(TARGET neograph_async OR TARGET neograph_llm)
+    if(TARGET neograph_async OR TARGET neograph_llm OR TARGET neograph_mcp_http_server)
         string(APPEND NEOGRAPH_CONFIG_DEPENDENCIES "\nfind_dependency(OpenSSL)")
     endif()
     if(TARGET neograph_postgres)
@@ -1682,6 +1798,7 @@ if(NEOGRAPH_BUILD_PYBIND)
     # not be located" — which is exactly what flipping NEOGRAPH_BUILD_MCP=ON in
     # pyproject.toml without touching this list did.
     if(TARGET neograph_mcp)
+        list(APPEND NEOGRAPH_PYBIND_LIBS neograph_mcp_types)
         list(APPEND NEOGRAPH_PYBIND_LIBS neograph_mcp)
     endif()
     # neograph_a2a ships when A2A is built. Same reasoning as above:

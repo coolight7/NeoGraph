@@ -7,7 +7,7 @@
 // 흐름:
 //   1) 그래프를 JSON 으로 기술 — 채널 1개 + 노드 1개 + 엣지
 //   2) 노드 타입을 등록
-//   3) compile → run → 결과를 result.channel<T>(name) 으로 꺼냄
+//   3) build → run → 결과를 result.channel<T>(name) 으로 꺼냄
 //
 // 실행: ./example_minimal     출력: "HELLO"
 
@@ -19,11 +19,13 @@
 using namespace neograph;
 using namespace neograph::graph;
 
+const ChannelKey<std::string> text_channel{"text"};
+
 // 노드 한 개. 채널 "text" 를 읽어서 대문자로 바꿔 다시 같은 채널에 씀.
 class UpperNode : public GraphNode {
 public:
     asio::awaitable<NodeOutput> run(NodeInput in) override {
-        std::string s = in.state.get("text").get<std::string>();
+        std::string s = in.state.get(text_channel);
         for (auto& c : s) c = static_cast<char>(std::toupper(c));
         NodeOutput out;
         out.writes.push_back(ChannelWrite{"text", json(s)});
@@ -52,12 +54,12 @@ int main() {
 
     // (3) 컴파일 → 실행 → 결과 꺼냄.
     NodeContext ctx;
-    auto engine = GraphEngine::compile(def, ctx);
+    auto        engine = GraphEngine::build_strict(def, EngineConfig{.node_context = ctx});
 
     RunConfig cfg;
     cfg.input = {{"text", "hello"}};
     auto result = engine->run(cfg);
 
-    std::cout << result.channel<std::string>("text") << "\n";   // → HELLO
+    std::cout << result.channel(text_channel) << "\n";   // → HELLO
     return 0;
 }

@@ -151,23 +151,20 @@ class NEOGRAPH_API SchemaProvider : public Provider {
     /// no nested `run_sync`, no shared-state race against the
     /// awaiter's io_context.
     ///
-    /// For the HTTP/SSE path (httplib synchronous) it defers to
-    /// `Provider::complete_stream_async`'s base implementation, which
-    /// post-#4 spawns a dedicated worker thread for `complete_stream`
-    /// and dispatches tokens back onto the awaiter's executor — so
-    /// the engine's io_context worker stays responsive and the user
-    /// `on_chunk` runs single-threaded with the awaiting coroutine.
+    /// For the HTTP/SSE path (httplib synchronous) it dispatches
+    /// `complete_stream` onto the provider's long-lived bridge thread.
+    /// That thread writes tokens to a private queue; the awaiting
+    /// coroutine drains the queue on its own executor. The engine's
+    /// io_context stays responsive, user callbacks remain single-
+    /// threaded with the awaiter, and abandoned calls never dispatch
+    /// back into a destroyed outer io_context.
     asio::awaitable<ChatCompletion>
     complete_stream_async(const CompletionParams& params,
                           const StreamCallback& on_chunk) override;
 
-    /// v1.0 single-dispatch override (Candidate 6 PR6). Anchors the
-    /// dispatch surface — engine `provider->invoke(...)` calls land
-    /// here directly instead of bouncing through the base default that
-    /// re-forwards to the 4-virtual chain. v0.9 body routes through
-    /// existing native overrides (no behavioural change); v1.0 will
-    /// fold complete_async + complete_stream_async bodies into invoke()
-    /// and delete the legacy methods.
+    /// Callback-selected compatibility override. Engine
+    /// `provider->invoke(...)` calls land here and route through the
+    /// stable native overrides above without changing their behavior.
     asio::awaitable<ChatCompletion>
     invoke(const CompletionParams& params, StreamCallback on_chunk) override;
 

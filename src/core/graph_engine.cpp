@@ -4,7 +4,13 @@
 #include <neograph/graph/loader.h>
 #include <neograph/graph/validator.h>
 
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/error.hpp>
+#include <asio/system_error.hpp>
+#include <asio/this_coro.hpp>
 #include <asio/thread_pool.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -23,81 +29,135 @@ std::size_t default_worker_count() {
     auto n = std::thread::hardware_concurrency();
     return n > 0 ? static_cast<std::size_t>(n) : 4u;
 }
+
+void report_validation(const ValidationReport& report, int schema_version) {
+    if (schema_version >= 1) {
+        if (report.has_errors()) {
+            throw std::runtime_error("graph validation failed (schema_version " +
+                                     std::to_string(schema_version) + "):\n" + report.summary());
+        }
+        for (const auto* warning : report.warnings()) {
+            std::fprintf(stderr, "[neograph] lint [%s] %s: %s\n", warning->code.c_str(),
+                         warning->path.c_str(), warning->message.c_str());
+        }
+    } else {
+        for (const auto* error : report.errors()) {
+            std::fprintf(stderr, "[neograph] warning: [%s] %s: %s\n", error->code.c_str(),
+                         error->path.c_str(), error->message.c_str());
+        }
+    }
+}
 }  // namespace
 
 // =========================================================================
-// compile(): JSON definition -> GraphEngine
+// compile(): compatibility facade over the canonical build() path
 //
-// Parsing is delegated to GraphCompiler (pure JSON → CompiledGraph). This
-// function is now just a thin adapter: move every parsed field into the
-// engine's runtime home, then construct the Scheduler from the resulting
-// edge topology + barrier specs.
+// Keep the original signature and behavior while routing construction through
+// EngineConfig so both entry points share one implementation.
 // =========================================================================
 std::unique_ptr<GraphEngine> GraphEngine::compile(const json&                      definition,
                                                   const NodeContext&               default_context,
                                                   std::shared_ptr<CheckpointStore> store) {
-    auto cg = GraphCompiler::compile(definition, default_context);
+    EngineConfig config;
+    config.node_context     = default_context;
+    config.checkpoint_store = std::move(store);
+    return build(definition, std::move(config));
+}
 
-    // Translation validation: assert nothing was silently dropped or
-    // rewired between the JSON definition and the compiled graph.
-    // Strict documents (schema_version >= 1) fail hard; legacy
-    // documents get a stderr warning. Must run before the moves below.
-    GraphCompiler::verify_roundtrip(definition, cg);
+std::unique_ptr<GraphEngine> GraphEngine::build(const json& definition, EngineConfig config) {
+    return build(definition, std::move(config), {});
+}
 
-    // Static semantic analysis (issue #75 M2). Strict documents:
-    // errors throw, warnings go to stderr. Legacy documents: only
-    // errors are surfaced (as stderr warnings — they were silent
-    // breakage before, e.g. a dangling edge or an empty route map),
-    // heuristic lint is suppressed to keep existing graphs quiet.
-    {
-        auto report = GraphValidator::validate(cg);
-        if (cg.schema_version >= 1) {
-            if (report.has_errors()) {
-                std::string msg = "graph validation failed (schema_version " +
-                                  std::to_string(cg.schema_version) + "):\n" + report.summary();
-                throw std::runtime_error(msg);
-            }
-            for (const auto* w : report.warnings()) {
-                std::fprintf(stderr, "[neograph] lint [%s] %s: %s\n", w->code.c_str(),
-                             w->path.c_str(), w->message.c_str());
-            }
-        } else {
-            for (const auto* e : report.errors()) {
-                std::fprintf(stderr, "[neograph] warning: [%s] %s: %s\n", e->code.c_str(),
-                             e->path.c_str(), e->message.c_str());
-            }
+std::unique_ptr<GraphEngine> GraphEngine::build(const json&     definition,
+                                                EngineConfig    config,
+                                                EngineResources resources) {
+    if (!resources.tools.empty()) {
+        if (!config.node_context.tools.empty()) {
+            throw std::invalid_argument(
+                "GraphEngine::build received both EngineResources::tools and "
+                "NodeContext::tools; use the owned ToolSet only");
         }
+        config.node_context.tools = resources.tools.view();
     }
 
+    const auto& registry = resources.registry ? *resources.registry : GraphRegistry::global();
+    auto        topology = GraphCompiler::parse(definition, registry);
+
     // Translation validation: assert nothing was silently dropped or
     // rewired between the JSON definition and the compiled graph.
     // Strict documents (schema_version >= 1) fail hard; legacy
     // documents get a stderr warning. Must run before the moves below.
-    GraphCompiler::verify_roundtrip(definition, cg);
+    GraphCompiler::verify_roundtrip(definition, topology);
 
+    // Static semantics operate on the declarative topology before factories
+    // create runtime nodes. Legacy documents keep warning-only behavior.
+    report_validation(GraphValidator::validate(topology, registry), topology.schema_version);
+
+    auto cg = GraphCompiler::link(std::move(topology), config.node_context, registry);
+    return link_impl(std::move(cg), std::move(config), std::move(resources), false);
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::build_strict(const json&  definition,
+                                                       EngineConfig config) {
+    return build_strict(definition, std::move(config), {});
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::build_strict(const json&     definition,
+                                                       EngineConfig    config,
+                                                       EngineResources resources) {
+    json strict_definition = definition;
+    if (!strict_definition.contains("schema_version") ||
+        (strict_definition["schema_version"].is_number_integer() &&
+         strict_definition["schema_version"].get<int>() == 0)) {
+        strict_definition["schema_version"] = 1;
+    }
+    return build(strict_definition, std::move(config), std::move(resources));
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::link(CompiledGraph cg, EngineConfig config) {
+    return link(std::move(cg), std::move(config), {});
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::link(CompiledGraph   cg,
+                                               EngineConfig    config,
+                                               EngineResources resources) {
+    return link_impl(std::move(cg), std::move(config), std::move(resources), true);
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::link(ValidatedTopology topology, EngineConfig config) {
+    return link(std::move(topology), std::move(config), {});
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::link(ValidatedTopology topology,
+                                               EngineConfig      config,
+                                               EngineResources   resources) {
+    if (!resources.tools.empty()) {
+        if (!config.node_context.tools.empty()) {
+            throw std::invalid_argument(
+                "GraphEngine::link received both EngineResources::tools and "
+                "NodeContext::tools; use the owned ToolSet only");
+        }
+        config.node_context.tools = resources.tools.view();
+    }
+
+    const auto& registry = resources.registry ? *resources.registry : GraphRegistry::global();
+    report_validation(topology.report(), topology.topology().schema_version);
+    auto cg = GraphCompiler::link(std::move(topology).release(), config.node_context, registry);
+    return link_impl(std::move(cg), std::move(config), std::move(resources), false);
+}
+
+std::unique_ptr<GraphEngine> GraphEngine::link_impl(CompiledGraph   cg,
+                                                    EngineConfig    config,
+                                                    EngineResources resources,
+                                                    bool            validate) {
     // Static semantic analysis (issue #75 M2). Strict documents:
     // errors throw, warnings go to stderr. Legacy documents: only
     // errors are surfaced (as stderr warnings — they were silent
     // breakage before, e.g. a dangling edge or an empty route map),
     // heuristic lint is suppressed to keep existing graphs quiet.
-    {
-        auto report = GraphValidator::validate(cg);
-        if (cg.schema_version >= 1) {
-            if (report.has_errors()) {
-                std::string msg = "graph validation failed (schema_version " +
-                                  std::to_string(cg.schema_version) + "):\n" + report.summary();
-                throw std::runtime_error(msg);
-            }
-            for (const auto* w : report.warnings()) {
-                std::fprintf(stderr, "[neograph] lint [%s] %s: %s\n", w->code.c_str(),
-                             w->path.c_str(), w->message.c_str());
-            }
-        } else {
-            for (const auto* e : report.errors()) {
-                std::fprintf(stderr, "[neograph] warning: [%s] %s: %s\n", e->code.c_str(),
-                             e->path.c_str(), e->message.c_str());
-            }
-        }
+    if (validate) {
+        const auto& registry = resources.registry ? *resources.registry : GraphRegistry::global();
+        report_validation(GraphValidator::validate(cg, registry), cg.schema_version);
     }
 
     auto engine                = std::unique_ptr<GraphEngine>(new GraphEngine());
@@ -111,6 +171,17 @@ std::unique_ptr<GraphEngine> GraphEngine::compile(const json&                   
     if (cg.retry_policy) {
         engine->default_retry_policy_ = *cg.retry_policy;
     }
+    if (config.retry_policy) {
+        engine->default_retry_policy_ = *config.retry_policy;
+    }
+    engine->node_retry_policies_ = std::move(config.node_retry_policies);
+    engine->checkpoint_store_    = std::move(config.checkpoint_store);
+    engine->store_               = std::move(config.store);
+    engine->tool_gate_           = std::move(config.tool_gate);
+    engine->owned_tools_         = std::move(resources.tools).release();
+    for (const auto& node_name : config.cached_nodes) {
+        engine->node_cache_.set_enabled(node_name, true);
+    }
 
     // Signal-based dispatch — see Scheduler. A node becomes ready in
     // super-step S+1 iff some node in step S routed to it (regular edge,
@@ -119,8 +190,17 @@ std::unique_ptr<GraphEngine> GraphEngine::compile(const json&                   
     // and deadlock conditional self-loops. Explicitly-declared barriers
     // (via the node's "barrier": {"wait_for": [...]} field) opt back
     // into AND-join semantics for those specific nodes.
-    engine->scheduler_ = std::make_unique<Scheduler>(engine->edges_, engine->conditional_edges_,
-                                                     std::move(cg.barrier_specs));
+    engine->scheduler_ =
+        std::make_unique<Scheduler>(engine->edges_, engine->conditional_edges_,
+                                    std::move(cg.barrier_specs), resources.registry);
+
+    GraphEngine* self         = engine.get();
+    auto         retry_lookup = [self](const std::string& node_name) {
+        return self->get_retry_policy(node_name);
+    };
+    engine->executor_ = std::make_unique<NodeExecutor>(
+        engine->nodes_, engine->channel_defs_, std::move(retry_lookup),
+        std::move(resources.registry), nullptr, &engine->node_cache_);
 
     // NodeExecutor owns retry + fan-out + Send invocation. Bind the
     // retry-policy lookup to this engine's per-node override map so
@@ -151,9 +231,7 @@ std::unique_ptr<GraphEngine> GraphEngine::compile(const json&                   
     // bodies, large fan-out, etc.) call `set_worker_count_auto()` or
     // `set_worker_count(N)` explicitly. The opt-in surface is
     // documented in `docs/migration-v0.4-to-v1.0.md`.
-    engine->set_worker_count(1);
-
-    engine->checkpoint_store_ = std::move(store);
+    engine->set_worker_count(config.worker_count);
     return engine;
 }
 
@@ -205,18 +283,19 @@ void GraphEngine::set_worker_count(std::size_t n) {
     // resizable. Dtor joins the old pool's workers, so callers must
     // not resize across an in-flight run() (documented on declaration).
     GraphEngine* self         = this;
+    auto         registry     = executor_ ? executor_->registry_ : nullptr;
     auto         retry_lookup = [self](const std::string& node_name) {
         return self->get_retry_policy(node_name);
     };
     if (n == 1) {
         pool_.reset();
         executor_ = std::make_unique<NodeExecutor>(nodes_, channel_defs_, std::move(retry_lookup),
-                                                   nullptr, &node_cache_);
+                                                   std::move(registry), nullptr, &node_cache_);
         return;
     }
     pool_     = std::make_unique<asio::thread_pool>(n);
     executor_ = std::make_unique<NodeExecutor>(nodes_, channel_defs_, std::move(retry_lookup),
-                                               pool_.get(), &node_cache_);
+                                               std::move(registry), pool_.get(), &node_cache_);
 }
 
 void GraphEngine::set_worker_count_auto() {
@@ -240,6 +319,31 @@ RetryPolicy GraphEngine::get_retry_policy(const std::string& node_name) const {
 // =========================================================================
 // get_state / get_state_history / update_state / fork
 // =========================================================================
+
+GraphAdmin GraphEngine::admin() noexcept {
+    return GraphAdmin(*this);
+}
+
+std::optional<json> GraphAdmin::get_state(const std::string& thread_id) const {
+    return engine_->get_state(thread_id);
+}
+
+std::vector<Checkpoint> GraphAdmin::get_state_history(const std::string& thread_id,
+                                                      int                limit) const {
+    return engine_->get_state_history(thread_id, limit);
+}
+
+void GraphAdmin::update_state(const std::string& thread_id,
+                              const json&        channel_writes,
+                              const std::string& as_node) const {
+    engine_->update_state(thread_id, channel_writes, as_node);
+}
+
+std::string GraphAdmin::fork(const std::string& source_thread_id,
+                             const std::string& new_thread_id,
+                             const std::string& checkpoint_id) const {
+    return engine_->fork(source_thread_id, new_thread_id, checkpoint_id);
+}
 
 std::optional<json> GraphEngine::get_state(const std::string& thread_id) const {
     if (!checkpoint_store_) return std::nullopt;
@@ -328,9 +432,13 @@ void GraphEngine::update_state(const std::string& thread_id,
     // super-step saves propagate this for the same reason.
     new_cp.barrier_state = cp.barrier_state;
     new_cp.step          = cp.step;
-    new_cp.timestamp     = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
+    const int64_t now =
+        static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count());
+    // update_state preserves the parent's step, so millisecond timestamp ties
+    // would leave durable stores unable to identify the newer checkpoint.
+    new_cp.timestamp = std::max(now, cp.timestamp + 1);
 
     checkpoint_store_->save(new_cp);
 }
@@ -347,6 +455,10 @@ std::string GraphEngine::fork(const std::string& source_thread_id,
         cp_opt = checkpoint_store_->load_by_id(checkpoint_id);
     }
     if (!cp_opt) throw std::runtime_error("No checkpoint found for fork source");
+    if (cp_opt->thread_id != source_thread_id) {
+        throw std::runtime_error("Checkpoint does not belong to fork source thread: " +
+                                 source_thread_id);
+    }
 
     Checkpoint forked;
     forked.id               = Checkpoint::generate_id();
@@ -376,14 +488,7 @@ std::string GraphEngine::fork(const std::string& source_thread_id,
 // =========================================================================
 
 void GraphEngine::init_state(GraphState& state) const {
-    for (const auto& cd : channel_defs_) {
-        auto reducer = ReducerRegistry::instance().get(cd.reducer_name);
-        json initial = cd.initial_value;
-        if (cd.type == ReducerType::APPEND && initial.is_null()) {
-            initial = json::array();
-        }
-        state.init_channel(cd.name, cd.type, reducer, initial);
-    }
+    executor_->init_state(state);
 }
 
 void GraphEngine::apply_input(GraphState& state, const json& input) const {
@@ -407,7 +512,12 @@ RunResult GraphEngine::run(const RunConfig& config) {
     // thread-pool hop. Parallel fan-out inside run_parallel_async /
     // run_sends_async still uses pool_ explicitly for CPU
     // parallelism (see NodeExecutor::fan_out_pool_).
-    return neograph::async::run_sync(execute_graph_async(config, nullptr));
+    RunConfig operation_config = config;
+    if (config.cancel_token) {
+        operation_config.cancel_token = config.cancel_token->fork();
+    }
+    return neograph::async::detail::run_sync_operation(
+        execute_graph_async(operation_config, nullptr), operation_config.cancel_token);
 }
 
 // Public async entry — takes RunConfig BY VALUE so the coroutine frame
@@ -420,34 +530,98 @@ RunResult GraphEngine::run(const RunConfig& config) {
 // callers (run_sync, run_async, resume_async) all keep the config
 // alive on their own stack frame.
 asio::awaitable<RunResult> GraphEngine::run_async(RunConfig config) {
-    co_return co_await execute_graph_async(config, nullptr);
+    auto operation =
+        config.cancel_token ? config.cancel_token->fork() : std::shared_ptr<CancelToken>{};
+    config.cancel_token = operation;
+    if (!operation) {
+        co_return co_await execute_graph_async(config, nullptr);
+    }
+
+    auto executor = co_await asio::this_coro::executor;
+    operation->bind_executor(executor);
+    operation->throw_if_cancelled("run_async entry");
+    try {
+        co_return co_await asio::co_spawn(
+            executor, execute_graph_async(config, nullptr),
+            asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
+    } catch (const asio::system_error& error) {
+        if (operation->is_cancelled() && error.code() == asio::error::operation_aborted) {
+            throw CancelledException("run_async operation aborted");
+        }
+        throw;
+    }
 }
 
 RunResult GraphEngine::run_stream(const RunConfig& config, const GraphStreamCallback& cb) {
-    return neograph::async::run_sync(execute_graph_async(config, cb));
+    RunConfig operation_config = config;
+    if (config.cancel_token) {
+        operation_config.cancel_token = config.cancel_token->fork();
+    }
+    return neograph::async::detail::run_sync_operation(execute_graph_async(operation_config, cb),
+                                                       operation_config.cancel_token);
 }
 
 asio::awaitable<RunResult> GraphEngine::run_stream_async(RunConfig config, GraphStreamCallback cb) {
     // Same lifetime concern as run_async — both config and cb might
     // be stack-local at the callsite, captured into a co_spawn'd
     // awaitable that outlives the callsite. Take both by value.
-    co_return co_await execute_graph_async(config, cb);
+    auto operation =
+        config.cancel_token ? config.cancel_token->fork() : std::shared_ptr<CancelToken>{};
+    config.cancel_token = operation;
+    if (!operation) {
+        co_return co_await execute_graph_async(config, cb);
+    }
+
+    auto executor = co_await asio::this_coro::executor;
+    operation->bind_executor(executor);
+    operation->throw_if_cancelled("run_stream_async entry");
+    try {
+        co_return co_await asio::co_spawn(
+            executor, execute_graph_async(config, cb),
+            asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
+    } catch (const asio::system_error& error) {
+        if (operation->is_cancelled() && error.code() == asio::error::operation_aborted) {
+            throw CancelledException("run_stream_async operation aborted");
+        }
+        throw;
+    }
 }
 
 RunResult GraphEngine::resume(const std::string&         thread_id,
                               const json&                resume_value,
                               const GraphStreamCallback& cb) {
-    return neograph::async::run_sync(resume_async(thread_id, resume_value, cb));
+    RunConfig config;
+    config.thread_id = thread_id;
+    return resume(config, resume_value, cb);
+}
+
+RunResult GraphEngine::resume(const RunConfig&           config,
+                              const json&                resume_value,
+                              const GraphStreamCallback& cb) {
+    return neograph::async::run_sync(resume_async(config, resume_value, cb));
 }
 
 asio::awaitable<RunResult> GraphEngine::resume_async(const std::string&         thread_id,
                                                      const json&                resume_value,
                                                      const GraphStreamCallback& cb) {
+    RunConfig config;
+    config.thread_id = thread_id;
+    co_return co_await resume_async(std::move(config), resume_value, cb);
+}
+
+asio::awaitable<RunResult> GraphEngine::resume_async(RunConfig           config,
+                                                     json                resume_value,
+                                                     GraphStreamCallback cb) {
     // Sem 3.7.5: real async resume. Mirrors sync resume() but the
     // load_latest and the downstream super-step loop go through
     // their *_async peers, so the whole resume path is non-blocking.
     if (!checkpoint_store_)
         throw std::runtime_error("Cannot resume: no checkpoint store configured");
+
+    if (config.thread_id.empty()) {
+        throw std::invalid_argument("Cannot resume: thread_id is required");
+    }
+    const auto& thread_id = config.thread_id;
 
     auto cp_opt = co_await checkpoint_store_->load_latest_async(thread_id);
     if (!cp_opt) throw std::runtime_error("No checkpoint found for thread: " + thread_id);
@@ -459,11 +633,7 @@ asio::awaitable<RunResult> GraphEngine::resume_async(const std::string&         
         co_return result;
     }
 
-    RunConfig config;
-    config.thread_id = thread_id;
-    config.max_steps = 50;
-
-    co_return co_await execute_graph_async(config, cb, cp_opt->next_nodes, resume_value);
+    co_return co_await execute_graph_async(config, cb, cp_opt->next_nodes, &resume_value);
 }
 
 // =========================================================================
@@ -484,7 +654,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
     const RunConfig&                config,
     const GraphStreamCallback&      cb,
     const std::vector<std::string>& resume_from,
-    const json&                     resume_value) {
+    const json*                     resume_value) {
     const bool is_resume = !resume_from.empty();
 
     // RAII inc/dec on the inflight-run counter — set_worker_count()
@@ -530,7 +700,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
     // fresh run, which is how a node distinguishes "nobody has answered yet"
     // from "the answer was no". Only engaged on an actual resume, so the
     // common path pays no json allocation.
-    if (!resume_value.is_null()) ctx.resume_value = resume_value;
+    if (resume_value && !resume_value->is_null()) ctx.resume_value = *resume_value;
     ctx.tool_gate = tool_gate_;  // issue #89 — engine-level, so resume() keeps it
     // ctx.deadline / ctx.trace_id stay default-constructed for now —
     // RunConfig has no source field for either. Future PRs add them.
@@ -558,12 +728,12 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
             // dynamic interrupts exist for. Every node now reads the answer
             // from ``ctx.resume_value`` regardless; this write stays for the
             // graphs that were relying on it (issue #94).
-            if (!resume_value.is_null() && state.has_channel("messages")) {
+            if (resume_value && !resume_value->is_null() && state.has_channel("messages")) {
                 // Build the resume message outside the brace-init that
                 // would otherwise nest inside the coroutine body. Same
                 // GCC 13 ICE shape; same workaround.
-                std::string content = resume_value.is_string() ? resume_value.get<std::string>()
-                                                               : resume_value.dump();
+                std::string content = resume_value->is_string() ? resume_value->get<std::string>()
+                                                                : resume_value->dump();
                 json        resume_msg;
                 resume_msg["role"]    = "user";
                 resume_msg["content"] = content;
@@ -601,11 +771,11 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
         // v0.3: cooperative cancel checkpoint. Polled at the super-step
         // boundary so any future node work is suppressed; in-flight
         // HTTP work inside the just-finished step is aborted via the
-        // asio cancellation_signal bound at co_spawn time (see pybind
-        // bind_graph.cpp::run_async wiring) — both layers needed to
-        // close the cost-leak gap reported in v0.2.3.
-        if (config.cancel_token) {
-            config.cancel_token->throw_if_cancelled("step " + std::to_string(step));
+        // operation child's asio cancellation_signal bound by run_async /
+        // run_stream_async (or the sync bridge for blocking entry points).
+        // Both layers are needed to close the cost-leak gap from v0.2.3.
+        if (ctx.cancel_token) {
+            ctx.cancel_token->throw_if_cancelled("step " + std::to_string(step));
         }
 
         // hit_end is informational only — a Send target with no outgoing
@@ -643,7 +813,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
                         json data;
                         data["phase"]         = "before";
                         data["checkpoint_id"] = cp_id;
-                        cb(GraphEvent{GraphEvent::Type::INTERRUPT, node_name, data});
+                        cb(GraphEvent{GraphEvent::Type::INTERRUPT, node_name, std::move(data)});
                     }
                     co_return result;
                 }
@@ -771,7 +941,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
                     json data;
                     data["phase"]         = "after";
                     data["checkpoint_id"] = cp_id;
-                    cb(GraphEvent{GraphEvent::Type::INTERRUPT, node_name, data});
+                    cb(GraphEvent{GraphEvent::Type::INTERRUPT, node_name, std::move(data)});
                 }
                 co_return result;
             }
@@ -804,7 +974,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
             if (plan.winning_command_goto) {
                 json data;
                 data["command_goto"] = *plan.winning_command_goto;
-                cb(GraphEvent{GraphEvent::Type::NODE_START, "__routing__", data});
+                cb(GraphEvent{GraphEvent::Type::NODE_START, "__routing__", std::move(data)});
             }
             if (!ready.empty()) {
                 json next_nodes_arr = json::array();
@@ -813,7 +983,7 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
                 json data;
                 data["next_nodes"] = next_nodes_arr;
                 data["step"]       = step;
-                cb(GraphEvent{GraphEvent::Type::NODE_START, "__routing__", data});
+                cb(GraphEvent{GraphEvent::Type::NODE_START, "__routing__", std::move(data)});
             }
         }
 
@@ -844,6 +1014,9 @@ asio::awaitable<RunResult> GraphEngine::execute_graph_async(
     result.usage           = ctx.usage->snapshot();  // #88
     result.output          = state.serialize();
     result.execution_trace = std::move(trace);
+    if (!ready.empty()) {
+        result.output["_neograph"] = json{{"max_steps_exhausted", true}};
+    }
     if (!last_checkpoint_id.empty()) {
         result.checkpoint_id = last_checkpoint_id;
     }

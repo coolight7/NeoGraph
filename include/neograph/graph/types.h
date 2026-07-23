@@ -9,17 +9,21 @@
 #pragma once
 
 #include <neograph/api.h>
-#include <neograph/types.h>
 #include <neograph/provider.h>
 #include <neograph/tool.h>
+#include <neograph/types.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
-#include <cstdint>
 
 // Windows SDK (pulled in transitively via asio on Win32) defines a
 // bunch of ALL-CAPS macros — notably ERROR (wingdi.h) and DEBUG —
@@ -165,6 +169,43 @@ private:
 };
 
 /**
+ * @brief A node failure annotated by the executor with dispatch context.
+ *
+ * The original exception remains available through @c cause() and can be
+ * rethrown with @c std::rethrow_exception. Control-flow exceptions such as
+ * NodeInterrupt and CancelledException are never wrapped.
+ */
+class NEOGRAPH_API NodeExecutionError : public std::runtime_error {
+public:
+    NodeExecutionError(std::string node_name, int attempts,
+                       std::exception_ptr cause)
+        : std::runtime_error(make_message(node_name, attempts, cause)),
+          node_name_(std::move(node_name)), attempts_(attempts),
+          cause_(std::move(cause)) {}
+
+    const std::string& node_name() const noexcept { return node_name_; }
+    int attempts() const noexcept { return attempts_; }
+    const std::exception_ptr& cause() const noexcept { return cause_; }
+
+private:
+    static std::string make_message(const std::string& node_name, int attempts,
+                                    const std::exception_ptr& cause) {
+        std::string detail = "unknown exception";
+        try {
+            if (cause) std::rethrow_exception(cause);
+        } catch (const std::exception& e) {
+            detail = e.what();
+        } catch (...) {}
+        return "Node '" + node_name + "' failed after "
+            + std::to_string(attempts) + " attempt(s): " + detail;
+    }
+
+    std::string        node_name_;
+    int                attempts_;
+    std::exception_ptr cause_;
+};
+
+/**
  * @brief Dynamic fan-out request (map-reduce pattern).
  *
  * A node can return Send objects to dispatch the same (or different) node
@@ -304,10 +345,11 @@ struct NodeContext {
     std::shared_ptr<Provider> provider;    ///< LLM provider for making completions.
     /// Non-owning tool pointers consumed by node factories at compile()
     /// time. **Lifetime contract**: the pointees must outlive the
-    /// GraphEngine. Typical pattern: hand the engine ownership via
-    /// `engine.own_tools(std::move(unique_ptr_vec))` after compile, or
-    /// keep the owning unique_ptrs alive in the caller's scope for at
-    /// least as long as the engine. Constructing NodeContext from a
+    /// GraphEngine. New code should pass an owned ToolSet through
+    /// EngineResources; compatibility code can call
+    /// `engine.own_tools(std::move(unique_ptr_vec))` after compile, or keep the
+    /// owning unique_ptrs alive in the caller's scope for at least as long as
+    /// the engine. Constructing NodeContext from a
     /// throwaway unique_ptr collection that goes out of scope before
     /// `engine->run()` returns leaves these pointers dangling and is UB.
     std::vector<Tool*>        tools;
@@ -334,9 +376,107 @@ struct GraphEvent {
     json        data;       ///< Event-specific data payload.
 };
 
+/// Typed view of a node-start event. `data` preserves extension fields.
+struct NodeStartEvent {
+    std::string        node_name;
+    std::optional<int> retry_attempt;
+    json               data;
+};
+
+/// Typed view of a node-end event. `data` preserves extension fields.
+struct NodeEndEvent {
+    std::string                node_name;
+    std::optional<std::string> command_goto;
+    std::size_t                send_count = 0;
+    json                       data;
+};
+
+/// Typed LLM token event.
+struct LlmTokenEvent {
+    std::string node_name;
+    std::string token;
+};
+
+/// Typed channel update event.
+struct ChannelWriteEvent {
+    std::string node_name;
+    std::string channel;
+    json        value;
+};
+
+/// Full serialized state emitted for StreamMode::VALUES.
+struct StateSnapshotEvent {
+    json state;
+};
+
+/// Routing decision emitted for StreamMode::DEBUG.
+struct RoutingEvent {
+    std::optional<std::string> command_goto;
+    std::vector<std::string>   next_nodes;
+    std::optional<int>         step;
+    json                       data;
+};
+
+/// Dynamic Send batch emitted for StreamMode::DEBUG.
+struct SendDispatchEvent {
+    std::vector<Send> sends;
+};
+
+/// Typed HITL interrupt event. `data` remains available for custom metadata.
+struct InterruptEvent {
+    std::string                node_name;
+    std::optional<std::string> phase;
+    std::optional<std::string> checkpoint_id;
+    json                       data;
+};
+
+/// Typed execution error event. `data` preserves retry diagnostics.
+struct ErrorEvent {
+    std::string node_name;
+    std::string message;
+    json        data;
+};
+
+/// Escape hatch for malformed input or payload shapes added by future versions.
+struct RawGraphEvent {
+    GraphEvent event;
+};
+
+using TypedGraphEvent = std::variant<NodeStartEvent,
+                                     NodeEndEvent,
+                                     LlmTokenEvent,
+                                     ChannelWriteEvent,
+                                     StateSnapshotEvent,
+                                     RoutingEvent,
+                                     SendDispatchEvent,
+                                     InterruptEvent,
+                                     ErrorEvent,
+                                     RawGraphEvent>;
+
+/**
+ * @brief Convert the stable GraphEvent wire shape to an owning typed event.
+ *
+ * Existing JSON and callback contracts remain canonical. Sentinel debug events
+ * (`__state__`, `__routing__`, and `__send__`) receive dedicated alternatives;
+ * malformed or unknown payloads are returned as RawGraphEvent instead of
+ * throwing from a streaming callback.
+ */
+NEOGRAPH_API TypedGraphEvent to_typed_event(const GraphEvent& event);
+
 /// Callback for receiving graph execution events.
 /// @param event The graph event to process.
 using GraphStreamCallback = std::function<void(const GraphEvent&)>;
+
+/// Callback for the additive typed event view.
+using TypedGraphStreamCallback = std::function<void(const TypedGraphEvent&)>;
+
+/// @brief Adapt a typed callback to the existing GraphStreamCallback surface.
+inline GraphStreamCallback adapt_typed_stream(TypedGraphStreamCallback callback) {
+    if (!callback) return {};
+    return [callback = std::move(callback)](const GraphEvent& event) {
+        callback(to_typed_event(event));
+    };
+}
 
 /**
  * @brief Extended result returned by node execution.

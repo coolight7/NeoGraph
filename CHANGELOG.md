@@ -11,6 +11,111 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SQLite Harness record store (issue #147 follow-up).** Added the optional
+  `neograph::mcp_sqlite` target and `SqliteHarnessRecordStore` for WAL-backed,
+  schema-versioned artifact/run persistence with immutable artifact and run-to-
+  artifact bindings. The Harness MCP binary now stores records in `runs.db`,
+  while checkpoints remain in `checkpoints.db`.
+
+### Changed
+
+- **Provider API 영구 호환 정책 (issue #5).** `Provider::complete()`,
+  `complete_async()`, `complete_stream()`, `complete_stream_async()`와 callback 기반
+  `invoke()`의 제거 계획을 철회하고 `[[deprecated]]` 경고를 없앴다. 기존 API에는
+  호환성·보안 수정을 계속 적용한다. 새 Provider 구현과 새 직접 호출에는 각각
+  `CompletionProvider::do_invoke()`와 `invoke_request(CompletionRequest)`를 권장하며,
+  새 기능을 기존 API에 모두 역이식하는 것은 보장하지 않는다. 공개 서명, virtual
+  순서, 객체 크기와 vtable은 바뀌지 않는다.
+
+### Removed
+
+- **폐기된 TransformerCPP 연동 예제.** 더 이상 제공되지 않는 외부 저장소에
+  의존하던 `example_inproc_gemma`, `NEOGRAPH_BUILD_LOCAL_INFERENCE_EXAMPLE`,
+  `TRANSFORMERCPP_DIR`를 제거했다. 일반 OpenAI 호환 로컬 서버를 사용하는
+  `example_local_transformer`는 유지한다.
+
+### Fixed
+
+- **MCP 2025-11-25 tool-client contract modernization (issue #147 M0).**
+  Initialization is now idempotent and retains negotiated server metadata;
+  HTTP tools reuse the discovery session; `/mcp` endpoint construction is
+  shared by requests and notifications; tool discovery follows opaque cursors;
+  and JSON-RPC code/data, full tool metadata, non-text content,
+  `structuredContent`, `isError`, and `_meta` survive C++ and Python paths.
+  Added configurable HTTP timeout/static/dynamic headers, output-schema
+  validation, strict response-ID checking, and typed `InitializeResult`,
+  `ToolDefinition`, `ListToolsPage`, and `CallToolResult` APIs. SSE detection now
+  uses `Content-Type` rather than misclassifying JSON containing `data:` URLs.
+- **취소 작업별 상태와 게시된 emit 수명 안전성.** `GraphEngine::run`, `run_async`,
+  `run_stream`, `run_stream_async`는 호출자가 준 parent에서 실행별 child를
+  하나씩 만들고, 그 child만 내부 `co_spawn`/sync bridge에 묶으며 같은
+  child를 `RunContext`로 전달한다. 따라서 parent 하나로 동시에 실행 중인
+  여러 run을 모두 취소해도 cancellation slot이 서로 덮이지 않는다.
+  Fork된 실행 child는 기존 `shared_ptr` 소유권을 게시된 emit까지 유지해
+  엔진 작업 종료와 emit 실행 사이의 use-after-free를 막는다.
+  취소 때문에 생긴 asio `operation_aborted`는 재시도 가능한 노드 오류가
+  아니라 `CancelledException`으로 전달한다.
+  `CancelToken`의 0.11.x 객체 배치와 inline/header-only 동작은 그대로다.
+  따라서 이미 컴파일된 C++ 소비자가 갱신된 `fork()` 수명 동작까지 받으려면
+  재컴파일해야 한다. 공유 라이브러리만 교체해도 객체 배치는 호환되지만,
+  소비자 바이너리에 들어간 기존 inline 본문은 바뀌지 않는다.
+  단, 외부 코드가 직접 만든 token에 `bind_executor()`를 호출한 경우에는
+  해당 executor의 게시 작업이 끝날 때까지 token을 살려 둘 책임이 여전히
+  호출자에게 있다.
+- **PostgreSQL 비동기 연결의 전역 제한 시간 정책 명문화.** 비동기 최초
+  연결·교체는 모든 host/IP를 합쳐 하나의 제한 시간을 사용한다. 양수
+  connection string에 직접 쓴 `connect_timeout`은 최소 2초로 적용하고,
+  미지정·0·음수이거나 환경변수·service file로만 지정한 값이면 운영 안전
+  기본값 30초를 사용한다. libpq의 host별 동기 제한 시간과 의도적으로
+  다르며, 동기 생성·교체 동작은 바꾸지 않았다.
+- **JARVIS mock 빌드 복구 (issue #130).** 음성 의존성이 없을 때
+  `MicCapture`가 불완전한 타입으로 남아 `cookbook_jarvis` 컴파일이 실패하던
+  문제를 수정했다. `NEOGRAPH_JARVIS_FORCE_MOCK`을 추가해 ASan CI가 runner의
+  설치 패키지와 관계없이 외부 음성 의존성 없는 mock 구성을 항상 빌드한다.
+  세션 실행기도 실제 CMake 출력 경로와 specialist 대상 이름을 사용하고,
+  존재하는 `demo_mcp_server.py`를 기동하도록 맞췄다.
+- **노드 실패 문맥 보존 (issue #123).** C++ 실행 오류를 원래
+  `exception_ptr`과 실패 노드 이름·시도 횟수를 담은 `NodeExecutionError`로
+  전달하고, terminal `ERROR` event에도 같은 문맥을 기록한다. Python에서는
+  원래 예외 객체·타입·args·사용자 속성·traceback을 그대로 유지하면서
+  `.node_name`과 `.attempts` 속성만 추가한다. `NodeInterrupt`, 취소, 메모리
+  부족 예외는 기존 제어 흐름대로 감싸지 않는다.
+
+### Fixed (docs)
+
+- **Provider cookbook의 무시되던 노드별 prompt 제거 (issue #116).** 세 Python
+  예제가 built-in `llm_call`이 읽지 않는 `config.system`으로 여러 역할을
+  수행한다고 설명하던 문제를 수정했다. 각 예제를
+  `NodeContext.instructions`를 쓰는 strict 단일 호출 graph로 바꾸고 관련
+  README를 실제 동작에 맞췄다.
+- **예약된 `RunContext::deadline` 설명 정정 (issue #115).** 현재
+  `RunConfig`로 설정할 수 없고 Python에도 노출되지 않는 `deadline`과
+  `trace_id`를 사용 가능한 per-run metadata처럼 안내하던 문서와 Doxygen
+  주석을 수정했다.
+- **`GraphNode::run` 예제 서명 수정 (issue #129).** 공개 헤더 예제가 실제
+  by-value virtual과 달리 `const NodeInput&`를 받아 override에 실패하던 문제를
+  수정하고, 코루틴 인자 수명에 필요한 by-value 계약을 compile-time test로
+  고정했다.
+
+### Added
+
+- **하위 호환 Provider 이전 경로.** 새 `CompletionRequest`가 streaming mode를
+  callback 유무와 분리하고, `CompletionProvider`는 새 구현이 `do_invoke()`
+  하나만 작성하게 한다. 기존 `Provider` vtable, 네 legacy virtual, callback
+  기반 `invoke()`, Python `complete()` subclass 계약은 그대로 유지한다.
+
+- **Python persistence backends** (#117) — `Store` and `CheckpointStore` are
+  now constructible subclass bases with C++ virtual dispatch into Python.
+  `StoreItem`, `CheckpointPhase`, `Checkpoint`, and `PendingWrite` are exposed
+  with JSON-shaped fields; checkpoint pending-write methods remain optional.
+- **Python synchronous cancellation** (#119) — Python callers can construct a
+  `CancelToken`, assign it to `RunConfig.cancel_token`, and cooperatively stop
+  `engine.run()` from another thread.
+
+- **Python checkpoint history** (#118) — `GraphEngine.get_state_history()`
+  exposes newest-first checkpoint records so callers can inspect parent links,
+  metadata, steps, and IDs before forking from a historical state.
+
 - **DSL 표면 (elaboration 계층) + 스키마 진화 게이트** (#75 M4).
   - **Elaborator**: `vars`(`{"$var":...}`·`${...}` 보간, 비순환 강제) /
     `templates`+`use`(파라미터 정확 일치 강제, 노드 prefix 리네임 —
@@ -150,6 +255,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     하위 호환.
   - 검증: 478/478 ctest, Valgrind 누수 0, TSAN race 0.
 
+### Fixed
+
+- **Python 비동기 실행의 예외 보존 (issue #122).** `run_async`,
+  `run_stream_async`, `resume_async`가 Python 노드의 원래 예외를 문자열로
+  바꾼 새 `RuntimeError`로 덮어쓰던 문제를 수정. 이제 pybind11의 표준
+  예외 변환 경로를 거쳐 원래 Python 예외 객체·타입·사용자 속성·traceback을
+  보존하고, C++ `py::type_error`도 동기 실행과 같은 Python `TypeError`로
+  전달한다. `resume_async`의 빈 callback도 코루틴이 끝날 때까지 보관해
+  pybind11 3.x에서 드러난 dangling-reference 충돌을 함께 막았다.
+
 ### Fixed (docs)
 
 - **샌드박스 실측으로 드러난 README 요약 배지의 조건 누락·내부 모순 정정.**
@@ -220,6 +335,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       재발 방지).
 
 ### Fixed
+
+- **토폴로지 최상위 컨테이너 형식 검증 (#126).** `channels`/`nodes`는
+  객체가 아니면 모든 모드에서 거부한다. `edges`/`conditional_edges`의
+  배열 검증은 strict 모드에서 강제하며, legacy의 keyed edge map 호환성은
+  유지한다. 오류에는 전체 입력 대신 경로와 JSON 종류만 기록한다.
+- **`max_steps` 종료 상태 노출 (#114).**
+  `RunResult::max_steps_exhausted()`와 Python의 읽기 전용
+  `RunResult.max_steps_exhausted` 속성을 추가했다. 실행할 노드가 남은 상태에서
+  `max_steps`에 도달했을 때만 참이며, 같은 상태를 gRPC 단건 응답과 스트리밍
+  마지막 JSON에서도 제공한다. C++ 구조체 크기는 바꾸지 않았다.
 
 - **`set_worker_count` / `set_worker_count_auto` docstring 정정
   (issue #62, PR #63).** v1.0 prep 사이클에 `compile()` 의 worker pool
@@ -806,17 +931,18 @@ The opening release of the v1.0 sharpening track (ROADMAP_v1.md).
 The 8-virtual `GraphNode` cross-product (`execute` / `execute_async` /
 `execute_full` / … / `execute_full_stream_async`) collapses to a
 single canonical method: `run(NodeInput) -> awaitable<NodeOutput>`.
-Per-run metadata (cancel token, deadline, trace_id) moves from a
-non-channel-set `GraphState` member + a thread-local smuggling
-channel into an explicit `RunContext` argument. `CancelToken` gains
+Per-run cancellation metadata moves from a non-channel-set `GraphState`
+member + a thread-local smuggling channel into an explicit `RunContext`
+argument. `deadline` and `trace_id` were added only as reserved extension
+slots and are not populated by `RunConfig`. `CancelToken` gains
 hierarchical `fork()` so multi-Send fan-out workers each own a
 private signal that the parent's `cancel()` cascades to.
 
 ### Added
 
-- `RunContext` (`include/neograph/graph/engine.h`) — explicit
-  per-run metadata: `cancel_token`, `deadline`, `trace_id`,
-  `thread_id`, `step`, `stream_mode`. Engine threads through every
+- `RunContext` (`include/neograph/graph/engine.h`) — explicit per-run metadata:
+  usable `cancel_token`, `thread_id`, `step`, `stream_mode`, plus reserved
+  `deadline` and `trace_id` slots. Engine threads it through every
   `NodeExecutor::run` call. **PR 1, commit `a473f0e`.**
 - `GraphNode::run(NodeInput) -> awaitable<NodeOutput>` — single
   canonical dispatch entry point. `NodeInput { state, ctx,

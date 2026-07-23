@@ -1,9 +1,12 @@
-#include <neograph/graph/validator.h>
 #include <neograph/graph/loader.h>
+#include <neograph/graph/registry.h>
+#include <neograph/graph/validator.h>
+
 #include <algorithm>
 #include <map>
 #include <queue>
 #include <set>
+#include <stdexcept>
 
 namespace neograph::graph {
 
@@ -19,7 +22,8 @@ json string_set_to_array(const std::set<std::string>& s) {
 }
 
 struct Ctx {
-    const CompiledGraph& cg;
+    const TopologySpec& cg;
+    const GraphRegistry&  registry;
     std::set<std::string> node_names;
     // Static successor map: plain edges + every conditional route
     // target. The scheduler's fallback route is always one of the
@@ -244,7 +248,7 @@ void check_routes(Ctx& c) {
             continue;
         }
 
-        auto spec = ConditionRegistry::instance().condition_spec(ce.condition);
+        auto spec = c.registry.condition_spec(ce.condition);
         if (!spec) continue;   // no declared contract — skip
 
         const std::set<std::string> labels(spec->labels.begin(), spec->labels.end());
@@ -292,7 +296,7 @@ void check_effects(Ctx& c) {
     std::map<std::string, std::pair<std::set<std::string>, std::set<std::string>>>
         node_rw;   // node -> (reads, writes)
     for (const auto& n : c.node_names) {
-        const json eff = NodeFactory::instance().node_effects(c.node_type(n));
+        const json eff = c.registry.node_effects(c.node_type(n));
         if (eff.is_null() || !eff.is_object()) return;   // gate: skip family
         std::set<std::string> reads, writes;
         if (eff.contains("reads"))
@@ -433,9 +437,22 @@ std::string ValidationReport::summary() const {
 }
 
 ValidationReport GraphValidator::validate(const CompiledGraph& cg) {
-    Ctx c{cg, {}, {}, {}};
-    for (const auto& [name, node] : cg.nodes) {
-        (void)node;
+    return validate(cg.topology(), GraphRegistry::global());
+}
+
+ValidationReport GraphValidator::validate(const CompiledGraph& cg, const GraphRegistry& registry) {
+    return validate(cg.topology(), registry);
+}
+
+ValidationReport GraphValidator::validate(const TopologySpec& topology) {
+    return validate(topology, GraphRegistry::global());
+}
+
+ValidationReport GraphValidator::validate(const TopologySpec& topology,
+                                          const GraphRegistry& registry) {
+    Ctx c{topology, registry, {}, {}, {}};
+    for (const auto& [name, node_def] : topology.node_defs) {
+        (void)node_def;
         c.node_names.insert(name);
     }
 
@@ -450,6 +467,22 @@ ValidationReport GraphValidator::validate(const CompiledGraph& cg) {
     check_effects(c);
 
     return ValidationReport{std::move(c.out)};
+}
+
+ValidatedTopology GraphValidator::require_valid(TopologySpec topology) {
+    return require_valid(std::move(topology), GraphRegistry::global());
+}
+
+ValidatedTopology GraphValidator::require_valid(TopologySpec topology,
+                                                 const GraphRegistry& registry) {
+    auto report = validate(topology, registry);
+    if (report.has_errors()) {
+        throw std::runtime_error(
+            "graph validation failed (schema_version "
+            + std::to_string(topology.schema_version) + "):\n"
+            + report.summary());
+    }
+    return ValidatedTopology(std::move(topology), std::move(report));
 }
 
 } // namespace neograph::graph

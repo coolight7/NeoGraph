@@ -259,10 +259,10 @@ pool (CPU-bound bodies, large fan-out widths).
 `re-agent` commits `2a5c5dc` / `5993935` and replicated in NeoGraph
 master.
 
-**Root cause:** pure-write `GraphNode` subclasses (no `Command`, no
-`Send`) ran `execute()` once for the result and once for the stream
-hook. Override `execute_full_stream` (or `execute_full_stream_async`)
-to dedup.
+**Root cause on pre-v1 releases:** pure-write `GraphNode` subclasses (no
+`Command`, no `Send`) could run once for the result and once for the stream
+hook. Upgrade and implement the single `run(NodeInput)` override; v1 invokes
+that method once and exposes the optional stream sink as `in.stream_cb`.
 
 If you're using the `@ng.node` decorator (not subclassing), this is
 already handled.
@@ -294,6 +294,28 @@ them — or use the `key=value` form:
 
 ```
 host=localhost user=neo password=p@ss dbname=neograph
+```
+
+### Async Postgres reconnect times out after 30 seconds
+
+Async initial/replacement connections use one production-safety deadline for
+the entire attempt. A positive `connect_timeout=N` written directly in the
+connection string sets that global budget in seconds, with `connect_timeout=1`
+rounded up to PostgreSQL's minimum of two seconds. If the explicit value is
+absent, zero, or negative, NeoGraph uses 30 seconds. `PGCONNECT_TIMEOUT` and
+service-file timeout values are resolved too late to bound the initial async
+connection step, so they also use the 30-second default; put the value directly
+in the connection string when the async deadline must differ.
+
+The budget spans every host and resolved IP in a multi-host connection string;
+it is not multiplied per host. This differs intentionally from synchronous
+libpq, where `connect_timeout` applies separately to each host. Synchronous
+`PostgresCheckpointStore` construction and replacement are unchanged.
+
+For example, this gives the complete async replacement attempt 60 seconds:
+
+```
+host=pg-a,pg-b dbname=neograph connect_timeout=60
 ```
 
 ### Postgres `relation "neograph_checkpoints" does not exist`
@@ -366,9 +388,12 @@ The provider must support streaming. Currently:
 | `SchemaProvider("claude")` | ✓ SSE |
 | Custom Python `Provider` subclass | depends on your `complete_stream` impl |
 
-If you're using a custom provider, override `complete_stream_async` or
-the engine falls back to non-streaming `complete_async` and your
-TOKENS callback won't fire.
+For a custom Python `Provider`, override `complete_stream`; Python subclasses
+do not expose an async virtual override. For a new C++ backend, derive from
+`CompletionProvider` and handle `request.streaming()` in `do_invoke()`. Existing
+C++ `Provider` subclasses may continue to override `complete_stream()` or
+`complete_stream_async()`. Without a streaming implementation, the default emits
+the collected response as one chunk rather than incremental tokens.
 
 ---
 

@@ -316,10 +316,10 @@ each**. After they land:
   safe" decision. The user overrides `run(NodeInput)`. Sync vs
   async, stream vs non-stream, writes vs full-result are all body
   shape choices — no hidden invariants tied to virtual identity.
-- **Candidate 6** (Provider 4 → 1): same collapse for `Provider`.
-  The "X is safe only when Y" trap of #4/#5 cannot recur because
-  there is no Y to violate — there's only one entry point and
-  one canonical drain pattern.
+- **Candidate 6** (Provider 4 → 1): new implementations use
+  `CompletionProvider::do_invoke()` as their one override point. The
+  existing `Provider` surface remains stable for compatibility, while
+  the new path has one explicit request mode and one drain pattern.
 
 The remaining 2 findings (#9 thread identity, #16 ODR macro) are
 *not* fixed by Candidates 1 + 6 — they're separate issue classes
@@ -373,7 +373,7 @@ the class. Candidate 1 + 6 do.
 | 3 | Hierarchical CancelToken | **Landed in v0.4** (`CancelToken::fork()` + cascade) | v0.3.2 hooks, v0.3.2 emit-vs-bind |
 | 4 | Self-evolving graph runtime hooks | Research | TODO_v0.3.md #8 |
 | 5 | pgvector RAG example | Cookbook | TODO_v0.3.md #9 |
-| 6 | Provider single dispatch | **Landed (additive + deprecation)** v0.9.0 candidate — PR #40 / #41+#42 / #43 / #44 / #45. Phase B (legacy 4 virtual 제거) v1.0.0 대기. | #4 (closed v0.7), #5 (open as v1.0 tracking item), pattern reinforced by #36 |
+| 6 | Provider single dispatch | **Landed without removal.** `CompletionProvider::do_invoke()` is the recommended one-override path. Existing `Provider::complete*` methods remain supported; deprecation warnings were withdrawn and no removal is planned. | #4 (closed v0.7), #5 (compatibility policy), pattern reinforced by #36 |
 
 ---
 
@@ -876,31 +876,26 @@ necessary, and the safety of the bridge depends on which corner of
 the cross-product you override (an invariant nothing pins at
 compile time).
 
-### Suggested direction (v1.0)
+### Landed direction
 
-Async-first single dispatch:
+The one-override path is additive rather than a replacement:
 
 ```cpp
-class Provider {
+class CompletionProvider : public Provider {
 public:
-    // Only thing native subclasses override.
-    virtual asio::awaitable<CompletionStream>
-    invoke(CompletionRequest req) = 0;
+    asio::awaitable<ChatCompletion>
+    invoke_request(CompletionRequest request);
+
+protected:
+    virtual asio::awaitable<ChatCompletion>
+    do_invoke(CompletionRequest request) = 0;
 };
 ```
 
-`CompletionStream` is a sender / awaitable / channel — the caller
-picks how to drain it (collect-to-end for sync, await-final for
-non-streaming async, iterate for streaming). Sync + non-streaming
-variants become thin base-class adapters that apply `run_sync`
-exactly once at the outermost boundary, never composed with each
-other. Native subclasses only ship the async-streaming path
-because it's a strict superset of the rest.
-
-Pair with Candidate 1 (GraphNode 8-virtual flattening) — same
-shape, same fix, should land in the same v1.0 cycle so the
-"override one virtual" contract is consistent across the public
-surface.
+`CompletionRequest` explicitly selects collect or stream mode without
+inferring transport from callback presence. Final adapters preserve all
+existing `Provider` entry points. This gives new implementations one
+override while leaving existing source and binary contracts intact.
 
 ### Adjacent — `schema_provider.cpp` split
 
@@ -913,9 +908,9 @@ split if the work happens in different PRs.
 
 ### Triggering round
 
-Issue #5 — surfaced while debugging #4. Concrete crash closed by
-PR #10; architectural cleanup deferred to v1.0 alongside
-Candidate 1.
+Issue #5 — surfaced while debugging #4. The concrete crash closed in
+PR #10; the architectural cleanup landed through the additive
+`CompletionProvider` path and a permanent compatibility policy.
 
 ### Landing log (v0.9.0 candidate cycle)
 
@@ -929,19 +924,24 @@ Candidate 1.
 | **#44 (PR4)** | 4 legacy virtual 모두 `[[deprecated]]` 마커. `plan_execute_graph.cpp` 3 사이트 invoke() 마이그레이션. `OpenInferenceProvider` 와 `RateLimitedProvider` (decorator 들) 의 4 virtual override 블록을 `NEOGRAPH_PUSH/POP_IGNORE_DEPRECATED` 로 감쌈 — internal forwarder warning 차단, user-facing override / 호출 사이트만 warning. | v0.9.0 |
 | **#45 (PR5)** | C++ examples 마이그레이션 (`31_local_transformer.cpp`, `cookbook/ai-assembly/member_server.cpp`). | v0.9.0 |
 
-### v1.0 destructive removal (deferred)
+### Additive compatibility path (revised 2026-07)
 
-`SchemaProvider` / `OpenAIProvider` / `RateLimitedProvider` /
-`OpenInferenceProvider` 는 4 legacy virtual override 와 새 invoke()
-의 default forward 를 함께 갖고 있는 상태. v1.0.0 sub-PR 시퀀스 (Candidate 1
-의 9b–9e mirror):
+기존 `Provider` vtable을 유지한 채 별도 `CompletionProvider`를 추가한다.
+새 구현은 explicit `CompletionRequest`를 받고 `do_invoke()` 하나만 재정의한다.
+기존 네 virtual과 callback 기반 `invoke()`는 final adapter를 통해 새 구현에
+연결되며, 기존 Provider subclass와 Python trampoline은 그대로 유지된다.
 
-  - **6b**: native subclass 가 invoke() native override (4 virtual
-    override 의 코드를 invoke 안으로 통합). 기존 4 override 는 thin
-    adapter 또는 제거.
-  - **6c**: 4 legacy virtual 자체 삭제 from `Provider`. internal
-    forwarder PUSH_IGNORE 가드 제거. v1.0.0 에서 `Provider` 가 단일
-    pure-virtual `invoke()` + `get_name()` 만.
+기존 virtual은 안정 API로 계속 지원하며 제거 계획이 없다. 호환성·보안 수정은
+계속 적용하지만, 새 기능을 기존 네 virtual에 모두 역이식할 의무는 없다.
+새 구현과 새 직접 호출은 각각 `do_invoke()`와 `invoke_request()`를 권장한다.
+이 정책은 기존 공개 서명, virtual 순서, 객체 크기, vtable을 바꾸지 않는다.
+#127의 native async transport와 operation ownership은 이 API 정책과 별도다.
+
+후속 작업:
+
+  - **6b**: 새 Provider는 `CompletionProvider` 기반으로 작성. 기존 built-in의
+    즉시 상속 변경은 ABI 영향 때문에 하지 않는다.
+  - **6c**: native async transport와 request-owned cancellation/lifetime 완성.
   - **adjacent**: `schema_provider.cpp` (1800 LoC) 의 `SchemaParser` /
     `SchemaWireBuilder` / `SchemaProviderImpl` 분할 (위 6b 와 같은
     PR 또는 별도 — 구현 시 결정).

@@ -8,11 +8,18 @@
 //            its index; summarizer counts.
 //
 // Graph is compiled once; invoke() is the hot loop.
+// Usage: bench_neograph [seq_iters] [par_iters] [par_workers]
+// par_workers is 1 (default), auto, or an explicit positive integer.
 
 #include <neograph/neograph.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 using namespace neograph;
 using namespace neograph::graph;
@@ -145,9 +152,43 @@ static BenchResult bench(GraphEngine* engine, int iters) {
     return {total_ms, (total_ms * 1000.0) / iters};
 }
 
+static BenchResult bench_stream(GraphEngine* engine, int iters, StreamMode mode) {
+    RunConfig cfg;
+    cfg.stream_mode = mode;
+    const GraphStreamCallback discard = [](const GraphEvent&) {};
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        (void)engine->run_stream(cfg, discard);
+    }
+    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    return {total_ms, (total_ms * 1000.0) / iters};
+}
+
+static std::string configure_par_workers(GraphEngine& engine,
+                                         const std::string& mode) {
+    if (mode == "auto") {
+        engine.set_worker_count_auto();
+        return "auto(" + std::to_string(
+            std::max(std::thread::hardware_concurrency(), 1u)) + ")";
+    }
+
+    std::size_t parsed = 0;
+    const auto workers = std::stoull(mode, &parsed);
+    if (parsed != mode.size() || workers == 0) {
+        throw std::invalid_argument(
+            "par_workers must be 'auto' or a positive integer");
+    }
+    engine.set_worker_count(static_cast<std::size_t>(workers));
+    return std::to_string(workers);
+}
+
 int main(int argc, char** argv) {
     const int seq_iters = (argc > 1) ? std::atoi(argv[1]) : 10000;
     const int par_iters = (argc > 2) ? std::atoi(argv[2]) : 5000;
+    const std::string par_worker_mode = (argc > 3) ? argv[3] : "1";
 
     register_types();
 
@@ -163,9 +204,21 @@ int main(int argc, char** argv) {
 
     // --- Parallel ---
     auto par_engine = GraphEngine::compile(par_graph(), NodeContext{});
+    const auto par_workers = configure_par_workers(*par_engine, par_worker_mode);
+    std::cout << "config\tpar_workers\t" << par_workers << "\n";
     auto par = bench(par_engine.get(), par_iters);
     std::cout << "par\t" << par_iters << "\t" << par.total_ms
               << "\t" << par.per_iter_us << "\n";
+
+    // A callback with TOKENS emits nothing for this graph. Comparing it with
+    // EVENTS isolates lifecycle-event construction and callback dispatch.
+    auto seq_stream_idle = bench_stream(seq_engine.get(), seq_iters, StreamMode::TOKENS);
+    std::cout << "seq_stream_idle\t" << seq_iters << "\t" << seq_stream_idle.total_ms
+              << "\t" << seq_stream_idle.per_iter_us << "\n";
+
+    auto seq_events = bench_stream(seq_engine.get(), seq_iters, StreamMode::EVENTS);
+    std::cout << "seq_events\t" << seq_iters << "\t" << seq_events.total_ms
+              << "\t" << seq_events.per_iter_us << "\n";
 
     return 0;
 }
