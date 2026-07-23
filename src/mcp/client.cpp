@@ -245,7 +245,7 @@ private:
     // channel behaves as a binary semaphore: holder takes the token
     // via `async_receive`, releases via `try_send`. Second acquirer
     // suspends cooperatively rather than blocking the worker thread.
-    using AsyncLock = asio::experimental::channel<void(asio::error_code)>;
+    using AsyncLock = asio::experimental::channel<void(neograph_asio_error_code)>;
     std::unique_ptr<AsyncLock> async_lock_;
     std::mutex                 async_lock_init_mtx_;
 
@@ -283,7 +283,8 @@ private:
     // fans each response to the waiter registered under its JSON-RPC id,
     // so N in-flight calls overlap their reads instead of serialising
     // behind one round-trip lock.
-    using RespChan = asio::experimental::channel<void(asio::error_code, std::shared_ptr<json>)>;
+    using RespChan =
+        asio::experimental::channel<void(neograph_asio_error_code, std::shared_ptr<json>)>;
     std::mutex                               demux_mu_;  ///< guards the two fields below
     std::map<int, std::shared_ptr<RespChan>> waiters_;   ///< id → response sink
     bool reader_running_ = false;                        ///< a run_reader() coroutine is live
@@ -602,7 +603,7 @@ void StdioSession::shutdown_async_io() {
         return;
     }
     asio::post(io_, [this] {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         if (async_in_) async_in_->close(ec);
         if (async_out_) async_out_->close(ec);
         if (async_lock_) async_lock_->close();
@@ -798,7 +799,7 @@ asio::awaitable<void> StdioSession::run_reader() {
                     // empty, so this send always lands for the matched id.
                     if (chan) {
                         auto p = std::make_shared<json>(std::move(resp));
-                        chan->try_send(asio::error_code{}, p);
+                        chan->try_send(neograph_asio_error_code{}, p);
                     }
                 }
             }
@@ -883,7 +884,7 @@ asio::awaitable<json> StdioSession::do_exchange(std::string method, json params)
             async_lock_ = std::make_unique<AsyncLock>(ex, 1);
             // Seed with the initial token so the first writer takes it
             // without blocking.
-            async_lock_->try_send(asio::error_code{});
+            async_lock_->try_send(neograph_asio_error_code{});
         }
     }
 
@@ -982,7 +983,7 @@ asio::awaitable<json> StdioSession::do_exchange(std::string method, json params)
             AsyncLock* ch;
             ~WriteReleaser() {
                 try {
-                    ch->try_send(asio::error_code{});
+                    ch->try_send(neograph_asio_error_code{});
                 } catch (...) {}
             }
         } wrel{async_lock_.get()};

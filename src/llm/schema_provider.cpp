@@ -1715,8 +1715,8 @@ asio::awaitable<ChatCompletion> SchemaProvider::complete_stream_async(
         }
 
         poll.expires_after(std::chrono::milliseconds(1));
-        asio::error_code ec;
-        co_await         poll.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        neograph_asio_error_code ec;
+        co_await                 poll.async_wait(asio::redirect_error(asio::use_awaitable, ec));
     }
 }
 

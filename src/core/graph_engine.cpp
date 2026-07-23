@@ -544,7 +544,7 @@ asio::awaitable<RunResult> GraphEngine::run_async(RunConfig config) {
         co_return co_await asio::co_spawn(
             executor, execute_graph_async(config, nullptr),
             asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         if (operation->is_cancelled() && error.code() == asio::error::operation_aborted) {
             throw CancelledException("run_async operation aborted");
         }
@@ -579,7 +579,7 @@ asio::awaitable<RunResult> GraphEngine::run_stream_async(RunConfig config, Graph
         co_return co_await asio::co_spawn(
             executor, execute_graph_async(config, cb),
             asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         if (operation->is_cancelled() && error.code() == asio::error::operation_aborted) {
             throw CancelledException("run_stream_async operation aborted");
         }

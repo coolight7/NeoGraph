@@ -42,8 +42,7 @@ inline uint64_t fnv1a_64(const std::string& s) noexcept {
 }
 inline std::string fnv1a_hex(const std::string& s) {
     char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016llx",
-                  static_cast<unsigned long long>(fnv1a_64(s)));
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(fnv1a_64(s)));
     return std::string(buf, 16);
 }
 
@@ -57,14 +56,15 @@ inline std::string make_static_task_id(int step, const std::string& node_name) {
 // Stable task_id for a Send: includes index + target + deterministic
 // hash of the input payload so the same logical Send rehydrates under
 // the same key on resume.
-inline std::string make_send_task_id(int step, size_t idx,
-                                      const std::string& target,
-                                      const json& input) {
-    return "s" + std::to_string(step) + ":send[" + std::to_string(idx)
-           + "]:" + target + ":" + fnv1a_hex(input.dump());
+inline std::string make_send_task_id(int                step,
+                                     size_t             idx,
+                                     const std::string& target,
+                                     const json&        input) {
+    return "s" + std::to_string(step) + ":send[" + std::to_string(idx) + "]:" + target + ":" +
+           fnv1a_hex(input.dump());
 }
 
-} // namespace
+}  // namespace
 
 // =========================================================================
 // NodeExecutor construction + helpers
@@ -114,8 +114,7 @@ void NodeExecutor::maybe_warn_serial_fanout(std::size_t width) const {
     // every subsequent fan-out on this executor is silent. The flag
     // resets along with the executor on the next set_worker_count(N).
     bool expected = false;
-    if (!warned_serial_fanout_.compare_exchange_strong(
-            expected, true, std::memory_order_relaxed)) {
+    if (!warned_serial_fanout_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
         return;
     }
     // Opt-out for users who knowingly drive serial fan-out (the
@@ -123,8 +122,7 @@ void NodeExecutor::maybe_warn_serial_fanout(std::size_t width) const {
     // assertion-checked. Accepts "1" / "true" / "yes" as on, anything
     // else (or unset) as off.
     if (const char* env = std::getenv("NEOGRAPH_SUPPRESS_FANOUT_WARNING")) {
-        if (std::strcmp(env, "1") == 0 ||
-            std::strcmp(env, "true") == 0 ||
+        if (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0 ||
             std::strcmp(env, "yes") == 0) {
             return;
         }
@@ -175,12 +173,11 @@ void NodeExecutor::apply_input(GraphState& state, const json& input) const {
 // inside try, then deciding what to do outside.
 
 asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
-    const std::string& node_name,
-    GraphState& state,
+    const std::string&         node_name,
+    GraphState&                state,
     const GraphStreamCallback& cb,
-    StreamMode stream_mode,
-    const RunContext& ctx) {
-
+    StreamMode                 stream_mode,
+    const RunContext&          ctx) {
     // PR 2 (v0.4.0): dispatch via the unified ``run(NodeInput)`` virtual.
     // ``ctx`` reaches the user-overridable surface for the first time
     // — new nodes read it directly, legacy nodes that don't override
@@ -197,28 +194,28 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
     // Node-level cache: opt-in per node, only consulted when caller is
     // not streaming (cached hits cannot replay LLM_TOKEN events). Hash
     // is computed once per call so retries reuse the same lookup key.
-    const bool cache_eligible =
-        node_cache_ && !cb && node_cache_->is_enabled(node_name);
+    const bool  cache_eligible = node_cache_ && !cb && node_cache_->is_enabled(node_name);
     std::string cache_state_hash;
     if (cache_eligible) {
         cache_state_hash = hash_state_for_cache(state.serialize());
-        if (auto cached = node_cache_->lookup(node_name, cache_state_hash);
-            cached) {
+        if (auto cached = node_cache_->lookup(node_name, cache_state_hash); cached) {
             co_return std::move(*cached);
         }
     }
 
-    auto policy  = retry_policy_for_(node_name);
-    int delay_ms = policy.initial_delay_ms;
+    auto policy   = retry_policy_for_(node_name);
+    int  delay_ms = policy.initial_delay_ms;
 
     auto ex = co_await asio::this_coro::executor;
 
     auto throw_node_error = [&](std::exception_ptr cause, int attempts) -> void {
         if (cb && has_mode(stream_mode, StreamMode::EVENTS)) {
             std::string what = "unknown";
-            try { std::rethrow_exception(cause); }
-            catch (const std::exception& e) { what = e.what(); }
-            catch (...) {}
+            try {
+                std::rethrow_exception(cause);
+            } catch (const std::exception& e) {
+                what = e.what();
+            } catch (...) {}
             cb(GraphEvent{GraphEvent::Type::ERROR, node_name,
                           json{{"error", what}, {"attempts", attempts}}});
         }
@@ -236,8 +233,7 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
         if (cb && has_mode(stream_mode, StreamMode::EVENTS)) {
             json data;
             if (attempt > 0) data["retry_attempt"] = attempt;
-            cb(GraphEvent{GraphEvent::Type::NODE_START, node_name,
-                          std::move(data)});
+            cb(GraphEvent{GraphEvent::Type::NODE_START, node_name, std::move(data)});
         }
 
         // Capture the outcome of one attempt without co_await inside a
@@ -245,7 +241,7 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
         // re-thrown immediately so it short-circuits the loop just
         // like the sync path.
         std::optional<NodeResult> ok_result;
-        std::exception_ptr  retryable_err;
+        std::exception_ptr        retryable_err;
 
         try {
             // PR 2: single dispatch point. NodeInput bundles the legacy
@@ -271,14 +267,13 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
             // cancel flag, the second HTTP call would slip through,
             // and the cost leak would persist for max_retries × ~3 s.
             throw;
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             // Socket/timer cancellation enters node code as
             // operation_aborted. Once this operation's token is set, that is
             // cancellation control flow, not a retryable transport failure.
             if (ctx.cancel_token && ctx.cancel_token->is_cancelled() &&
                 error.code() == asio::error::operation_aborted) {
-                throw CancelledException(
-                    "node " + node_name + " operation aborted");
+                throw CancelledException("node " + node_name + " operation aborted");
             }
             retryable_err = std::current_exception();
         } catch (const std::bad_alloc&) {
@@ -312,12 +307,9 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
                 }
                 if (has_mode(stream_mode, StreamMode::EVENTS)) {
                     json end_data;
-                    if (nr.command)
-                        end_data["command_goto"] = nr.command->goto_node;
-                    if (!nr.sends.empty())
-                        end_data["sends"] = (int)nr.sends.size();
-                    cb(GraphEvent{GraphEvent::Type::NODE_END, node_name,
-                                  std::move(end_data)});
+                    if (nr.command) end_data["command_goto"] = nr.command->goto_node;
+                    if (!nr.sends.empty()) end_data["sends"] = (int)nr.sends.size();
+                    cb(GraphEvent{GraphEvent::Type::NODE_END, node_name, std::move(end_data)});
                 }
             }
             if (cache_eligible) {
@@ -334,9 +326,13 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
 
         if (cb && has_mode(stream_mode, StreamMode::DEBUG)) {
             std::string what;
-            try { std::rethrow_exception(retryable_err); }
-            catch (const std::exception& e) { what = e.what(); }
-            catch (...) { what = "unknown"; }
+            try {
+                std::rethrow_exception(retryable_err);
+            } catch (const std::exception& e) {
+                what = e.what();
+            } catch (...) {
+                what = "unknown";
+            }
             cb(GraphEvent{GraphEvent::Type::ERROR, node_name,
                           json{{"retry", attempt + 1},
                                {"max_retries", policy.max_retries},
@@ -351,10 +347,10 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
         int actual_delay = delay_ms;
         if (policy.jitter_pct > 0.0f && delay_ms > 0) {
             // Per-thread RNG so concurrent branches don't share state.
-            thread_local std::mt19937 rng{std::random_device{}()};
-            float pct = std::min(1.0f, policy.jitter_pct);
+            thread_local std::mt19937             rng{std::random_device{}()};
+            float                                 pct = std::min(1.0f, policy.jitter_pct);
             std::uniform_real_distribution<float> dist(-pct, pct);
-            float scaled = delay_ms * (1.0f + dist(rng));
+            float                                 scaled = delay_ms * (1.0f + dist(rng));
             if (scaled < 0.0f) scaled = 0.0f;
             actual_delay = static_cast<int>(scaled);
         }
@@ -363,13 +359,11 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
         timer.expires_after(std::chrono::milliseconds(actual_delay));
         co_await timer.async_wait(asio::use_awaitable);
 
-        delay_ms = std::min(
-            static_cast<int>(delay_ms * policy.backoff_multiplier),
-            policy.max_delay_ms);
+        delay_ms =
+            std::min(static_cast<int>(delay_ms * policy.backoff_multiplier), policy.max_delay_ms);
     }
 
-    throw std::runtime_error(
-        "Unreachable: async retry loop exited without return or throw");
+    throw std::runtime_error("Unreachable: async retry loop exited without return or throw");
 }
 
 // =========================================================================
@@ -377,18 +371,17 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
 // =========================================================================
 
 asio::awaitable<NodeResult> NodeExecutor::run_one_async(
-    const std::string& node_name,
-    int step,
-    GraphState& state,
+    const std::string&                                 node_name,
+    int                                                step,
+    GraphState&                                        state,
     const std::unordered_map<std::string, NodeResult>& replay,
-    CheckpointCoordinator& coord,
-    const std::string& parent_cp_id,
-    const BarrierState& barrier_state,
-    std::vector<std::string>& trace,
-    const GraphStreamCallback& cb,
-    StreamMode stream_mode,
-    const RunContext& ctx) {
-
+    CheckpointCoordinator&                             coord,
+    const std::string&                                 parent_cp_id,
+    const BarrierState&                                barrier_state,
+    std::vector<std::string>&                          trace,
+    const GraphStreamCallback&                         cb,
+    StreamMode                                         stream_mode,
+    const RunContext&                                  ctx) {
     const std::string task_id = make_static_task_id(step, node_name);
 
     // GCC-13-safe outcome capture: collect result or NodeInterrupt
@@ -404,13 +397,13 @@ asio::awaitable<NodeResult> NodeExecutor::run_one_async(
             // do NOT re-record. Just apply the recorded writes.
             ok_result.emplace(replay_it->second);
         } else {
-            ok_result.emplace(co_await execute_node_with_retry_async(
-                node_name, state, cb, stream_mode, ctx));
+            ok_result.emplace(
+                co_await execute_node_with_retry_async(node_name, state, cb, stream_mode, ctx));
 
             // Record BEFORE apply_writes so a crash between the two
             // still leaves a durable log for resume to replay.
-            co_await coord.record_pending_write_async(parent_cp_id,
-                task_id, task_id, node_name, *ok_result, step);
+            co_await coord.record_pending_write_async(parent_cp_id, task_id, task_id, node_name,
+                                                      *ok_result, step);
         }
     } catch (const NodeInterrupt& ni) {
         // Copy the whole interrupt, not just the fact that one happened.
@@ -431,10 +424,9 @@ asio::awaitable<NodeResult> NodeExecutor::run_one_async(
         // body trips build_special_member_call).
         std::vector<std::string> next_nodes;
         next_nodes.push_back(node_name);
-        co_await coord.save_super_step_async(state,
-            node_name, next_nodes,
-            CheckpointPhase::NodeInterrupt, step, parent_cp_id,
-            barrier_state);
+        co_await coord.save_super_step_async(state, node_name, next_nodes,
+                                             CheckpointPhase::NodeInterrupt, step, parent_cp_id,
+                                             barrier_state);
         // The executor is the only layer that knows the graph's name for
         // this node — the node body does not.
         interrupt->set_node(node_name);
@@ -465,20 +457,18 @@ asio::awaitable<NodeResult> NodeExecutor::run_one_async(
 // the coroutine body. The first-exception classifier uses a separate
 // try/catch to tag NodeInterrupt; the cp save happens outside.
 
-asio::awaitable<std::vector<NodeResult>>
-NodeExecutor::run_parallel_async(
-    const std::vector<std::string>& ready,
-    int step,
-    GraphState& state,
+asio::awaitable<std::vector<NodeResult>> NodeExecutor::run_parallel_async(
+    const std::vector<std::string>&                    ready,
+    int                                                step,
+    GraphState&                                        state,
     const std::unordered_map<std::string, NodeResult>& replay,
-    CheckpointCoordinator& coord,
-    const std::string& parent_cp_id,
-    const BarrierState& barrier_state,
-    std::vector<std::string>& trace,
-    const GraphStreamCallback& cb,
-    StreamMode stream_mode,
-    const RunContext& ctx) {
-
+    CheckpointCoordinator&                             coord,
+    const std::string&                                 parent_cp_id,
+    const BarrierState&                                barrier_state,
+    std::vector<std::string>&                          trace,
+    const GraphStreamCallback&                         cb,
+    StreamMode                                         stream_mode,
+    const RunContext&                                  ctx) {
     // Single-ready bypass: skip the parallel_group machinery entirely.
     // When the super-step has only one ready node, building deferred
     // ops, allocating excs/values/order vectors, and wrapping in
@@ -488,10 +478,10 @@ NodeExecutor::run_parallel_async(
     // by any super-step where conditional routing collapses to one
     // target.
     if (ready.size() == 1) {
-        const auto& node_name = ready[0];
-        const std::string task_id = make_static_task_id(step, node_name);
-        auto replay_it = replay.find(task_id);
-        NodeResult nr;
+        const auto&                  node_name = ready[0];
+        const std::string            task_id   = make_static_task_id(step, node_name);
+        auto                         replay_it = replay.find(task_id);
+        NodeResult                   nr;
         std::optional<NodeInterrupt> interrupt;
         if (replay_it != replay.end()) {
             nr = replay_it->second;
@@ -499,23 +489,21 @@ NodeExecutor::run_parallel_async(
             // GCC-13: cannot co_await inside a catch handler. Classify
             // here, save + rethrow outside the try/catch.
             try {
-                nr = co_await execute_node_with_retry_async(
-                    node_name, state, cb, stream_mode, ctx);
+                nr = co_await execute_node_with_retry_async(node_name, state, cb, stream_mode, ctx);
             } catch (const NodeInterrupt& ni) {
                 interrupt = ni;
             }
             if (interrupt) {
                 std::vector<std::string> next_nodes;
                 next_nodes.push_back(node_name);
-                co_await coord.save_super_step_async(state,
-                    node_name, next_nodes,
-                    CheckpointPhase::NodeInterrupt, step, parent_cp_id,
-                    barrier_state);
+                co_await coord.save_super_step_async(state, node_name, next_nodes,
+                                                     CheckpointPhase::NodeInterrupt, step,
+                                                     parent_cp_id, barrier_state);
                 interrupt->set_node(node_name);
                 throw *interrupt;
             }
-            co_await coord.record_pending_write_async(
-                parent_cp_id, task_id, task_id, node_name, nr, step);
+            co_await coord.record_pending_write_async(parent_cp_id, task_id, task_id, node_name, nr,
+                                                      step);
         }
         state.apply_writes(nr.writes);
         if (nr.command) state.apply_writes(nr.command->updates);
@@ -534,8 +522,8 @@ NodeExecutor::run_parallel_async(
     // the outer executor — matches the single-threaded contract the
     // async peer tests assert.
     asio::any_io_executor branch_ex = fan_out_pool_
-        ? asio::any_io_executor(fan_out_pool_->get_executor())
-        : asio::any_io_executor(outer_ex);
+                                          ? asio::any_io_executor(fan_out_pool_->get_executor())
+                                          : asio::any_io_executor(outer_ex);
 
     // Per-branch worker. Captures by ref — all captured refs outlive
     // co_await below (stack scope), and state reads are
@@ -553,23 +541,22 @@ NodeExecutor::run_parallel_async(
     // cancellation that abandons the parallel_group early, switch
     // these captures to by-value copies first.
     auto worker = [&, this](std::string node_name) -> asio::awaitable<NodeResult> {
-        const std::string task_id = make_static_task_id(step, node_name);
-        auto replay_it = replay.find(task_id);
+        const std::string task_id   = make_static_task_id(step, node_name);
+        auto              replay_it = replay.find(task_id);
         if (replay_it != replay.end()) {
             co_return replay_it->second;
         }
-        auto nr = co_await execute_node_with_retry_async(
-            node_name, state, cb, stream_mode, ctx);
-        co_await coord.record_pending_write_async(
-            parent_cp_id, task_id, task_id, node_name, nr, step);
+        auto nr = co_await execute_node_with_retry_async(node_name, state, cb, stream_mode, ctx);
+        co_await  coord.record_pending_write_async(parent_cp_id, task_id, task_id, node_name, nr,
+                                                   step);
         co_return nr;
     };
 
     // Build deferred ops, one per ready node. co_spawn-with-deferred
     // returns an op that, when awaited, runs the worker coroutine and
     // completes with (exception_ptr, NodeResult).
-    using DeferredOp = decltype(asio::co_spawn(
-        branch_ex, worker(std::declval<std::string>()), asio::deferred));
+    using DeferredOp =
+        decltype(asio::co_spawn(branch_ex, worker(std::declval<std::string>()), asio::deferred));
     std::vector<DeferredOp> ops;
     ops.reserve(ready.size());
     for (const auto& node_name : ready) {
@@ -580,10 +567,9 @@ NodeExecutor::run_parallel_async(
     //   completion_order : std::vector<std::size_t>
     //   excs             : std::vector<std::exception_ptr>  (per-branch)
     //   values           : std::vector<NodeResult>          (per-branch)
-    auto [order, excs, values] = co_await asio::experimental::make_parallel_group(
-        std::move(ops))
-        .async_wait(asio::experimental::wait_for_all(),
-                    asio::use_awaitable);
+    auto [order, excs, values] =
+        co_await asio::experimental::make_parallel_group(std::move(ops))
+            .async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
     (void)order;  // we apply in ready-order regardless of completion-order
 
     // Find first exception + classify. NodeInterrupt gets a dedicated
@@ -628,10 +614,9 @@ NodeExecutor::run_parallel_async(
             // the co_await arg list (nested brace-init trips the ICE).
             std::vector<std::string> next_nodes;
             next_nodes.push_back(first_exception_node);
-            co_await coord.save_super_step_async(state,
-                first_exception_node, next_nodes,
-                CheckpointPhase::NodeInterrupt, step, parent_cp_id,
-                barrier_state);
+            co_await coord.save_super_step_async(state, first_exception_node, next_nodes,
+                                                 CheckpointPhase::NodeInterrupt, step, parent_cp_id,
+                                                 barrier_state);
             // Drop the worker eptr and throw a fresh NodeInterrupt —
             // see comment above the loop. The fresh exception is
             // wholly owned by the current (main) thread.
@@ -671,17 +656,16 @@ NodeExecutor::run_parallel_async(
 // first exception (if any) is rethrown after the wait resolves.
 
 asio::awaitable<std::vector<StepRouting>> NodeExecutor::run_sends_async(
-    const std::vector<Send>& sends,
-    int step,
-    GraphState& state,
+    const std::vector<Send>&                           sends,
+    int                                                step,
+    GraphState&                                        state,
     const std::unordered_map<std::string, NodeResult>& replay,
-    CheckpointCoordinator& coord,
-    const std::string& parent_cp_id,
-    std::vector<std::string>& trace,
-    const GraphStreamCallback& cb,
-    StreamMode stream_mode,
-    const RunContext& ctx) {
-
+    CheckpointCoordinator&                             coord,
+    const std::string&                                 parent_cp_id,
+    std::vector<std::string>&                          trace,
+    const GraphStreamCallback&                         cb,
+    StreamMode                                         stream_mode,
+    const RunContext&                                  ctx) {
     std::vector<StepRouting> routings;
     if (sends.empty()) co_return routings;
 
@@ -695,29 +679,26 @@ asio::awaitable<std::vector<StepRouting>> NodeExecutor::run_sends_async(
         }
         json data;
         data["sends"] = send_info;
-        cb(GraphEvent{GraphEvent::Type::NODE_START, "__send__",
-                      std::move(data)});
+        cb(GraphEvent{GraphEvent::Type::NODE_START, "__send__", std::move(data)});
     }
 
     // --- Single Send: sequential on shared state, with retry. ---
     if (sends.size() == 1) {
-        const auto& s = sends[0];
-        auto node_it = nodes_.find(s.target_node);
+        const auto& s       = sends[0];
+        auto        node_it = nodes_.find(s.target_node);
         if (node_it == nodes_.end()) co_return routings;
 
-        const std::string task_id = make_send_task_id(
-            step, 0, s.target_node, s.input);
-        NodeResult nr;
+        const std::string task_id = make_send_task_id(step, 0, s.target_node, s.input);
+        NodeResult        nr;
 
         auto replay_it = replay.find(task_id);
         if (replay_it != replay.end()) {
             nr = replay_it->second;
         } else {
             apply_input(state, s.input);
-            nr = co_await execute_node_with_retry_async(
-                s.target_node, state, cb, stream_mode, ctx);
-            co_await coord.record_pending_write_async(parent_cp_id,
-                task_id, task_id, s.target_node, nr, step);
+            nr = co_await execute_node_with_retry_async(s.target_node, state, cb, stream_mode, ctx);
+            co_await coord.record_pending_write_async(parent_cp_id, task_id, task_id, s.target_node,
+                                                      nr, step);
         }
         state.apply_writes(nr.writes);
         if (nr.command) state.apply_writes(nr.command->updates);
@@ -749,21 +730,19 @@ asio::awaitable<std::vector<StepRouting>> NodeExecutor::run_sends_async(
     // logically immutable across the worker batch (state mutations
     // happen post-join, line ~568 below) so a single snapshot is
     // safe to share.
-    auto state_snapshot = state.serialize();
-    auto outer_ex = co_await asio::this_coro::executor;
-    asio::any_io_executor ex = fan_out_pool_
-        ? asio::any_io_executor(fan_out_pool_->get_executor())
-        : asio::any_io_executor(outer_ex);
+    auto state_snapshot      = state.serialize();
+    auto outer_ex            = co_await asio::this_coro::executor;
+    asio::any_io_executor ex = fan_out_pool_ ? asio::any_io_executor(fan_out_pool_->get_executor())
+                                             : asio::any_io_executor(outer_ex);
 
     auto worker = [&, this](std::size_t si) -> asio::awaitable<NodeResult> {
-        const auto& s = sends[si];
-        auto node_it = nodes_.find(s.target_node);
+        const auto& s       = sends[si];
+        auto        node_it = nodes_.find(s.target_node);
         if (node_it == nodes_.end()) {
             co_return NodeResult{};  // silently skip missing target
         }
 
-        const std::string task_id = make_send_task_id(
-            step, si, s.target_node, s.input);
+        const std::string task_id = make_send_task_id(step, si, s.target_node, s.input);
 
         auto replay_it = replay.find(task_id);
         if (replay_it != replay.end()) {
@@ -779,25 +758,23 @@ asio::awaitable<std::vector<StepRouting>> NodeExecutor::run_sends_async(
         // is captured by value into this worker lambda — no
         // serialize/restore hop, no manual forward.
 
-        auto nr = co_await execute_node_with_retry_async(
-            s.target_node, send_state, cb, stream_mode, ctx);
-        co_await coord.record_pending_write_async(parent_cp_id,
-            task_id, task_id, s.target_node, nr, step);
+        auto         nr =
+            co_await execute_node_with_retry_async(s.target_node, send_state, cb, stream_mode, ctx);
+        co_await coord.record_pending_write_async(parent_cp_id, task_id, task_id, s.target_node, nr,
+                                                  step);
         co_return nr;
     };
 
-    using DeferredOp = decltype(asio::co_spawn(
-        ex, worker(std::size_t{0}), asio::deferred));
+    using DeferredOp = decltype(asio::co_spawn(ex, worker(std::size_t{0}), asio::deferred));
     std::vector<DeferredOp> ops;
     ops.reserve(sends.size());
     for (std::size_t si = 0; si < sends.size(); ++si) {
         ops.push_back(asio::co_spawn(ex, worker(si), asio::deferred));
     }
 
-    auto [order, excs, values] = co_await asio::experimental::make_parallel_group(
-        std::move(ops))
-        .async_wait(asio::experimental::wait_for_all(),
-                    asio::use_awaitable);
+    auto [order, excs, values] =
+        co_await asio::experimental::make_parallel_group(std::move(ops))
+            .async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
     (void)order;
 
     // First-exception pass — same shape as run_parallel_async, but
@@ -829,4 +806,4 @@ asio::awaitable<std::vector<StepRouting>> NodeExecutor::run_sends_async(
     co_return routings;
 }
 
-} // namespace neograph::graph
+}  // namespace neograph::graph

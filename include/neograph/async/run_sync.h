@@ -51,15 +51,14 @@ namespace detail {
 // using it here would create a grandchild and make RunContext's token differ
 // from the slot bound to the operation's co_spawn.
 template <typename T>
-T run_sync_operation(
-    asio::awaitable<T> aw,
-    std::shared_ptr<neograph::graph::CancelToken> operation) {
+T run_sync_operation(asio::awaitable<T>                            aw,
+                     std::shared_ptr<neograph::graph::CancelToken> operation) {
     if (operation) {
         operation->throw_if_cancelled("run_sync operation entry");
     }
 
-    asio::io_context io;
-    std::optional<T> result;
+    asio::io_context   io;
+    std::optional<T>   result;
     std::exception_ptr err;
 
     auto body = [&]() -> asio::awaitable<void> {
@@ -73,9 +72,7 @@ T run_sync_operation(
 
     if (operation) {
         operation->bind_executor(io.get_executor());
-        asio::co_spawn(
-            io, body(),
-            asio::bind_cancellation_slot(operation->slot(), asio::detached));
+        asio::co_spawn(io, body(), asio::bind_cancellation_slot(operation->slot(), asio::detached));
     } else {
         asio::co_spawn(io, body(), asio::detached);
     }
@@ -85,13 +82,11 @@ T run_sync_operation(
         if (operation && operation->is_cancelled()) {
             try {
                 std::rethrow_exception(err);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 if (error.code() == asio::error::operation_aborted) {
-                    throw neograph::graph::CancelledException(
-                        "run_sync operation aborted");
+                    throw neograph::graph::CancelledException("run_sync operation aborted");
                 }
-            } catch (...) {
-            }
+            } catch (...) {}
         }
         std::rethrow_exception(err);
     }
@@ -101,7 +96,7 @@ T run_sync_operation(
     return std::move(*result);
 }
 
-} // namespace detail
+}  // namespace detail
 
 /// Run @p aw to completion on a fresh single-threaded io_context
 /// and return its result. Any exception thrown inside the coroutine
