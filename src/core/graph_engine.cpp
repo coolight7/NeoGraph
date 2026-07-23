@@ -7,7 +7,6 @@
 #include <asio/bind_cancellation_slot.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/thread_pool.hpp>
 #include <asio/use_awaitable.hpp>

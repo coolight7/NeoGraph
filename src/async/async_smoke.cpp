@@ -9,10 +9,11 @@
 
 #include <neograph/define.h>
 
-#include <asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
+#include <asio/io_context.hpp>
+#include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 
 #include <chrono>

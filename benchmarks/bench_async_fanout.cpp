@@ -28,7 +28,6 @@
 // doesn't blow up per-agent. Wall-clock should be close between the two
 // once the thread scheduler catches up.
 
-#include <asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -49,26 +48,30 @@
 namespace {
 
 struct Config {
-    std::string mode      = "async";  // sync | async
-    int         concur    = 1000;     // how many parallel "agents"
-    int         rounds    = 5;        // LLM calls per agent
-    int         latency_ms = 50;      // simulated per-call wait
-    int         io_threads = 0;       // async only: 0 = std::thread::hardware_concurrency
+    std::string mode       = "async";  // sync | async
+    int         concur     = 1000;     // how many parallel "agents"
+    int         rounds     = 5;        // LLM calls per agent
+    int         latency_ms = 50;       // simulated per-call wait
+    int         io_threads = 0;        // async only: 0 = std::thread::hardware_concurrency
 };
 
 Config parse(int argc, char** argv) {
     Config c;
     for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
-        if      (a == "--mode")       c.mode       = next();
-        else if (a == "--concur")     c.concur     = std::stoi(next());
-        else if (a == "--rounds")     c.rounds     = std::stoi(next());
-        else if (a == "--latency-ms") c.latency_ms = std::stoi(next());
-        else if (a == "--io-threads") c.io_threads = std::stoi(next());
+        std::string a    = argv[i];
+        auto        next = [&]() { return (i + 1 < argc) ? argv[++i] : ""; };
+        if (a == "--mode")
+            c.mode = next();
+        else if (a == "--concur")
+            c.concur = std::stoi(next());
+        else if (a == "--rounds")
+            c.rounds = std::stoi(next());
+        else if (a == "--latency-ms")
+            c.latency_ms = std::stoi(next());
+        else if (a == "--io-threads")
+            c.io_threads = std::stoi(next());
     }
-    if (c.io_threads == 0)
-        c.io_threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (c.io_threads == 0) c.io_threads = static_cast<int>(std::thread::hardware_concurrency());
     if (c.io_threads == 0) c.io_threads = 4;
     return c;
 }
@@ -103,7 +106,8 @@ void run_sync(const Config& cfg) {
             }
         });
     }
-    for (auto& t : ts) t.join();
+    for (auto& t : ts)
+        t.join();
 }
 
 // Async worker coroutine: `rounds` timer awaits on the current executor.
@@ -128,7 +132,8 @@ void run_async(const Config& cfg) {
     // as the worker threads enter run().
     std::atomic<int> remaining{cfg.concur};
     for (int i = 0; i < cfg.concur; ++i) {
-        asio::co_spawn(io,
+        asio::co_spawn(
+            io,
             [rounds = cfg.rounds, latency = cfg.latency_ms]() -> asio::awaitable<void> {
                 co_await agent_coro(rounds, latency);
             },
@@ -154,29 +159,34 @@ void run_async(const Config& cfg) {
     }
     work.reset();
     io.stop();
-    for (auto& t : ts) t.join();
+    for (auto& t : ts)
+        t.join();
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     Config cfg = parse(argc, argv);
 
     auto t0 = std::chrono::steady_clock::now();
-    if      (cfg.mode == "sync")  run_sync(cfg);
-    else if (cfg.mode == "async") run_async(cfg);
-    else { std::cerr << "unknown mode: " << cfg.mode << "\n"; return 2; }
-    auto wall = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - t0).count();
+    if (cfg.mode == "sync")
+        run_sync(cfg);
+    else if (cfg.mode == "async")
+        run_async(cfg);
+    else {
+        std::cerr << "unknown mode: " << cfg.mode << "\n";
+        return 2;
+    }
+    auto wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     double total_ops = static_cast<double>(cfg.concur) * cfg.rounds;
-    double rss = peak_rss_mb();
+    double rss       = peak_rss_mb();
 
-    std::printf("mode=%-5s concur=%6d rounds=%d lat_ms=%d  "
-                "wall=%6.3fs  ops/s=%9.1f  rss_mb=%7.1f"
-                "  io_threads=%d\n",
-                cfg.mode.c_str(), cfg.concur, cfg.rounds, cfg.latency_ms,
-                wall, total_ops / wall, rss,
-                cfg.mode == "async" ? cfg.io_threads : cfg.concur);
+    std::printf(
+        "mode=%-5s concur=%6d rounds=%d lat_ms=%d  "
+        "wall=%6.3fs  ops/s=%9.1f  rss_mb=%7.1f"
+        "  io_threads=%d\n",
+        cfg.mode.c_str(), cfg.concur, cfg.rounds, cfg.latency_ms, wall, total_ops / wall, rss,
+        cfg.mode == "async" ? cfg.io_threads : cfg.concur);
     return 0;
 }

@@ -9,6 +9,7 @@
  * of provider.h.
  */
 #include <neograph/async/run_sync.h>
+#include <neograph/define.h>
 #include <neograph/graph/cancel.h>
 #include <neograph/provider.h>
 
@@ -172,6 +173,16 @@ asio::awaitable<ChatCompletion> Provider::invoke(const CompletionParams& params,
         co_return co_await complete_stream_async(params, on_chunk);
     }
     co_return co_await complete_async(params);
+}
+
+asio::awaitable<ChatCompletion> Provider::invoke_format_data(const CompletionParams&  params,
+                                                             FormatDataStreamCallback on_chunk) {
+    co_return co_await invoke(params, [&](const std::string& chunk) {
+        on_chunk(neograph::ChatStreamChunk{
+            .type = neograph::ChatStreamChunk::TYPE_CONTENT,
+            .data = chunk,
+        });
+    });
 }
 
 }  // namespace neograph

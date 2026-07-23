@@ -27,7 +27,6 @@
 #include <neograph/async/conn_pool.h>
 #include <neograph/async/http_client.h>
 
-#include <asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>

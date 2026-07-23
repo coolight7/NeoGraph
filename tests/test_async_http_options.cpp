@@ -20,7 +20,6 @@
 #include <asio/redirect_error.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
-#include <asio/system_error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 #include <gtest/gtest.h>

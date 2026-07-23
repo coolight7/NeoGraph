@@ -121,10 +121,8 @@ struct CompletionParams {
 /**
  * @brief Abstract base class for LLM providers.
  *
- * Existing subclasses may continue to implement any supported sync/async pair.
- * These entry points are stable compatibility APIs with no removal planned.
- * New backends should normally derive from `CompletionProvider` and implement
- * its explicit request contract instead.
+ * Subclass this to integrate any LLM backend (OpenAI, Claude, Gemini, etc.).
+ * Both synchronous and streaming completion must be implemented.
  *
  * @see neograph::llm::OpenAIProvider
  * @see neograph::llm::SchemaProvider
@@ -144,7 +142,11 @@ public:
      * @param params Completion parameters including model, messages, and tools.
      * @return The full completion response with message and usage statistics.
      *
+     * @deprecated New Provider implementations should derive from
+     * `CompletionProvider` and implement its explicit request contract.
+     * This method remains supported during the compatibility window.
      */
+    [[deprecated("legacy Provider API: new implementations should use CompletionProvider")]]
     virtual ChatCompletion complete(const CompletionParams& params);
 
     /**
@@ -167,7 +169,9 @@ public:
      * @param params Completion parameters.
      * @return An awaitable yielding the full completion response.
      *
+     * @deprecated New implementations should use `CompletionProvider`.
      */
+    [[deprecated("legacy Provider API: new implementations should use CompletionProvider")]]
     virtual asio::awaitable<ChatCompletion> complete_async(const CompletionParams& params);
 
     /**
@@ -187,7 +191,9 @@ public:
      * @param on_chunk Callback invoked per received token.
      * @return The full completion response after streaming is complete.
      *
+     * @deprecated New implementations should use `CompletionProvider`.
      */
+    [[deprecated("legacy Provider API: new implementations should use CompletionProvider")]]
     virtual ChatCompletion complete_stream(const CompletionParams& params,
                                            const StreamCallback&   on_chunk);
 
@@ -254,12 +260,14 @@ public:
      *                 internal worker thread).
      * @return Awaitable resolving to the full completion response.
      *
+     * @deprecated New implementations should use `CompletionProvider`.
      */
+    [[deprecated("legacy Provider API: new implementations should use CompletionProvider")]]
     virtual asio::awaitable<ChatCompletion> complete_stream_async(const CompletionParams& params,
                                                                   const StreamCallback&   on_chunk);
 
     /**
-     * @brief Compatibility callback-selected async completion entry point.
+     * @brief Legacy callback-selected async completion entry point.
      *
      * Existing Provider subclasses may override this method to combine the
      * legacy async collect and stream paths. New implementations should derive
@@ -279,10 +287,8 @@ public:
      *
      * The default implementation forwards to `complete_stream_async()` when
      * `on_chunk` is set and to `complete_async()` otherwise, preserving every
-     * existing Provider subclass. These compatibility methods remain supported
-     * with no removal planned. Compatibility and security fixes apply to them;
-     * new capabilities may be available only through `CompletionProvider`'s
-     * explicit request API.
+     * existing Provider subclass. The legacy methods remain available during
+     * the compatibility window; no removal version is currently scheduled.
      *
      * @param params   Completion parameters (model, messages, tools, ...).
      * @param on_chunk Optional per-chunk callback. `nullptr` for non-
@@ -291,7 +297,6 @@ public:
      */
     virtual asio::awaitable<ChatCompletion> invoke(const CompletionParams& params,
                                                    StreamCallback          on_chunk = nullptr);
-
     virtual asio::awaitable<ChatCompletion> invoke_format_data(
         const CompletionParams& params, FormatDataStreamCallback on_chunk = nullptr);
 

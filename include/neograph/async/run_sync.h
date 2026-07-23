@@ -33,7 +33,6 @@
 #include <asio/detached.hpp>
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
-#include <asio/system_error.hpp>
 #include <asio/thread_pool.hpp>
 
 #include <cstddef>
