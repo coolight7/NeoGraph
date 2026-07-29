@@ -4,7 +4,6 @@
 
 #include "harness_journal_internal.h"
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 
 #include <atomic>
 #include <chrono>

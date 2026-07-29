@@ -15,7 +15,6 @@
 #include <neograph/provider.h>
 
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 
 #include <algorithm>
 #include <atomic>

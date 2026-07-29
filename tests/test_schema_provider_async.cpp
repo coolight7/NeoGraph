@@ -10,7 +10,6 @@
 #include <asio/detached.hpp>
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
-#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <gtest/gtest.h>
 
