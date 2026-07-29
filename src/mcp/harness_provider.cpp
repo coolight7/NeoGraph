@@ -3,7 +3,6 @@
 #include <neograph/provider.h>
 
 #include "harness_journal_internal.h"
-
 #include <asio/error.hpp>
 #include <asio/system_error.hpp>
 
@@ -26,7 +25,7 @@ namespace {
 
 bool is_within(const std::filesystem::path& child, const std::filesystem::path& root) {
     auto child_it = child.begin();
-    auto root_it = root.begin();
+    auto root_it  = root.begin();
     for (; root_it != root.end(); ++root_it, ++child_it) {
         if (child_it == child.end() || *child_it != *root_it) return false;
     }
@@ -35,7 +34,7 @@ bool is_within(const std::filesystem::path& child, const std::filesystem::path& 
 
 std::filesystem::path resolved_path(const std::filesystem::path& value) {
     std::error_code error;
-    auto absolute = std::filesystem::absolute(value, error);
+    auto            absolute = std::filesystem::absolute(value, error);
     if (error) {
         throw std::runtime_error("cannot resolve Harness path: " + value.string());
     }
@@ -69,7 +68,7 @@ json enforce_path_policy(const HarnessWorkerCall& call, const json& tool, const 
         if (!arguments.contains(key) || !arguments[key].is_string()) continue;
         auto candidate = std::filesystem::path(arguments[key].get<std::string>());
         if (candidate.is_relative()) candidate = normalized_roots.front() / candidate;
-        candidate = resolved_path(candidate);
+        candidate    = resolved_path(candidate);
         bool allowed = false;
         for (const auto& root : normalized_roots) {
             if (is_within(candidate, root)) {
@@ -90,9 +89,9 @@ std::vector<ChatTool> chat_tools(const json& catalog) {
     std::vector<ChatTool> tools;
     for (const auto& entry : catalog) {
         ChatTool tool;
-        tool.name = entry["id"].get<std::string>();
+        tool.name        = entry["id"].get<std::string>();
         tool.description = entry.value("description", "");
-        tool.parameters = entry["input_schema"];
+        tool.parameters  = entry["input_schema"];
         tools.push_back(std::move(tool));
     }
     return tools;
@@ -130,7 +129,7 @@ json effect_descriptor(const json& executor, const std::string& call_id) {
     if (effect_namespace.empty()) {
         throw std::runtime_error("Harness host-brokered effect is missing its run namespace");
     }
-    const auto effect = executor["effect"];
+    const auto effect    = executor["effect"];
     const auto effect_id = effect_namespace + ":" + call_id;
     return {
         {"effect_id", effect_id},
@@ -168,14 +167,14 @@ public:
 
 private:
     std::shared_ptr<graph::CancelToken> cancel_;
-    std::atomic<bool> expired_{false};
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool finished_ = false;
-    std::thread timer_;
+    std::atomic<bool>                   expired_{false};
+    std::mutex                          mutex_;
+    std::condition_variable             cv_;
+    bool                                finished_ = false;
+    std::thread                         timer_;
 };
 
-} // namespace
+}  // namespace
 
 HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConfig config) {
     if (!config.provider) {
@@ -193,24 +192,24 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
         }
 
         CompletionParams params;
-        params.model = config.model;
-        params.temperature = 0.0f;
-        const auto budget = call.worker.value("_harness_provider_budget", json::object());
-        const int provider_timeout = budget.value("provider_timeout_seconds", 0);
-        const int max_output_tokens = budget.value("max_output_tokens", -1);
-        params.max_tokens = max_output_tokens;
-        params.cancel_token = cancel->fork();
-        params.tools = chat_tools(call.tool_catalog);
+        params.model                = config.model;
+        params.temperature          = 0.0f;
+        const auto budget           = call.worker.value("_harness_provider_budget", json::object());
+        const int  provider_timeout = budget.value("provider_timeout_seconds", 0);
+        const int  max_output_tokens = budget.value("max_output_tokens", -1);
+        params.max_tokens            = max_output_tokens;
+        params.cancel_token          = cancel->fork();
+        params.tools                 = chat_tools(call.tool_catalog);
         ChatMessage initial;
-        initial.role = "user";
+        initial.role    = "user";
         initial.content = worker_prompt(call);
         params.messages.push_back(std::move(initial));
 
         for (std::size_t round = 0; round < config.max_tool_rounds; ++round) {
             cancel->throw_if_cancelled("before provider Harness completion");
             ChatCompletion completion;
-            const auto provider_correlation = detail::journal_correlation_id("provider");
-            const auto provider_started = std::chrono::steady_clock::now();
+            const auto     provider_correlation = detail::journal_correlation_id("provider");
+            const auto     provider_started     = std::chrono::steady_clock::now();
             detail::append_current_harness_journal_event(
                 "provider.call.started",
                 {{"message_count", params.messages.size()},
@@ -224,20 +223,18 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                 provider_correlation);
             std::unique_ptr<ProviderDeadline> deadline;
             if (provider_timeout > 0) {
-                deadline = std::make_unique<ProviderDeadline>(params.cancel_token, provider_timeout);
+                deadline =
+                    std::make_unique<ProviderDeadline>(params.cancel_token, provider_timeout);
             }
-            const auto deadline_expired = [&deadline] {
-                return deadline && deadline->expired();
-            };
+            const auto deadline_expired = [&deadline] { return deadline && deadline->expired(); };
             try {
                 completion = config.provider->complete(params);
                 if (deadline_expired()) {
                     detail::append_current_harness_journal_event(
                         "provider.call.completed",
-                        {{"duration_ms",
-                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - provider_started)
-                              .count()},
+                        {{"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - provider_started)
+                                             .count()},
                          {"outcome", "timeout"}},
                         provider_correlation);
                     return HarnessWorkerResponse::timeout("provider request exceeded its timeout");
@@ -246,25 +243,22 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                 const bool timed_out = deadline_expired();
                 detail::append_current_harness_journal_event(
                     "provider.call.completed",
-                    {{"duration_ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - provider_started)
-                          .count()},
+                    {{"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - provider_started)
+                                         .count()},
                      {"outcome", timed_out ? "timeout" : "cancelled"}},
                     provider_correlation);
                 if (timed_out) {
                     return HarnessWorkerResponse::timeout("provider request exceeded its timeout");
                 }
                 return HarnessWorkerResponse::cancelled();
-            } catch (const asio::system_error& error) {
-                const bool timed_out = error.code() == asio::error::timed_out ||
-                                       deadline_expired();
+            } catch (const neograph_asio_system_error& error) {
+                const bool timed_out = error.code() == asio::error::timed_out || deadline_expired();
                 detail::append_current_harness_journal_event(
                     "provider.call.completed",
-                    {{"duration_ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - provider_started)
-                          .count()},
+                    {{"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - provider_started)
+                                         .count()},
                      {"error", error.what()},
                      {"outcome", timed_out ? "timeout" : "error"}},
                     provider_correlation);
@@ -274,10 +268,9 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                 if (deadline_expired()) {
                     detail::append_current_harness_journal_event(
                         "provider.call.completed",
-                        {{"duration_ms",
-                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - provider_started)
-                              .count()},
+                        {{"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - provider_started)
+                                             .count()},
                          {"error", error.what()},
                          {"outcome", "timeout"}},
                         provider_correlation);
@@ -285,10 +278,9 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                 }
                 detail::append_current_harness_journal_event(
                     "provider.call.completed",
-                    {{"duration_ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - provider_started)
-                          .count()},
+                    {{"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - provider_started)
+                                         .count()},
                      {"error", error.what()},
                      {"outcome", "error"}},
                     provider_correlation);
@@ -297,10 +289,9 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
             detail::append_current_harness_journal_event(
                 "provider.call.completed",
                 {{"content", completion.message.content},
-                 {"duration_ms",
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now() - provider_started)
-                      .count()},
+                 {"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - provider_started)
+                                     .count()},
                  {"outcome", completion.message.tool_calls.empty() ? "content" : "tool_calls"},
                  {"tool_call_count", completion.message.tool_calls.size()},
                  {"usage",
@@ -335,15 +326,16 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                     const auto executor = tool_it->second.value("executor", json::object());
                     if (executor.value("kind", "") == "host_brokered") {
                         const auto call_id = host_call_id();
-                        json pending = {
+                        json       pending = {
                             {"call_id", call_id},
                             {"provider_call_id", tool_call.id},
                             {"tool_id", tool_call.name},
                             {"arguments", std::move(arguments)},
                             {"result_schema",
-                             tool_it->second.value("output_schema", json::object())},
+                                   tool_it->second.value("output_schema", json::object())},
                         };
-                        if (const auto effect = effect_descriptor(executor, call_id); !effect.is_null()) {
+                        if (const auto effect = effect_descriptor(executor, call_id);
+                            !effect.is_null()) {
                             pending["effect"] = effect;
                         }
                         detail::append_current_harness_journal_event(
@@ -396,20 +388,19 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                     }
                     detail::append_current_harness_journal_event(
                         "capability.call.completed",
-                        {{"duration_ms",
-                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - capability_started)
-                              .count()},
+                        {{"duration_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - capability_started)
+                                             .count()},
                          {"executor_kind", executor.value("kind", "builtin")},
                          {"outcome", "success"},
                          {"result", result},
                          {"tool_id", tool_call.name}},
                         capability_correlation);
                     ChatMessage message;
-                    message.role = "tool";
+                    message.role         = "tool";
                     message.tool_call_id = tool_call.id;
-                    message.tool_name = tool_call.name;
-                    message.content = result.dump();
+                    message.tool_name    = tool_call.name;
+                    message.content      = result.dump();
                     params.messages.push_back(std::move(message));
                 } catch (const std::exception& error) {
                     return HarnessWorkerResponse::tool_error(error.what());
@@ -421,4 +412,4 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
     };
 }
 
-} // namespace neograph::mcp
+}  // namespace neograph::mcp

@@ -22,7 +22,6 @@
 #include <asio/use_awaitable.hpp>
 #include <asio/use_future.hpp>
 #include <asio/write.hpp>
-
 #include <gtest/gtest.h>
 
 #include <array>
@@ -37,10 +36,10 @@
 #include <vector>
 
 using namespace std::chrono_literals;
+using neograph::async::ws_connect;
 using neograph::async::WsClient;
 using neograph::async::WsMessage;
 using neograph::async::WsOpcode;
-using neograph::async::ws_connect;
 
 namespace detail_ws = neograph::async::detail;
 
@@ -55,19 +54,16 @@ asio::awaitable<void> serve_one(asio::ip::tcp::socket sock) {
     std::size_t hdr_end = std::string::npos;
     while (hdr_end == std::string::npos) {
         std::array<char, 4096> scratch{};
-        auto n = co_await sock.async_read_some(
-            asio::buffer(scratch), asio::use_awaitable);
+        auto n = co_await sock.async_read_some(asio::buffer(scratch), asio::use_awaitable);
         if (n == 0) co_return;
         buf.append(scratch.data(), n);
         hdr_end = buf.find("\r\n\r\n");
     }
     auto head = buf.substr(0, hdr_end);
-    if (head.rfind("GET / HTTP/1.1\r\n", 0) != 0 &&
-        head.rfind("GET /owned HTTP/1.1\r\n", 0) != 0 &&
+    if (head.rfind("GET / HTTP/1.1\r\n", 0) != 0 && head.rfind("GET /owned HTTP/1.1\r\n", 0) != 0 &&
         head.rfind("GET /hold HTTP/1.1\r\n", 0) != 0) {
-        const std::string bad =
-            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        co_await asio::async_write(sock, asio::buffer(bad), asio::use_awaitable);
+        const std::string bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        co_await          asio::async_write(sock, asio::buffer(bad), asio::use_awaitable);
         co_return;
     }
     std::string key;
@@ -78,16 +74,18 @@ asio::awaitable<void> serve_one(asio::ip::tcp::socket sock) {
         }
         if (pos == std::string::npos) co_return;
         pos = head.find(':', pos) + 1;
-        while (pos < head.size() && (head[pos] == ' ' || head[pos] == '\t')) ++pos;
+        while (pos < head.size() && (head[pos] == ' ' || head[pos] == '\t'))
+            ++pos;
         auto nl = head.find("\r\n", pos);
-        key = head.substr(pos, nl - pos);
+        key     = head.substr(pos, nl - pos);
     }
     std::string accept = detail_ws::compute_sec_websocket_accept(key);
     std::string resp =
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+        "Sec-WebSocket-Accept: " +
+        accept + "\r\n\r\n";
     co_await asio::async_write(sock, asio::buffer(resp), asio::use_awaitable);
     buf.erase(0, hdr_end + 4);
 
@@ -96,16 +94,14 @@ asio::awaitable<void> serve_one(asio::ip::tcp::socket sock) {
         std::optional<detail_ws::WsFrameHeader> h;
         while (!(h = detail_ws::parse_frame_header(buf))) {
             std::array<char, 4096> scratch{};
-            auto n = co_await sock.async_read_some(
-                asio::buffer(scratch), asio::use_awaitable);
+            auto n = co_await sock.async_read_some(asio::buffer(scratch), asio::use_awaitable);
             if (n == 0) co_return;
             buf.append(scratch.data(), n);
         }
         std::size_t needed = h->header_size + h->payload_len;
         while (buf.size() < needed) {
             std::array<char, 4096> scratch{};
-            auto n = co_await sock.async_read_some(
-                asio::buffer(scratch), asio::use_awaitable);
+            auto n = co_await sock.async_read_some(asio::buffer(scratch), asio::use_awaitable);
             if (n == 0) co_return;
             buf.append(scratch.data(), n);
         }
@@ -117,8 +113,7 @@ asio::awaitable<void> serve_one(asio::ip::tcp::socket sock) {
 
         // Server → client frames MUST be unmasked (§5.1).
         std::string out;
-        detail_ws::encode_frame_header(
-            out, h->opcode, h->fin, /*masked=*/false, payload.size());
+        detail_ws::encode_frame_header(out, h->opcode, h->fin, /*masked=*/false, payload.size());
         out.append(payload);
         co_await asio::async_write(sock, asio::buffer(out), asio::use_awaitable);
 
@@ -128,27 +123,24 @@ asio::awaitable<void> serve_one(asio::ip::tcp::socket sock) {
     }
 }
 
-asio::awaitable<std::uint16_t> listen_and_serve(
-    std::shared_ptr<asio::ip::tcp::acceptor> acceptor) {
+asio::awaitable<std::uint16_t> listen_and_serve(std::shared_ptr<asio::ip::tcp::acceptor> acceptor) {
     auto sock = co_await acceptor->async_accept(asio::use_awaitable);
-    co_await serve_one(std::move(sock));
-    co_return std::uint16_t{0};
+    co_await             serve_one(std::move(sock));
+    co_return            std::uint16_t{0};
 }
 
 }  // namespace
 
 class WsLoopback : public ::testing::Test {
-  protected:
+protected:
     void SetUp() override {
-        ioc_ = std::make_unique<asio::io_context>();
+        ioc_      = std::make_unique<asio::io_context>();
         acceptor_ = std::make_shared<asio::ip::tcp::acceptor>(
-            *ioc_,
-            asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+            *ioc_, asio::ip::tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
         port_ = acceptor_->local_endpoint().port();
 
         // Kick off the accept-and-serve coroutine on the io_context.
-        asio::co_spawn(
-            *ioc_, listen_and_serve(acceptor_), asio::detached);
+        asio::co_spawn(*ioc_, listen_and_serve(acceptor_), asio::detached);
 
         thread_ = std::thread([this] { ioc_->run(); });
     }
@@ -158,10 +150,10 @@ class WsLoopback : public ::testing::Test {
         if (thread_.joinable()) thread_.join();
     }
 
-    std::unique_ptr<asio::io_context>         ioc_;
-    std::shared_ptr<asio::ip::tcp::acceptor>  acceptor_;
-    std::uint16_t                             port_ = 0;
-    std::thread                               thread_;
+    std::unique_ptr<asio::io_context>        ioc_;
+    std::shared_ptr<asio::ip::tcp::acceptor> acceptor_;
+    std::uint16_t                            port_ = 0;
+    std::thread                              thread_;
 };
 
 TEST_F(WsLoopback, HandshakeAndTextEcho) {
@@ -185,12 +177,11 @@ TEST_F(WsLoopback, HandshakeAndTextEcho) {
     auto fut = asio::co_spawn(
         client_ioc,
         [&]() -> asio::awaitable<std::string> {
-            auto ws = co_await ws_connect(
-                client_ioc.get_executor(), host, port, "/",
-                {}, /*tls=*/false);
-            co_await ws->send_text("ping from client");
+            auto         ws =
+                co_await ws_connect(client_ioc.get_executor(), host, port, "/", {}, /*tls=*/false);
+            co_await     ws->send_text("ping from client");
             auto msg = co_await ws->recv();
-            co_await ws->send_close(1000, "bye");
+            co_await            ws->send_close(1000, "bye");
             // Drain the server's close echo so the server coroutine
             // exits cleanly.
             auto echo = co_await ws->recv();
@@ -207,22 +198,21 @@ TEST_F(WsLoopback, HandshakeAndTextEcho) {
 TEST_F(WsLoopback, LargeBinaryEcho) {
     // 70 KB crosses the 16-bit extended-length boundary (65535) and
     // forces the 8-byte length path.
-    std::string big(70 * 1024, '\x2A');
+    std::string      big(70 * 1024, '\x2A');
     asio::io_context client_ioc;
-    std::string host = "127.0.0.1";
-    std::string port = std::to_string(port_);
+    std::string      host = "127.0.0.1";
+    std::string      port = std::to_string(port_);
 
     // Same uninvoked-lambda pattern as HandshakeAndTextEcho; see
     // its comment for why.
     auto fut = asio::co_spawn(
         client_ioc,
         [&]() -> asio::awaitable<std::string> {
-            auto ws = co_await ws_connect(
-                client_ioc.get_executor(), host, port, "/",
-                {}, /*tls=*/false);
-            co_await ws->send_binary(big);
+            auto         ws =
+                co_await ws_connect(client_ioc.get_executor(), host, port, "/", {}, /*tls=*/false);
+            co_await     ws->send_binary(big);
             auto msg = co_await ws->recv();
-            co_await ws->send_close();
+            co_await            ws->send_close();
             auto echo = co_await ws->recv();
             EXPECT_EQ(echo.op, WsOpcode::Close);
             co_return std::move(msg.payload);
@@ -236,33 +226,31 @@ TEST_F(WsLoopback, LargeBinaryEcho) {
 }
 
 TEST_F(WsLoopback, CancellationAbortsHeldReceive) {
-    asio::io_context client_ioc;
-    const std::string port = std::to_string(port_);
-    auto token = std::make_shared<neograph::graph::CancelToken>();
-    std::promise<void> receive_entered;
-    auto entered = receive_entered.get_future();
-    std::promise<asio::error_code> completion;
-    auto result = completion.get_future();
+    asio::io_context                       client_ioc;
+    const std::string                      port  = std::to_string(port_);
+    auto                                   token = std::make_shared<neograph::graph::CancelToken>();
+    std::promise<void>                     receive_entered;
+    auto                                   entered = receive_entered.get_future();
+    std::promise<neograph_asio_error_code> completion;
+    auto                                   result = completion.get_future();
 
     asio::co_spawn(
         client_ioc,
         [&]() -> asio::awaitable<void> {
             try {
-                auto ex = co_await asio::this_coro::executor;
-                auto operation = token->fork();
+                auto ex                      = co_await asio::this_coro::executor;
+                auto               operation = token->fork();
                 operation->bind_executor(ex);
-                auto ws = co_await ws_connect(
-                    ex, "127.0.0.1", port, "/hold", {}, /*tls=*/false);
-                auto wait_for_message = [&]() -> asio::awaitable<WsMessage> {
+                auto ws = co_await ws_connect(ex, "127.0.0.1", port, "/hold", {}, /*tls=*/false);
+                auto               wait_for_message = [&]() -> asio::awaitable<WsMessage> {
                     receive_entered.set_value();
                     co_return co_await ws->recv();
                 };
                 (void)co_await asio::co_spawn(
                     ex, wait_for_message(),
-                    asio::bind_cancellation_slot(
-                        operation->slot(), asio::use_awaitable));
+                    asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
                 completion.set_value(asio::error::fault);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 completion.set_value(error.code());
             } catch (...) {
                 completion.set_value(asio::error::fault);
@@ -292,60 +280,54 @@ TEST_F(WsLoopback, CancellationAbortsHeldReceive) {
 
 TEST_F(WsLoopback, DelayedOperationsOwnEndpointAndPayloads) {
     asio::io_context client_ioc;
-    std::string host = "127.0.0.1";
-    std::string port = std::to_string(port_);
-    std::string path = "/owned";
+    std::string      host = "127.0.0.1";
+    std::string      port = std::to_string(port_);
+    std::string      path = "/owned";
 
-    auto connect_operation = ws_connect(
-        client_ioc.get_executor(), host, port, path, {}, /*tls=*/false);
+    auto connect_operation =
+        ws_connect(client_ioc.get_executor(), host, port, path, {}, /*tls=*/false);
     path = "/change";
-    auto connect_future = asio::co_spawn(
-        client_ioc, std::move(connect_operation), asio::use_future);
+    auto connect_future =
+        asio::co_spawn(client_ioc, std::move(connect_operation), asio::use_future);
     client_ioc.run();
     auto ws = connect_future.get();
 
     client_ioc.restart();
-    std::string text = "owned-text";
-    auto text_operation = ws->send_text(text);
-    text = "mutated-text";
-    auto text_future = asio::co_spawn(
-        client_ioc, std::move(text_operation), asio::use_future);
+    std::string text           = "owned-text";
+    auto        text_operation = ws->send_text(text);
+    text                       = "mutated-text";
+    auto text_future = asio::co_spawn(client_ioc, std::move(text_operation), asio::use_future);
     client_ioc.run();
     text_future.get();
 
     client_ioc.restart();
-    auto text_recv_future = asio::co_spawn(
-        client_ioc, ws->recv(), asio::use_future);
+    auto text_recv_future = asio::co_spawn(client_ioc, ws->recv(), asio::use_future);
     client_ioc.run();
     EXPECT_EQ(text_recv_future.get().payload, "owned-text");
 
     client_ioc.restart();
-    std::string binary = "owned-binary";
-    auto binary_operation = ws->send_binary(binary);
-    binary = "mutated-binary";
-    auto binary_future = asio::co_spawn(
-        client_ioc, std::move(binary_operation), asio::use_future);
+    std::string binary           = "owned-binary";
+    auto        binary_operation = ws->send_binary(binary);
+    binary                       = "mutated-binary";
+    auto binary_future = asio::co_spawn(client_ioc, std::move(binary_operation), asio::use_future);
     client_ioc.run();
     binary_future.get();
 
     client_ioc.restart();
-    auto binary_recv_future = asio::co_spawn(
-        client_ioc, ws->recv(), asio::use_future);
+    auto binary_recv_future = asio::co_spawn(client_ioc, ws->recv(), asio::use_future);
     client_ioc.run();
     EXPECT_EQ(binary_recv_future.get().payload, "owned-binary");
 
     client_ioc.restart();
-    std::string reason = "owned-close";
-    auto close_operation = ws->send_close(1000, reason);
-    reason = "mutated-close";
-    auto close_future = asio::co_spawn(
-        client_ioc, std::move(close_operation), asio::use_future);
+    std::string reason          = "owned-close";
+    auto        close_operation = ws->send_close(1000, reason);
+    reason                      = "mutated-close";
+    auto close_future = asio::co_spawn(client_ioc, std::move(close_operation), asio::use_future);
     client_ioc.run();
     close_future.get();
 
     client_ioc.restart();
-    auto close_recv_future = asio::co_spawn(
-        client_ioc, ws->recv(), asio::use_future);
+    auto close_recv_future = asio::co_spawn(client_ioc, ws->recv(), asio::use_future);
     client_ioc.run();
     auto close = close_recv_future.get();
     ASSERT_EQ(close.op, WsOpcode::Close);

@@ -307,7 +307,7 @@ TEST(RequestOptions, TimeoutTriggers) {
             // The acceptor belongs to the I/O thread. Closing it there lets
             // the pending accept finish before the thread is joined.
             asio::post(io, [this] {
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 acc.close(ec);
             });
             if (worker.joinable()) worker.join();
@@ -379,7 +379,7 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
             // The acceptor belongs to the I/O thread. Closing it there lets
             // the pending accept finish before the thread is joined.
             asio::post(io, [this] {
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 acc.close(ec);
             });
             if (worker.joinable()) worker.join();

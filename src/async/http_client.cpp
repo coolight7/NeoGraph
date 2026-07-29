@@ -257,7 +257,7 @@ asio::awaitable<HttpResponse> async_post_once_timed(
                                             std::move(body), std::move(headers), tls) ||
                             timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out, "async_post: per-hop timeout");
+            throw neograph_asio_system_error(asio::error::timed_out, "async_post: per-hop timeout");
         }
         co_return std::get<0>(std::move(res));
     } catch (const asio::multiple_exceptions& error) {
@@ -289,7 +289,8 @@ asio::awaitable<HttpStreamResponse> async_post_stream_once_timed(
                                                    std::move(headers), tls, std::move(on_chunk)) ||
                             timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out, "async_post_stream: per-hop timeout");
+            throw neograph_asio_system_error(asio::error::timed_out,
+                                             "async_post_stream: per-hop timeout");
         }
         co_return std::get<0>(std::move(res));
     } catch (const asio::multiple_exceptions& error) {
@@ -421,7 +422,7 @@ asio::awaitable<HttpResponse> async_get_once_timed(
                                            std::move(headers), tls) ||
                             timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out, "async_get: per-hop timeout");
+            throw neograph_asio_system_error(asio::error::timed_out, "async_get: per-hop timeout");
         }
         co_return std::get<0>(std::move(res));
     } catch (const asio::multiple_exceptions& error) {

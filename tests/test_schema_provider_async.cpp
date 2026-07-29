@@ -2,8 +2,6 @@
 // blocking HTTP/SSE bridge. Each case holds a local HTTP response indefinitely;
 // completion before release proves cancellation reached the active socket.
 
-#include <gtest/gtest.h>
-
 #include <neograph/graph/cancel.h>
 #include <neograph/llm/schema_provider.h>
 
@@ -14,6 +12,7 @@
 #include <asio/io_context.hpp>
 #include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
+#include <gtest/gtest.h>
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include <httplib.h>
@@ -39,24 +38,23 @@ constexpr const char* kResponse = R"({
 })";
 
 struct HoldingServer {
-    httplib::Server svr;
-    std::thread t;
-    int port = 0;
-    std::atomic<int> request_count{0};
+    httplib::Server   svr;
+    std::thread       t;
+    int               port = 0;
+    std::atomic<int>  request_count{0};
     std::atomic<bool> hold{true};
 
     HoldingServer() {
-        svr.Post("/v1/chat/completions",
-                 [this](const httplib::Request&, httplib::Response& res) {
-                     request_count.fetch_add(1, std::memory_order_release);
-                     while (hold.load(std::memory_order_acquire)) {
-                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                     }
-                     res.status = 200;
-                     res.set_content(kResponse, "application/json");
-                 });
+        svr.Post("/v1/chat/completions", [this](const httplib::Request&, httplib::Response& res) {
+            request_count.fetch_add(1, std::memory_order_release);
+            while (hold.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            res.status = 200;
+            res.set_content(kResponse, "application/json");
+        });
         port = svr.bind_to_any_port("127.0.0.1");
-        t = std::thread([this] { svr.listen_after_bind(); });
+        t    = std::thread([this] { svr.listen_after_bind(); });
         for (int i = 0; i < 200 && !svr.is_running(); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -68,9 +66,7 @@ struct HoldingServer {
         if (t.joinable()) t.join();
     }
 
-    std::string base_url() const {
-        return "http://127.0.0.1:" + std::to_string(port);
-    }
+    std::string base_url() const { return "http://127.0.0.1:" + std::to_string(port); }
 };
 
 CompletionParams make_params() {
@@ -85,36 +81,38 @@ void expect_socket_cancel(bool prefer_libcurl) {
     ASSERT_GT(server.port, 0);
 
     llm::SchemaProvider::Config config;
-    config.schema_path = "openai";
-    config.api_key = "test-key";
-    config.default_model = "gpt-4o-mini";
+    config.schema_path       = "openai";
+    config.api_key           = "test-key";
+    config.default_model     = "gpt-4o-mini";
     config.base_url_override = server.base_url();
-    config.timeout_seconds = 5;
-    config.prefer_libcurl = prefer_libcurl;
-    auto provider = llm::SchemaProvider::create(config);
+    config.timeout_seconds   = 5;
+    config.prefer_libcurl    = prefer_libcurl;
+    auto provider            = llm::SchemaProvider::create(config);
 
-    auto params = make_params();
-    auto token = std::make_shared<graph::CancelToken>();
+    auto params         = make_params();
+    auto token          = std::make_shared<graph::CancelToken>();
     params.cancel_token = token;
 
-    asio::io_context io;
-    std::promise<asio::error_code> completion;
-    auto result = completion.get_future();
-    asio::co_spawn(io, [&]() -> asio::awaitable<void> {
-        try {
-            token->bind_executor(co_await asio::this_coro::executor);
-            (void)co_await provider->complete_async(params);
-            completion.set_value(asio::error::fault);
-        } catch (const asio::system_error& error) {
-            completion.set_value(error.code());
-        } catch (...) {
-            completion.set_value(asio::error::fault);
-        }
-    }, asio::bind_cancellation_slot(token->slot(), asio::detached));
+    asio::io_context                       io;
+    std::promise<neograph_asio_error_code> completion;
+    auto                                   result = completion.get_future();
+    asio::co_spawn(
+        io,
+        [&]() -> asio::awaitable<void> {
+            try {
+                token->bind_executor(co_await asio::this_coro::executor);
+                (void)co_await provider->complete_async(params);
+                completion.set_value(asio::error::fault);
+            } catch (const neograph_asio_system_error& error) {
+                completion.set_value(error.code());
+            } catch (...) {
+                completion.set_value(asio::error::fault);
+            }
+        },
+        asio::bind_cancellation_slot(token->slot(), asio::detached));
     std::thread runner([&] { io.run(); });
 
-    const auto start_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (server.request_count.load(std::memory_order_acquire) == 0 &&
            std::chrono::steady_clock::now() < start_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -145,33 +143,35 @@ void expect_stream_socket_cancel() {
     ASSERT_GT(server.port, 0);
 
     llm::SchemaProvider::Config config;
-    config.schema_path = "openai";
-    config.api_key = "test-key";
-    config.default_model = "gpt-4o-mini";
+    config.schema_path       = "openai";
+    config.api_key           = "test-key";
+    config.default_model     = "gpt-4o-mini";
     config.base_url_override = server.base_url();
-    config.timeout_seconds = 5;
-    auto provider = llm::SchemaProvider::create(config);
+    config.timeout_seconds   = 5;
+    auto provider            = llm::SchemaProvider::create(config);
 
-    auto params = make_params();
-    auto token = std::make_shared<graph::CancelToken>();
+    auto params         = make_params();
+    auto token          = std::make_shared<graph::CancelToken>();
     params.cancel_token = token;
 
-    asio::io_context io;
+    asio::io_context                 io;
     std::promise<std::exception_ptr> completion;
-    auto result = completion.get_future();
-    asio::co_spawn(io, [&]() -> asio::awaitable<void> {
-        try {
-            token->bind_executor(co_await asio::this_coro::executor);
-            (void)co_await provider->complete_stream_async(params, StreamCallback{});
-            completion.set_value(nullptr);
-        } catch (...) {
-            completion.set_value(std::current_exception());
-        }
-    }, asio::detached);
+    auto                             result = completion.get_future();
+    asio::co_spawn(
+        io,
+        [&]() -> asio::awaitable<void> {
+            try {
+                token->bind_executor(co_await asio::this_coro::executor);
+                (void)co_await provider->complete_stream_async(params, StreamCallback{});
+                completion.set_value(nullptr);
+            } catch (...) {
+                completion.set_value(std::current_exception());
+            }
+        },
+        asio::detached);
     std::thread runner([&] { io.run(); });
 
-    const auto start_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (server.request_count.load(std::memory_order_acquire) == 0 &&
            std::chrono::steady_clock::now() < start_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -199,7 +199,7 @@ void expect_stream_socket_cancel() {
     runner.join();
 }
 
-} // namespace
+}  // namespace
 
 TEST(SchemaProviderAsync, CancelTokenAbortsConnPoolSocket) {
     expect_socket_cancel(false);

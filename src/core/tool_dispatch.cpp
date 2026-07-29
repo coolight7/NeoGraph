@@ -1,6 +1,6 @@
-#include <neograph/tool_dispatch.h>
 #include <neograph/graph/cancel.h>
-#include <neograph/graph/types.h>   // NodeInterrupt — the gate's Interrupt verdict
+#include <neograph/graph/types.h>  // NodeInterrupt — the gate's Interrupt verdict
+#include <neograph/tool_dispatch.h>
 
 #include <asio/co_spawn.hpp>
 #include <asio/deferred.hpp>
@@ -14,10 +14,11 @@
 
 namespace neograph {
 
-asio::awaitable<std::vector<ChatMessage>>
-dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
-                    ToolGate gate, ToolGateContext gctx,
-                    ToolExecutionContext execution) {
+asio::awaitable<std::vector<ChatMessage>> dispatch_tool_calls(std::vector<ToolCall> calls,
+                                                              std::vector<Tool*>    tools,
+                                                              ToolGate              gate,
+                                                              ToolGateContext       gctx,
+                                                              ToolExecutionContext  execution) {
     std::vector<ChatMessage> results;
     if (calls.empty()) co_return results;
 
@@ -64,8 +65,9 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
     // parallel group.
     throw_if_cancelled("before tool dispatch");
 
-    auto worker = [tools, execution](ToolCall tc, std::optional<ToolDecision> decision)
-            -> asio::awaitable<ChatMessage> {
+    auto worker = [tools, execution](
+                      ToolCall                    tc,
+                      std::optional<ToolDecision> decision) -> asio::awaitable<ChatMessage> {
         if (execution.cancel_token) {
             execution.cancel_token->throw_if_cancelled("before tool execution");
         }
@@ -84,7 +86,7 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
         }
 
         auto it = std::find_if(tools.begin(), tools.end(),
-            [&](Tool* t) { return t->get_name() == tc.name; });
+                               [&](Tool* t) { return t->get_name() == tc.name; });
         if (it == tools.end()) {
             tool_msg.content = R"({"error": "Tool not found: )" + tc.name + "\"}";
             co_return tool_msg;
@@ -93,13 +95,11 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
             // The gate may rewrite the arguments — that is how ambient values
             // (tenant, thread, credentials) get injected without every tool
             // having to know about them. No rewrite means what the model sent.
-            json args = (decision && decision->args)
-                            ? *decision->args
-                            : json::parse(tc.arguments);
+            json args = (decision && decision->args) ? *decision->args : json::parse(tc.arguments);
             if (auto* contextual = dynamic_cast<ContextualAsyncTool*>(*it)) {
                 tool_msg.content = co_await contextual->execute_async(args, execution);
             } else {
-                tool_msg.content = co_await (*it)->execute_async(args);
+                tool_msg.content = co_await(*it)->execute_async(args);
             }
             if (execution.cancel_token) {
                 execution.cancel_token->throw_if_cancelled("after tool execution");
@@ -108,9 +108,9 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
             // Cancellation is graph control flow, not a tool result that the
             // model should consume before the run terminates.
             throw;
-        } catch (const asio::system_error& error) {
-            if (execution.cancel_token && execution.cancel_token->is_cancelled()
-                && error.code() == asio::error::operation_aborted) {
+        } catch (const neograph_asio_system_error& error) {
+            if (execution.cancel_token && execution.cancel_token->is_cancelled() &&
+                error.code() == asio::error::operation_aborted) {
                 throw graph::CancelledException("tool operation aborted");
             }
             tool_msg.content = std::string(R"({"error": ")") + error.what() + "\"}";
@@ -133,21 +133,19 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
 
     // Multiple calls: fan them out via the same parallel-group idiom the engine
     // uses for independent nodes within a super-step.
-    auto ex = co_await asio::this_coro::executor;
+    auto ex          = co_await asio::this_coro::executor;
     using DeferredOp = decltype(asio::co_spawn(
-        ex, worker(std::declval<ToolCall>(),
-                   std::declval<std::optional<ToolDecision>>()),
+        ex, worker(std::declval<ToolCall>(), std::declval<std::optional<ToolDecision>>()),
         asio::deferred));
     std::vector<DeferredOp> ops;
     ops.reserve(calls.size());
     for (std::size_t i = 0; i < calls.size(); ++i) {
-        ops.push_back(asio::co_spawn(ex, worker(calls[i], decision_for(i)),
-                                     asio::deferred));
+        ops.push_back(asio::co_spawn(ex, worker(calls[i], decision_for(i)), asio::deferred));
     }
 
-    auto [order, excs, values] = co_await asio::experimental::make_parallel_group(
-        std::move(ops))
-        .async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
+    auto [order, excs, values] =
+        co_await asio::experimental::make_parallel_group(std::move(ops))
+            .async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
     (void)order;  // results are applied in call order, not completion order
 
     results.reserve(values.size());
@@ -163,9 +161,9 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
                 std::rethrow_exception(excs[i]);
             } catch (const graph::CancelledException&) {
                 throw;
-            } catch (const asio::system_error& error) {
-                if (execution.cancel_token && execution.cancel_token->is_cancelled()
-                    && error.code() == asio::error::operation_aborted) {
+            } catch (const neograph_asio_system_error& error) {
+                if (execution.cancel_token && execution.cancel_token->is_cancelled() &&
+                    error.code() == asio::error::operation_aborted) {
                     throw graph::CancelledException("tool operation aborted");
                 }
                 m.content = std::string(R"({"error": ")") + error.what() + "\"}";

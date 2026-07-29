@@ -609,7 +609,7 @@ asio::awaitable<RunResult> GraphEngine::run_async_with_runtime(RunConfig        
         co_return co_await asio::co_spawn(
             executor, execute_graph_async(config, cb, {}, nullptr, metadata, &resources),
             asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         if (operation->is_cancelled() && error.code() == asio::error::operation_aborted) {
             throw CancelledException("run_async operation aborted");
         }

@@ -523,9 +523,10 @@ asio::awaitable<std::unique_ptr<WsClient>> WsClient::connect_owned(
         impl->tls_stream = std::make_unique<asio::ssl::stream<asio::ip::tcp::socket&>>(
             impl->socket, *impl->ssl_ctx);
         if (!SSL_set_tlsext_host_name(impl->tls_stream->native_handle(), host.c_str())) {
-            throw asio::system_error{asio::error_code{static_cast<int>(::ERR_get_error()),
-                                                      asio::error::get_ssl_category()},
-                                     "ws: SNI setup"};
+            throw neograph_asio_system_error{
+                neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
+                                         asio::error::get_ssl_category()},
+                "ws: SNI setup"};
         }
         impl->tls_stream->set_verify_callback(asio::ssl::host_name_verification{host});
         co_await impl->tls_stream->async_handshake(asio::ssl::stream_base::client,

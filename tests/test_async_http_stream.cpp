@@ -327,15 +327,15 @@ TEST(AsyncHttpOwnership, StreamCancellationOwnsCallbackUntilAwaitableCompletes) 
         }
 
         ~SlowStreamServer() {
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             acceptor.close(ec);
             io.stop();
             if (worker.joinable()) worker.join();
         }
 
         asio::awaitable<void> accept_loop() {
-            asio::ip::tcp::socket sock{io};
-            asio::error_code      ec;
+            asio::ip::tcp::socket    sock{io};
+            neograph_asio_error_code ec;
             co_await acceptor.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
             try {
@@ -352,7 +352,7 @@ TEST(AsyncHttpOwnership, StreamCancellationOwnsCallbackUntilAwaitableCompletes) 
                     "0\r\n\r\n";
                 co_await asio::async_write(sock, asio::buffer(resp), asio::use_awaitable);
             } catch (...) {}
-            asio::error_code ignored;
+            neograph_asio_error_code ignored;
             sock.close(ignored);
         }
     } srv;
@@ -384,7 +384,7 @@ TEST(AsyncHttpOwnership, StreamCancellationOwnsCallbackUntilAwaitableCompletes) 
     auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
     io.run();
 
-    EXPECT_THROW((void)future.get(), asio::system_error);
+    EXPECT_THROW((void)future.get(), neograph_asio_system_error);
     EXPECT_TRUE(weak_callback.expired())
         << "cancelled stream should release callback captures on completion";
     EXPECT_EQ(chunks.load(std::memory_order_relaxed), 0)

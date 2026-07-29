@@ -301,7 +301,8 @@ asio::awaitable<HttpResponse> ConnPool::async_post_owned(
         auto res =
             co_await(impl_->dispatch(std::move(key), req) || timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out, "ConnPool::async_post: timeout");
+            throw neograph_asio_system_error(asio::error::timed_out,
+                                             "ConnPool::async_post: timeout");
         }
         co_return std::get<0>(std::move(res));
     } catch (const asio::multiple_exceptions& error) {
