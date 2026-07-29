@@ -27,6 +27,9 @@
 
 namespace neograph::graph {
 
+/// Latest topology schema accepted by GraphCompiler.
+inline constexpr int TOPOLOGY_SCHEMA_VERSION = 1;
+
 class GraphRegistry;
 
 class GraphNode;
@@ -184,7 +187,11 @@ public:
      * This makes the v0.1.0–v0.1.7 "silently dropped block" regression
      * class structurally impossible: deleting a parsing step deletes
      * its consumption mark, and any document using that feature fails
-     * loudly instead of degrading silently.
+     * loudly instead of degrading silently. Registered node config schemas
+     * additionally enforce NeoGraph's declared `required`, `type`, and `enum`
+     * subset before a node factory runs. Diagnostics use stable JSON paths;
+     * other JSON Schema keywords remain descriptive unless documented
+     * separately.
      *
      * Annotation namespace: keys starting with `_` or `x-` (e.g.
      * `_comment`, `x-studio-pos`) are never consumed, never errors,
@@ -243,10 +250,10 @@ public:
      * @brief Upgrade a legacy (schema_version 0 / absent) topology
      *        document to the current schema version.
      *
-     * v0 → v1 is purely mechanical and **lossless**: it stamps
-     * `schema_version: 1`, removes barrier blocks whose wait_for is
-     * missing/empty (making the legacy silent drop explicit), and
-     * renames every key strict mode would refuse to
+     * v0 → v1 is purely mechanical and **lossless**: it stamps the current
+     * `schema_version`, moves barrier blocks whose wait_for is missing/empty
+     * into the annotation namespace (making the legacy silent drop explicit),
+     * and renames every key strict mode would refuse to
      * `x-upgraded-<key>` — the annotation namespace — so no user data
      * is deleted, it is just moved out of the engine's way exactly as
      * the lenient parser ignored it.

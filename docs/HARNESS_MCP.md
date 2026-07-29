@@ -1,5 +1,7 @@
 # NeoGraph Harness MCP
 
+**Languages:** [English](HARNESS_MCP.md) | [한국어](HARNESS_MCP.ko.md) | [日本語](HARNESS_MCP.ja.md) | [简体中文](HARNESS_MCP.zh-CN.md)
+
 NeoGraph Harness compiles a bounded multi-worker workflow before it runs. The
 stable MCP surface stays at six tools:
 
@@ -13,6 +15,37 @@ stable MCP surface stays at six tools:
 The shipped presets are `fanout_judge`, `pr_review_panel`, `bug_triage`, and
 `research_synthesis`. Presets produce ordinary strict-core graph artifacts, so
 the same diagnostics and source maps apply to preset and DSL requests.
+
+### Sealed admission and explicit Core mode
+
+`harness.mode` accepts `preset`, `dsl`, or `core`. `preset` and `dsl` keep the
+existing bounded fanout/judge compatibility contract. `core` accepts an already
+strict topology (`schema_version: 1`) without passing it through the Elaborator;
+it is intended for an explicitly configured general-Core admission profile.
+
+Schema export, compile, and start now consume the same immutable
+`HarnessAdmissionProfile`. Its scoped `GraphRegistry` and manifest list every
+available node, reducer, and condition together with implementation, lowering,
+and compatibility metadata. Process-global registry entries are not part of
+this palette and cannot be resolved by Harness admission. Compile stops at
+validated declarative `TopologySpec`, so rejected input constructs no
+`GraphNode` and dispatches no worker or effect. Retained artifacts bind the
+profile ID and fingerprint; a different or pre-profile artifact fails closed at
+start/resume instead of being reinterpreted.
+
+C++ embedders pass a non-default profile through `HarnessServiceResources` at
+construction. This additive resource boundary preserves the existing
+`HarnessServiceConfig` layout. The profile fingerprint covers the manifest and
+the scoped registry's exported semantic projection. Each
+`implementation_identity` is a trusted declaration and must change whenever
+the corresponding callable behavior changes.
+
+This is migration groundwork, not the Control VM cutover. Current accepted
+Harness runs use the migration-only `precutover-graph-engine-v1` source profile
+and still execute through `GraphEngine`, which remains the pinned legacy
+runtime/oracle. This profile must stop admitting new runs before default VM
+cutover. No Program DSL, bytecode interpreter, or production Durable Kernel is
+claimed by this profile.
 
 ## Build And Run
 
@@ -30,7 +63,12 @@ export NEOGRAPH_HARNESS_MODEL=gpt-4o-mini
 
 `NEOGRAPH_HARNESS_API_KEY` takes precedence over `OPENAI_API_KEY`.
 `NEOGRAPH_HARNESS_BASE_URL` selects any OpenAI-compatible endpoint. The server
-writes protocol messages only to stdout and diagnostics only to stderr.
+accepts both an unversioned base such as `https://openrouter.ai/api` and the
+provider's documented versioned form such as `https://openrouter.ai/api/v1`;
+it adds `/v1` only when missing. The server writes protocol messages only to
+stdout and diagnostics only to stderr. See the
+[OpenRouter quickstart](https://openrouter.ai/docs/quickstart) for its current
+endpoint format.
 
 For host interoperability smoke tests only, set `NEOGRAPH_HARNESS_SMOKE=1`.
 That explicit mode uses a deterministic in-process provider returning a valid
@@ -360,7 +398,9 @@ the Harness tools. A suitable request is:
     "max_steps": 10,
     "timeout_seconds": 600,
     "max_parallel_workers": 2,
-    "max_worker_retries": 1
+    "max_worker_retries": 1,
+    "provider_timeout_seconds": 60,
+    "max_output_tokens": 4096
   },
   "policy": {
     "read_only": true,
@@ -368,6 +408,19 @@ the Harness tools. A suitable request is:
   }
 }
 ```
+
+### Provider Budgets
+
+`budgets.provider_timeout_seconds` limits one provider completion attempt to
+1--600 seconds. `budgets.max_output_tokens` limits one completion to 1--128000
+generated tokens. Both are optional: omitting either preserves the previous
+behavior, with no Harness deadline and the provider's existing output limit.
+
+A worker may set either field to a smaller value. A worker value above the
+Harness-wide value is rejected at compile time. On a deadline, Harness cancels
+only the child cancellation token supplied to that provider call; it does not
+cancel sibling workers or the enclosing run. The provider must honor the token,
+so a provider that cannot be interrupted may return after its deadline.
 
 The host should follow this sequence:
 
@@ -377,6 +430,15 @@ The host should follow this sequence:
 4. If detail is needed, call `neograph_get` with the same `run_id` and a
    returned `neograph://runs/...` URI as `uri`. Do not pull traces into context
    by default.
+
+### Finding Provenance
+
+The details artifact preserves each schema-validated worker response in
+`workers` and keeps the established flat `findings` array for existing clients.
+`finding_sources` is a same-length parallel array: each entry contains the
+aggregate `finding_index`, source `worker_id`, and that worker's `local_index`.
+Use it to identify the source of duplicate local IDs such as `F1`; do not add
+provenance fields to the worker's declared finding object.
 
 ## Host-Brokered Resume
 
@@ -406,6 +468,72 @@ conflicting duplicate is rejected. The accepted resume intent is persisted
 before execution is scheduled, so polling after a process crash restarts the
 resume from the `NodeInterrupt` checkpoint without repeating successful sibling
 workers.
+
+### External Effects And Reconciliation
+
+The ordinary host-brokered contract is backward compatible: a catalog entry
+without `executor.effect` remains `awaiting_tool_results` after a process
+restart and accepts the same `{run_id, call_id, result}` resume request.
+
+For a host capability that can make an externally visible, non-idempotent
+change, declare that risk explicitly. Effect metadata is valid only with the
+default `host_brokered` `tool_result` interaction; it is not input collection
+metadata.
+
+```json
+{
+  "executor": {
+    "kind": "host_brokered",
+    "effect": {
+      "idempotency": "unsupported",
+      "status_query": true,
+      "fencing": true
+    }
+  }
+}
+```
+
+The pending call then includes a durable `effect` object. Its `effect_id` and
+`idempotency_key` are scoped to the Harness run and differ from the provider's
+tool-call ID. `status_query` and `fencing` describe host capabilities; Harness
+records them but does not invent a provider-specific query or retry protocol.
+
+If the service reconnects while an `idempotency: "unsupported"` call is still
+waiting, it changes only that run to `ambiguous_effect`. This means the host
+may have performed the effect before the process stopped, but Harness cannot
+prove either outcome. The compact status includes `pending` and `ambiguity`,
+the journal records `host_brokered.effect.ambiguous`, and Harness neither
+replays the tool nor reports the effect as failed or completed.
+
+Resolve the ambiguity through `neograph_resume` after the host checks its own
+authoritative system:
+
+```json
+{"run_id":"run_...","call_id":"hcall_...","resolution":"completed","result":{"answer":"validated host result"}}
+```
+
+```json
+{"run_id":"run_...","call_id":"hcall_...","resolution":"failed"}
+```
+
+```json
+{"run_id":"run_...","call_id":"hcall_...","resolution":"unknown"}
+```
+
+`completed` validates and consumes `result`, then resumes from the checkpoint.
+`failed` records a terminal Harness failure without executing the worker again.
+`unknown` leaves the run in `ambiguous_effect` for later reconciliation. Exact
+duplicate completed, failed, or unknown submissions are idempotent; a conflicting
+completed or failed submission is rejected. Every non-duplicate reconciliation
+is journaled as `host_brokered.effect.reconciled`.
+
+An ambiguous effect is deliberately not cancellable and does not expire. A
+cancel or timeout cannot establish whether the external effect occurred; submit
+`unknown` if the authoritative system cannot resolve it yet.
+
+This protocol does not claim exactly-once delivery across a host crash. Hosts
+that support idempotency keys or a status query should use those systems to
+determine a real outcome before submitting a reconciliation.
 
 Run snapshots include `created_at`, `updated_at`, `expires_at`, and
 `poll_after_ms`. The default TTL is 24 hours and the default polling interval is

@@ -43,6 +43,9 @@
 namespace neograph::graph {
 
 class ValidatedTopology;
+namespace detail {
+struct SubgraphWriteJournal;
+}
 
 /**
  * @brief Construction-time configuration for a GraphEngine.
@@ -78,8 +81,13 @@ struct EngineConfig {
     /// Fan-out worker count. One preserves the historical no-pool fast path.
     std::size_t worker_count = 1;
 
-    /// Pure nodes whose result cache should be enabled at construction time.
+    /// Pure, context-independent nodes whose results may be reused across
+    /// executions. This is an explicit CacheScope::Reusable opt-in; use the
+    /// two-argument set_node_cache_enabled() API for execution-local caching.
     std::set<std::string> cached_nodes;
+
+    /// Global NodeCache entry bound. Zero preserves unbounded behavior.
+    std::size_t node_cache_max_entries = 0;
 };
 
 /**
@@ -154,6 +162,17 @@ struct RunConfig {
      * is a no-op.
      */
     bool resume_if_exists = false;
+};
+
+/**
+ * @brief Optional per-run metadata without changing the stable RunConfig ABI.
+ *
+ * The engine copies this metadata into RunContext and preserves it through
+ * subgraphs. Python does not expose this C++-only extension yet.
+ */
+struct RunMetadata {
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    std::string                                          trace_id;
 };
 
 /// @brief Normal, paused, or step-limited outcome of a successful run call.
@@ -482,6 +501,10 @@ public:
      */
     RunResult run(const RunConfig& config);
 
+    /// Execute with optional C++ deadline and trace metadata. RunMetadata is
+    /// separate from RunConfig to preserve the latter's stable ABI.
+    RunResult run(const RunConfig& config, const RunMetadata& metadata);
+
     /**
      * @brief Async peer of run() — returns an awaitable yielding the result.
      *
@@ -502,6 +525,9 @@ public:
      */
     asio::awaitable<RunResult> run_async(RunConfig config);
 
+    /// Async peer that preserves the supplied C++ run metadata.
+    asio::awaitable<RunResult> run_async(RunConfig config, RunMetadata metadata);
+
     /**
      * @brief Execute the graph with streaming event callbacks.
      * @param config Run configuration.
@@ -510,10 +536,20 @@ public:
      */
     RunResult run_stream(const RunConfig& config, const GraphStreamCallback& cb);
 
+    /// Streaming execution with optional C++ deadline and trace metadata.
+    RunResult run_stream(const RunConfig&           config,
+                         const GraphStreamCallback& cb,
+                         const RunMetadata&         metadata);
+
     /// Async peer of run_stream — non-blocking coroutine surface.
     /// `config` and `cb` are taken by value for the same reason as
     /// run_async() — see that overload's docstring.
     asio::awaitable<RunResult> run_stream_async(RunConfig config, GraphStreamCallback cb);
+
+    /// Async streaming peer that preserves the supplied C++ run metadata.
+    asio::awaitable<RunResult> run_stream_async(RunConfig           config,
+                                                GraphStreamCallback cb,
+                                                RunMetadata         metadata);
 
     /**
      * @brief Resume execution from a HITL interrupt.
@@ -531,7 +567,7 @@ public:
                      const GraphStreamCallback& cb           = nullptr);
 
     /**
-     * @brief Resume while preserving caller cancellation and deadline settings.
+     * @brief Resume while preserving caller cancellation settings.
      *
      * `config.thread_id` identifies the interrupted session. Input is ignored;
      * the latest checkpoint remains the source of resumed graph state.
@@ -540,7 +576,18 @@ public:
                      const json&                resume_value = json(),
                      const GraphStreamCallback& cb           = nullptr);
 
+    /// Resume with metadata for this new execution attempt. Deadlines are not
+    /// checkpointed because an absolute deadline from a previous attempt may be
+    /// stale; callers intentionally provide a fresh RunMetadata value.
+    RunResult resume(const RunConfig&           config,
+                     const json&                resume_value,
+                     const GraphStreamCallback& cb,
+                     const RunMetadata&         metadata);
+
     /// Async peer of resume — non-blocking coroutine surface.
+    /// All arguments are copied before this function returns, so the returned
+    /// awaitable does not borrow the caller's strings, JSON, or callback object.
+    /// Objects referenced by the callback's captures remain caller-owned.
     asio::awaitable<RunResult> resume_async(const std::string&         thread_id,
                                             const json&                resume_value = json(),
                                             const GraphStreamCallback& cb           = nullptr);
@@ -549,6 +596,12 @@ public:
     asio::awaitable<RunResult> resume_async(RunConfig           config,
                                             json                resume_value = json(),
                                             GraphStreamCallback cb           = nullptr);
+
+    /// Async resume peer with metadata for this new execution attempt.
+    asio::awaitable<RunResult> resume_async(RunConfig           config,
+                                            json                resume_value,
+                                            GraphStreamCallback cb,
+                                            RunMetadata         metadata);
 
     /// @brief Borrow the state-administration facade for this engine.
     GraphAdmin admin() noexcept;
@@ -583,6 +636,16 @@ public:
     void update_state(const std::string& thread_id,
                       const json&        channel_writes,
                       const std::string& as_node = "");
+
+    /**
+     * @brief Update state with ordered writes that preserve ChannelWrite modes.
+     *
+     * Unlike the JSON keyed form, this overload applies repeated channel writes
+     * in order and honors explicit overwrite intent.
+     */
+    void update_state_writes(const std::string&               thread_id,
+                             const std::vector<ChannelWrite>& channel_writes,
+                             const std::string&               as_node = "");
 
     /// [@coolight] 方便直接修改
     void update_state(const std::string&                      thread_id,
@@ -725,13 +788,20 @@ public:
      * @brief Enable or disable per-node result caching.
      *
      * When enabled for a node, the executor hashes the input state and
-     * looks up `(node_name, hash)` in the engine's NodeCache. On hit,
+     * looks up an execution-local `(node_name, scope, hash)` key in the
+     * engine's NodeCache. On hit,
      * the cached NodeResult is replayed without invoking the node — no
      * LLM call, no tool execution. On miss, the node runs and the
      * result is stored.
      *
      * Cache is OFF by default. Only opt in for nodes that are pure
      * (deterministic, no external side effects, no time dependence).
+     * The default CacheScope::Execution never reuses a result across
+     * `run()` or `resume()` calls, so it cannot cross tenant, Store,
+     * ToolGate, provider/model, or resume boundaries. Pass
+     * CacheScope::Reusable only for a node proven independent of all such
+     * context, optionally with a CacheKeyPolicy context key that declares
+     * stable, non-secret context partitions.
      * Streaming runs (`run_stream`) bypass the cache for the affected
      * nodes because cached hits cannot replay LLM_TOKEN events.
      *
@@ -740,10 +810,17 @@ public:
      */
     void set_node_cache_enabled(const std::string& node_name, bool enabled);
 
+    /// Enable or disable caching with an explicit identity policy.
+    void set_node_cache_enabled(const std::string& node_name, bool enabled, CacheKeyPolicy policy);
+
     /**
      * @brief Drop all cached entries (per-node enable state preserved).
      */
     void clear_node_cache();
+
+    /// Set the global NodeCache entry bound. Zero means unbounded. Safe during
+    /// active runs; lowering the value may evict entries immediately.
+    void set_node_cache_max_entries(std::size_t max_entries);
 
     /// @brief Borrow the engine's NodeCache for stats inspection.
     const NodeCache& node_cache() const { return node_cache_; }
@@ -755,6 +832,20 @@ public:
     const std::string& get_graph_name() const { return name_; }
 
 private:
+    friend class SubgraphNode;
+
+    struct SubgraphRunResult {
+        RunResult                 result;
+        std::vector<ChannelWrite> writes;
+    };
+
+    struct RuntimeResources {
+        std::optional<std::shared_ptr<CheckpointStore>> checkpoint_store;
+        std::optional<std::shared_ptr<Store>>           store;
+        std::optional<ToolGate>                         parent_tool_gate;
+        std::shared_ptr<detail::SubgraphWriteJournal>   subgraph_write_journal;
+    };
+
     GraphEngine() = default;
 
     static std::unique_ptr<GraphEngine> link_impl(CompiledGraph   graph,
@@ -769,6 +860,25 @@ private:
     void init_state(GraphState& state) const;
     void apply_input(GraphState& state, const json& input) const;
 
+    asio::awaitable<RunResult> resume_async_owned(std::string         thread_id,
+                                                  json                resume_value,
+                                                  GraphStreamCallback cb);
+
+    asio::awaitable<RunResult> run_async_with_runtime(RunConfig           config,
+                                                      GraphStreamCallback cb,
+                                                      RunMetadata         metadata,
+                                                      RuntimeResources    resources);
+
+    asio::awaitable<RunResult> resume_async_with_runtime(RunConfig           config,
+                                                         json                resume_value,
+                                                         GraphStreamCallback cb,
+                                                         RunMetadata         metadata,
+                                                         RuntimeResources    resources);
+
+    asio::awaitable<SubgraphRunResult> run_subgraph_async(RunConfig           config,
+                                                          const RunContext&   parent,
+                                                          GraphStreamCallback cb);
+
     /// Super-step loop (coroutine). Owns: state init, interrupt
     /// gates, resume load, super-step commit, routing via Scheduler.
     /// Delegates: node invocation to NodeExecutor, checkpoint
@@ -777,7 +887,9 @@ private:
     asio::awaitable<RunResult> execute_graph_async(const RunConfig&                config,
                                                    const GraphStreamCallback&      cb,
                                                    const std::vector<std::string>& resume_from = {},
-                                                   const json* resume_value = nullptr);
+                                                   const json*             resume_value = nullptr,
+                                                   const RunMetadata&      metadata     = {},
+                                                   const RuntimeResources* resources    = nullptr);
 
     RetryPolicy get_retry_policy(const std::string& node_name) const;
 
@@ -827,7 +939,8 @@ private:
     /// Per-node result cache (opt-in via set_node_cache_enabled).
     /// Stored by value so the engine owns it; NodeExecutor holds a
     /// non-owning pointer threaded through set_worker_count() rebuilds.
-    NodeCache node_cache_;
+    NodeCache                  node_cache_;
+    std::atomic<std::uint64_t> next_cache_execution_id_{1};
 
     /// Inflight-run counter. Incremented at the top of
     /// execute_graph_async and decremented at coroutine completion

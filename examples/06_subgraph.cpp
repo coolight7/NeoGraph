@@ -67,6 +67,7 @@ int main() {
 
     // JSON-based graph definition — subgraph included inline
     neograph::json definition = {
+        {"schema_version", neograph::graph::TOPOLOGY_SCHEMA_VERSION},
         {"name", "supervisor_graph"},
         {"channels", {
             {"messages", {{"reducer", "append"}}}
@@ -91,7 +92,9 @@ int main() {
                         {{"from", "tools"}, {"to", "llm"}}
                     })}
                 }}
-                // input_map/output_map omitted → auto-mapped by same-name channels
+                // input_map/output_map omitted -> identity mapping. Parent values
+                // seed the child once; only child-produced ChannelWrite deltas
+                // return, in order and with each write mode preserved.
             }}
         }},
         {"edges", neograph::json::array({

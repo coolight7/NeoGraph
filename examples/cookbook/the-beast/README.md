@@ -1,5 +1,7 @@
 # The Beast — generate · evolve · roll back
 
+**Languages:** [English](README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
+
 > A self-evolving agent that writes its own harness, evolves it under the
 > DSL compiler, and rewinds its execution through the checkpointer.
 > **Generated. Evolved. Rewound. The Beast remains.**
@@ -350,14 +352,13 @@ secret mediation) is the documented next step.
 
 ## Evolve — memetic (Darwinian + Lamarckian)
 
-The offline `the_beast.cpp` runs evolution.h's `evolve()`, but that path's
-`evaluate()` is **gate-only**: it compiles/validates a mutant and calls it
-"cost 0" — it never *runs* the harness or scores its output. So fitness is
-flat and nothing climbs (the best individual stays the seed).
+The offline `the_beast.cpp` deliberately sets `run_evaluation=false`, so its
+selection is structural-only. The generic evolution API can also execute a
+task and score exact expected channel values.
 
-[`the_beast_evolve.cpp`](the_beast_evolve.cpp) supplies the missing layer:
-a **real fitness that executes the harness and scores its actual output**,
-then drives a memetic loop.
+[`the_beast_evolve.cpp`](the_beast_evolve.cpp) uses a custom continuous
+distance metric instead: near misses can improve toward the numeric target
+rather than receiving the generic scorer's single output-mismatch class.
 
 - **The task** (a genuine one, output-scored — not a structural proxy):
   assemble an ARITHMETIC PIPELINE that computes a target number. Five op

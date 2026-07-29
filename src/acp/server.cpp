@@ -149,14 +149,16 @@ struct ACPServer::Impl {
     /// Sessions whose latest engine result is paused. The next prompt is
     /// consumed as the resume value exactly once instead of starting at entry.
     std::set<std::string>                         interrupted_sessions;
-    /// Per-session cancel flags held behind shared_ptrs so a worker
-    /// thread can capture the pointer at dispatch time (under the
-    /// lock) and read/write the flag thereafter without re-traversing
-    /// the map — `std::map<…, std::atomic<bool>>` would otherwise
-    /// invite concurrent-rebalance UB when a parallel session/cancel
-    /// rotates a tree node the worker is reading.
-    std::map<std::string, std::shared_ptr<std::atomic<bool>>>
-                                                  cancel_flags;
+    /// An active prompt owns its token until its terminal response leaves the
+    /// notification sink. A cancel before a session's first prompt is consumed
+    /// by that prompt.
+    std::map<std::string, std::shared_ptr<neograph::graph::CancelToken>>
+                                                    active_cancel_tokens;
+    std::set<std::string>                         pending_cancels;
+    /// A terminal prompt response has been committed for these sessions. ACP
+    /// cancel carries only a session id, so a cancel without an active prompt
+    /// after this point is stale rather than a pre-cancel for a later turn.
+    std::set<std::string>                         terminal_prompt_sessions;
 
     /// Outbound JSON-RPC: id → promise that the run-loop reader fulfils
     /// when it sees a response with that id.
@@ -315,7 +317,6 @@ ACPServer::Impl::handle_session_new(const neograph::json& params,
     {
         std::lock_guard lk(sessions_mu);
         sessions[sid] = req.cwd;
-        cancel_flags[sid] = std::make_shared<std::atomic<bool>>(false);
     }
 
     NewSessionResponse resp;
@@ -369,10 +370,6 @@ ACPServer::Impl::handle_session_resume(const neograph::json& params,
                 -32602, "session/resume cwd does not match the existing session", id);
         }
         sessions[req.session_id] = req.cwd;
-        if (!cancel_flags.count(req.session_id)) {
-            cancel_flags[req.session_id] =
-                std::make_shared<std::atomic<bool>>(false);
-        }
         if (is_interrupt_phase(history.front().interrupt_phase)) {
             interrupted_sessions.insert(req.session_id);
         } else {
@@ -433,24 +430,21 @@ ACPServer::Impl::handle_session_prompt(ACPServer& /*owner*/,
         return;
     }
 
-    // Capture the cancel-flag shared_ptr while holding sessions_mu so the
-    // worker can read/write it later without re-traversing the map.
-    std::shared_ptr<std::atomic<bool>> my_cancel;
+    std::shared_ptr<neograph::graph::CancelToken> task_cancel;
+    bool pre_cancelled = false;
     bool resume_pending = false;
     {
         std::lock_guard lk(sessions_mu);
         if (sessions.count(req.session_id) == 0) {
             sessions[req.session_id] = "";
         }
-        auto it = cancel_flags.find(req.session_id);
-        if (it == cancel_flags.end() || !it->second) {
-            my_cancel = std::make_shared<std::atomic<bool>>(false);
-            cancel_flags[req.session_id] = my_cancel;
-        } else {
-            my_cancel = it->second;
-        }
+        task_cancel = std::make_shared<neograph::graph::CancelToken>();
+        active_cancel_tokens[req.session_id] = task_cancel;
+        pre_cancelled = pending_cancels.erase(req.session_id) != 0;
+        terminal_prompt_sessions.erase(req.session_id);
         resume_pending = interrupted_sessions.count(req.session_id) != 0;
     }
+    if (pre_cancelled) task_cancel->cancel();
 
     // Run the engine on a detached worker so the run-loop reader can
     // keep pumping inbound messages — including responses to fs/*
@@ -467,13 +461,53 @@ ACPServer::Impl::handle_session_prompt(ACPServer& /*owner*/,
         }
 #endif
         std::thread worker(
-            [this, req = std::move(req), id, my_cancel, reservation,
-             resume_pending]() mutable {
+            [this, req = std::move(req), id, task_cancel, reservation,
+              resume_pending]() mutable {
+                bool response_attempted = false;
+                bool terminal_committed = false;
+                auto cleanup = [&] {
+                    reservation->release_session();
+                    std::lock_guard lk(sessions_mu);
+                    auto it = active_cancel_tokens.find(req.session_id);
+                    if (it != active_cancel_tokens.end()
+                        && it->second == task_cancel) {
+                        active_cancel_tokens.erase(it);
+                    }
+                    if (!terminal_committed) {
+                        // Error paths still complete this prompt turn. Mark it
+                        // terminal so a late cancel cannot cancel the next one.
+                        terminal_prompt_sessions.insert(req.session_id);
+                    }
+                };
+                auto commit_terminal = [&](StopReason& stop,
+                                           bool interrupted) {
+                    std::lock_guard lk(sessions_mu);
+                    // This lock is the cancel-vs-terminal-response
+                    // linearization point. A cancel that wins here changes the
+                    // sole terminal response; one that arrives after is stale.
+                    if (task_cancel->is_cancelled()) {
+                        stop = StopReason::Cancelled;
+                    }
+                    if (stop != StopReason::Cancelled && interrupted) {
+                        interrupted_sessions.insert(req.session_id);
+                    } else {
+                        interrupted_sessions.erase(req.session_id);
+                    }
+                    auto it = active_cancel_tokens.find(req.session_id);
+                    if (it != active_cancel_tokens.end()
+                        && it->second == task_cancel) {
+                        active_cancel_tokens.erase(it);
+                    }
+                    terminal_prompt_sessions.insert(req.session_id);
+                    terminal_committed = true;
+                };
+
                 try {
                     auto& a = *adapter;
 
                     neograph::graph::RunConfig cfg;
                     cfg.thread_id = req.session_id;
+                    cfg.cancel_token = task_cancel;
 
                     StopReason  stop         = StopReason::EndTurn;
                     bool        graph_failed = false;
@@ -493,6 +527,8 @@ ACPServer::Impl::handle_session_prompt(ACPServer& /*owner*/,
                         if (!run_result.interrupted) {
                             agent_text = a.extract_agent_text(run_result.output);
                         }
+                    } catch (const neograph::graph::CancelledException&) {
+                        stop = StopReason::Cancelled;
                     } catch (const std::exception& e) {
                         graph_failed = true;
                         graph_error = e.what();
@@ -501,7 +537,13 @@ ACPServer::Impl::handle_session_prompt(ACPServer& /*owner*/,
                         graph_error = "unknown exception";
                     }
 
-                    if (graph_failed) {
+                    if (task_cancel->is_cancelled()) {
+                        stop = StopReason::Cancelled;
+                    }
+
+                    // Cancellation wins a concurrent graph failure so the client
+                    // observes one terminal cancelled response, not an error update.
+                    if (graph_failed && stop != StopReason::Cancelled) {
                         // ACP's StopReason vocabulary has no generic error
                         // value. Preserve the existing protocol shape:
                         // diagnostic update, then a normal end_turn response.
@@ -514,18 +556,10 @@ ACPServer::Impl::handle_session_prompt(ACPServer& /*owner*/,
                         to_json(nj, n);
                         emit(jsonrpc_notify("session/update", std::move(nj)));
                     } else {
-                        {
-                            std::lock_guard lk(sessions_mu);
-                            if (run_result.interrupted) {
-                                interrupted_sessions.insert(req.session_id);
-                            } else {
-                                interrupted_sessions.erase(req.session_id);
-                            }
-                        }
-                        bool was_cancelled = my_cancel->exchange(
-                            false, std::memory_order_acq_rel);
-                        if (was_cancelled) {
-                            stop = StopReason::Cancelled;
+                        if (stop == StopReason::Cancelled) {
+                            // Cancellation has no final agent content. Emit only
+                            // the terminal prompt response below, never an empty
+                            // session/update followed by a second terminal signal.
                         } else if (run_result.interrupted) {
                             const auto reason = run_result.interrupt_value.value(
                                 "reason", run_result.interrupt_value.value(
@@ -567,22 +601,32 @@ ACPServer::Impl::handle_session_prompt(ACPServer& /*owner*/,
                         }
                     }
 
+                    // Notifications may synchronously block in an embedder's
+                    // sink. Recheck cancellation only after all pending updates
+                    // have been emitted, then commit the one terminal response.
+                    commit_terminal(
+                        stop, !graph_failed && run_result.interrupted);
+
+                    // The terminal state is now committed and the old cancel
+                    // token is no longer reachable. Admit the next turn before
+                    // publishing the response so a client awakened by the sink
+                    // cannot observe a stale single-flight reservation.
+                    reservation->release_session();
+
                     PromptResponse resp;
                     resp.stop_reason = stop;
                     neograph::json rj;
                     to_json(rj, resp);
-                    // The graph and all session-state updates are complete.
-                    // Admit the next turn before publishing this response so a
-                    // reentrant/fast client cannot observe a stale busy state.
-                    reservation->release_session();
+                    response_attempted = true;
                     emit(jsonrpc_result(std::move(rj), id));
+                    cleanup();
                 } catch (const std::exception& e) {
-                    reservation->release_session();
-                    emit_internal_error(
+                    cleanup();
+                    if (!response_attempted) emit_internal_error(
                         id, "ACP prompt worker failed: ", e.what());
                 } catch (...) {
-                    reservation->release_session();
-                    emit_internal_error(
+                    cleanup();
+                    if (!response_attempted) emit_internal_error(
                         id, "ACP prompt worker failed: unknown exception");
                 }
                 // The captured reservation is the last owner after dispatch
@@ -617,23 +661,17 @@ ACPServer::Impl::handle_session_cancel(const neograph::json& params) {
     try { from_json(params, n); }
     catch (...) { return; }
 
-    std::shared_ptr<std::atomic<bool>> flag;
+    std::shared_ptr<neograph::graph::CancelToken> token;
     {
         std::lock_guard lk(sessions_mu);
-        auto it = cancel_flags.find(n.session_id);
-        if (it != cancel_flags.end() && it->second) {
-            flag = it->second;
-        } else {
-            // Cancel arriving for a session whose prompt hasn't been
-            // dispatched yet — pre-create the flag so the eventual
-            // handle_session_prompt picks it up. Aligns with the
-            // documented semantic ("cancel-before-prompt sticks until
-            // the next prompt observes and consumes it").
-            flag = std::make_shared<std::atomic<bool>>(false);
-            cancel_flags[n.session_id] = flag;
+        auto it = active_cancel_tokens.find(n.session_id);
+        if (it != active_cancel_tokens.end() && it->second) {
+            token = it->second;
+        } else if (!terminal_prompt_sessions.contains(n.session_id)) {
+            pending_cancels.insert(n.session_id);
         }
     }
-    flag->store(true, std::memory_order_release);
+    if (token) token->cancel();
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +696,19 @@ ACPServer::~ACPServer() {
     // (see handle_session_prompt) so we don't join them; we wait on
     // inflight_count via workers_cv until every worker has decremented
     // and cleared its single-flight session.
+    // Detached workers may finish while this destructor drains. Drop their
+    // late notifications instead of invoking a sink owned by the caller.
+    std::atomic_store_explicit(
+        &impl_->sink_, std::shared_ptr<NotificationSink>{}, std::memory_order_release);
     impl_->stop_flag.store(true, std::memory_order_release);
+    std::vector<std::shared_ptr<neograph::graph::CancelToken>> active_tokens;
+    {
+        std::lock_guard lk(impl_->sessions_mu);
+        for (const auto& [_, token] : impl_->active_cancel_tokens) {
+            active_tokens.push_back(token);
+        }
+    }
+    for (const auto& token : active_tokens) token->cancel();
     {
         std::unique_lock lk(impl_->workers_mu);
         impl_->workers_cv.wait(lk, [this]{

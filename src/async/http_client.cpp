@@ -252,13 +252,17 @@ asio::awaitable<HttpResponse> async_post_once_timed(
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(ex);
     timer.expires_after(timeout);
-    auto res = co_await(async_post_once(ex, std::move(host), std::move(port), std::move(path),
-                                        std::move(body), std::move(headers), tls) ||
-                        timer.async_wait(asio::use_awaitable));
-    if (res.index() == 1) {
-        throw neograph_asio_system_error(asio::error::timed_out, "async_post: per-hop timeout");
+    try {
+        auto res = co_await(async_post_once(ex, std::move(host), std::move(port), std::move(path),
+                                            std::move(body), std::move(headers), tls) ||
+                            timer.async_wait(asio::use_awaitable));
+        if (res.index() == 1) {
+            throw asio::system_error(asio::error::timed_out, "async_post: per-hop timeout");
+        }
+        co_return std::get<0>(std::move(res));
+    } catch (const asio::multiple_exceptions& error) {
+        detail::rethrow_first_exception(error);
     }
-    co_return std::get<0>(std::move(res));
 }
 
 asio::awaitable<HttpStreamResponse> async_post_stream_once_timed(
@@ -279,31 +283,35 @@ asio::awaitable<HttpStreamResponse> async_post_stream_once_timed(
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(ex);
     timer.expires_after(timeout);
-    auto res = co_await(async_post_stream_once(ex, std::move(host), std::move(port),
-                                               std::move(path), std::move(body), std::move(headers),
-                                               tls, std::move(on_chunk)) ||
-                        timer.async_wait(asio::use_awaitable));
-    if (res.index() == 1) {
-        throw neograph_asio_system_error(asio::error::timed_out,
-                                         "async_post_stream: per-hop timeout");
+    try {
+        auto res = co_await(async_post_stream_once(ex, std::move(host), std::move(port),
+                                                   std::move(path), std::move(body),
+                                                   std::move(headers), tls, std::move(on_chunk)) ||
+                            timer.async_wait(asio::use_awaitable));
+        if (res.index() == 1) {
+            throw asio::system_error(asio::error::timed_out, "async_post_stream: per-hop timeout");
+        }
+        co_return std::get<0>(std::move(res));
+    } catch (const asio::multiple_exceptions& error) {
+        detail::rethrow_first_exception(error);
     }
-    co_return std::get<0>(std::move(res));
 }
 
 }  // namespace
 
 // ── Public API ────────────────────────────────────────────────────
 
-asio::awaitable<HttpResponse> async_post(asio::any_io_executor                            ex,
-                                         std::string_view                                 host,
-                                         std::string_view                                 port,
-                                         std::string_view                                 path,
-                                         std::string_view                                 body,
-                                         std::vector<std::pair<std::string, std::string>> headers,
-                                         bool                                             tls,
-                                         RequestOptions                                   opts) {
-    Target      cur{std::string(host), std::string(port), std::string(path), tls};
-    std::string req_body(body);
+static asio::awaitable<HttpResponse> async_post_owned(
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
+    std::vector<std::pair<std::string, std::string>> headers,
+    bool                                             tls,
+    RequestOptions                                   opts) {
+    Target      cur{std::move(host), std::move(port), std::move(path), tls};
+    std::string req_body(std::move(body));
     int         hops = 0;
     for (;;) {
         auto resp = co_await async_post_once_timed(ex, cur.host, cur.port, cur.path, req_body,
@@ -323,6 +331,18 @@ asio::awaitable<HttpResponse> async_post(asio::any_io_executor                  
         cur = parse_location(cur, resp.location);
         // Loop: next hop uses the new cur.
     }
+}
+
+asio::awaitable<HttpResponse> async_post(asio::any_io_executor                            ex,
+                                         std::string_view                                 host,
+                                         std::string_view                                 port,
+                                         std::string_view                                 path,
+                                         std::string_view                                 body,
+                                         std::vector<std::pair<std::string, std::string>> headers,
+                                         bool                                             tls,
+                                         RequestOptions                                   opts) {
+    return async_post_owned(std::move(ex), std::string(host), std::string(port), std::string(path),
+                            std::string(body), std::move(headers), tls, opts);
 }
 
 // ── Async GET ─────────────────────────────────────────────────────
@@ -396,13 +416,29 @@ asio::awaitable<HttpResponse> async_get_once_timed(
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(ex);
     timer.expires_after(timeout);
-    auto res = co_await(async_get_once(ex, std::move(host), std::move(port), std::move(path),
-                                       std::move(headers), tls) ||
-                        timer.async_wait(asio::use_awaitable));
-    if (res.index() == 1) {
-        throw neograph_asio_system_error(asio::error::timed_out, "async_get: per-hop timeout");
+    try {
+        auto res = co_await(async_get_once(ex, std::move(host), std::move(port), std::move(path),
+                                           std::move(headers), tls) ||
+                            timer.async_wait(asio::use_awaitable));
+        if (res.index() == 1) {
+            throw asio::system_error(asio::error::timed_out, "async_get: per-hop timeout");
+        }
+        co_return std::get<0>(std::move(res));
+    } catch (const asio::multiple_exceptions& error) {
+        detail::rethrow_first_exception(error);
     }
-    co_return std::get<0>(std::move(res));
+}
+
+static asio::awaitable<HttpResponse> async_get_owned(
+    asio::any_io_executor                            ex,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::vector<std::pair<std::string, std::string>> headers,
+    bool                                             tls,
+    RequestOptions                                   opts) {
+    co_return co_await async_get_once_timed(ex, std::move(host), std::move(port), std::move(path),
+                                            std::move(headers), tls, opts.timeout);
 }
 
 asio::awaitable<HttpResponse> async_get(asio::any_io_executor                            ex,
@@ -412,17 +448,16 @@ asio::awaitable<HttpResponse> async_get(asio::any_io_executor                   
                                         std::vector<std::pair<std::string, std::string>> headers,
                                         bool                                             tls,
                                         RequestOptions                                   opts) {
-    co_return co_await async_get_once_timed(ex, std::string(host), std::string(port),
-                                            std::string(path), std::move(headers), tls,
-                                            opts.timeout);
+    return async_get_owned(std::move(ex), std::string(host), std::string(port), std::string(path),
+                           std::move(headers), tls, opts);
 }
 
-asio::awaitable<HttpStreamResponse> async_post_stream(
+static asio::awaitable<HttpStreamResponse> async_post_stream_owned(
     asio::any_io_executor                            ex,
-    std::string_view                                 host,
-    std::string_view                                 port,
-    std::string_view                                 path,
-    std::string_view                                 body,
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
     std::vector<std::pair<std::string, std::string>> headers,
     bool                                             tls,
     std::function<void(std::string_view chunk)>      on_chunk,
@@ -433,8 +468,8 @@ asio::awaitable<HttpStreamResponse> async_post_stream(
     // configured on_chunk should be aware it can fire twice if a
     // redirect occurs. In practice, streaming endpoints always return
     // 200 or a fixed-body error, so this loop usually runs once.
-    Target      cur{std::string(host), std::string(port), std::string(path), tls};
-    std::string req_body(body);
+    Target      cur{std::move(host), std::move(port), std::move(path), tls};
+    std::string req_body(std::move(body));
     int         hops = 0;
     for (;;) {
         auto resp = co_await async_post_stream_once_timed(
@@ -452,6 +487,21 @@ asio::awaitable<HttpStreamResponse> async_post_stream(
         // rather than guess a target.
         co_return resp;
     }
+}
+
+asio::awaitable<HttpStreamResponse> async_post_stream(
+    asio::any_io_executor                            ex,
+    std::string_view                                 host,
+    std::string_view                                 port,
+    std::string_view                                 path,
+    std::string_view                                 body,
+    std::vector<std::pair<std::string, std::string>> headers,
+    bool                                             tls,
+    std::function<void(std::string_view chunk)>      on_chunk,
+    RequestOptions                                   opts) {
+    return async_post_stream_owned(std::move(ex), std::string(host), std::string(port),
+                                   std::string(path), std::string(body), std::move(headers), tls,
+                                   std::move(on_chunk), opts);
 }
 
 }  // namespace neograph::async

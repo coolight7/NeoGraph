@@ -2,9 +2,23 @@
 
 #include <neograph/graph/state.h>
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 
 namespace neograph::a2a {
+
+namespace {
+std::string fresh_caller_message_id() {
+    static std::atomic<std::uint64_t> counter{0};
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "ng-a2a-call-%016llx",
+                  static_cast<unsigned long long>(
+                      counter.fetch_add(1, std::memory_order_relaxed)));
+    return buf;
+}
+}
 
 using neograph::graph::ChannelWrite;
 using neograph::graph::GraphState;
@@ -12,16 +26,21 @@ using neograph::graph::NodeInput;
 using neograph::graph::NodeOutput;
 
 A2ACallerNode::A2ACallerNode(std::string name,
-                             std::shared_ptr<A2AClient> client,
-                             std::string input_key,
-                             std::string output_key)
+                              std::shared_ptr<A2AClient> client,
+                              std::string input_key,
+                              std::string output_key,
+                              MessageIdFactory message_id_factory)
     : name_(std::move(name)),
       client_(std::move(client)),
       input_key_(std::move(input_key)),
-      output_key_(std::move(output_key)) {
+      output_key_(std::move(output_key)),
+      message_id_factory_(std::move(message_id_factory)) {
     if (!client_) {
         throw std::invalid_argument(
             "A2ACallerNode '" + name_ + "': client must not be null");
+    }
+    if (!message_id_factory_) {
+        message_id_factory_ = fresh_caller_message_id;
     }
 }
 
@@ -38,8 +57,11 @@ asio::awaitable<NodeOutput> A2ACallerNode::run(NodeInput in) {
     auto context_id_val = in.state.get(output_key_ + "_context_id");
 
     MessageSendParams params;
-    params.message.message_id = name_ + "-" + std::to_string(
-        reinterpret_cast<std::uintptr_t>(this) & 0xFFFF);
+    params.message.message_id = message_id_factory_();
+    if (params.message.message_id.empty()) {
+        throw std::runtime_error(
+            "A2ACallerNode '" + name_ + "': message ID factory returned empty ID");
+    }
     params.message.role = Role::User;
     params.message.parts.push_back(Part::text_part(std::move(prompt)));
     if (task_id_val.is_string())    params.message.task_id    = task_id_val.get<std::string>();

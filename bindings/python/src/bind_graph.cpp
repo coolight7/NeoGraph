@@ -932,20 +932,12 @@ void init_graph(py::module_& m) {
                 // The list form is symmetric with how every node
                 // body builds writes, so it's the natural shape a
                 // caller from a Python REPL or UI would try.
-                json payload;
                 if (py::isinstance<py::dict>(channel_writes)) {
-                    payload = py_to_json(channel_writes);
+                    self.update_state(thread_id, py_to_json(channel_writes), as_node);
                 } else if (py::isinstance<py::list>(channel_writes) ||
                            py::isinstance<py::tuple>(channel_writes)) {
-                    // Reduce list[ChannelWrite] → dict {channel: value}.
-                    // If the same channel appears more than once, the
-                    // last value wins — matches dict-literal semantics
-                    // and keeps the engine's single-write-per-channel
-                    // invariant intact. For multi-write per channel
-                    // (e.g. appending two messages at once on an
-                    // APPEND-reduced channel), bundle the values into
-                    // a list yourself: {"messages": [m1, m2]}.
-                    payload = json::object();
+                    std::vector<ChannelWrite> writes;
+                    writes.reserve(py::len(channel_writes));
                     for (auto item : channel_writes) {
                         // Accept either an actual ChannelWrite instance
                         // or a duck-typed object exposing .channel /
@@ -960,10 +952,15 @@ void init_graph(py::module_& m) {
                                               .attr("__name__"))
                                       .cast<std::string>());
                         }
-                        std::string ch =
-                            item.attr("channel").cast<std::string>();
-                        payload[ch] = py_to_json(item.attr("value"));
+                        ChannelWrite write;
+                        write.channel = item.attr("channel").cast<std::string>();
+                        write.value = py_to_json(item.attr("value"));
+                        if (py::hasattr(item, "mode")) {
+                            write.mode = item.attr("mode").cast<ChannelWrite::Mode>();
+                        }
+                        writes.push_back(std::move(write));
                     }
+                    self.update_state_writes(thread_id, writes, as_node);
                 } else {
                     throw py::type_error(
                         "update_state: channel_writes must be a dict "
@@ -973,7 +970,6 @@ void init_graph(py::module_& m) {
                                     .attr("__name__"))
                             .cast<std::string>());
                 }
-                self.update_state(thread_id, payload, as_node);
             },
             py::arg("thread_id"),
             py::arg("channel_writes"),
@@ -981,15 +977,12 @@ void init_graph(py::module_& m) {
             "Apply channel writes to the latest checkpoint for "
             "thread_id and save a new checkpoint. Useful for injecting "
             "external state from a UI / REPL.\n\n"
-            "``channel_writes`` accepts two equivalent shapes:\n"
+            "``channel_writes`` accepts two shapes:\n"
             "  - ``dict``: ``{channel_name: value}`` — direct keyed form.\n"
             "  - ``list[ChannelWrite]``: ``[ChannelWrite('messages', [...])]``\n"
-            "    — symmetric with the shape every node body emits.\n"
-            "Duplicate channels in the list form are last-write-wins; "
-            "for multi-write per channel (e.g. APPEND-reduced messages), "
-            "bundle the values: ``{'messages': [m1, m2]}``. Other types "
-            "raise TypeError so a silent no-op (the pre-v0.3.2 trap) "
-            "can't reoccur.")
+            "    — applied in order and preserving each write mode.\n"
+            "Other types raise TypeError so a silent no-op (the pre-v0.3.2 "
+            "trap) can't reoccur.")
 
         .def("fork", &GraphEngine::fork,
             py::arg("source_thread_id"),
@@ -1021,15 +1014,17 @@ void init_graph(py::module_& m) {
             "serially on a single thread until this (or set_worker_count(N)) "
             "is called explicitly. Must be called before any run().")
 
-        .def("set_node_cache_enabled", &GraphEngine::set_node_cache_enabled,
+        .def("set_node_cache_enabled",
+             py::overload_cast<const std::string&, bool>(&GraphEngine::set_node_cache_enabled),
             py::arg("node_name"), py::arg("enabled"),
             "Opt a node into result caching. The executor hashes the "
             "input state and replays a cached NodeResult on hit, "
-            "skipping the node's execute() entirely. Off by default — "
+            "skipping the node's run(input) entirely. Off by default — "
             "only enable for pure nodes (deterministic, no side "
             "effects). Streaming runs (run_stream) bypass the cache "
             "for the affected node because cached hits cannot replay "
-            "LLM_TOKEN events.")
+            "LLM_TOKEN events. Cache entries are execution-local; cross-run "
+            "reuse is available only through the C++ CacheKeyPolicy API.")
 
         .def("clear_node_cache", &GraphEngine::clear_node_cache,
             "Drop all cached NodeResults. Per-node enable state is "
@@ -1037,14 +1032,23 @@ void init_graph(py::module_& m) {
             "external state changes the cached results would no "
             "longer reflect.")
 
+        .def("set_node_cache_max_entries",
+             &GraphEngine::set_node_cache_max_entries,
+             py::arg("max_entries"),
+             "Set the global cache entry bound. Zero preserves unbounded "
+             "behavior. Lowering the value evicts least-recently-used "
+             "entries immediately.")
+
         .def("node_cache_stats", [](const GraphEngine& self) {
             const auto& nc = self.node_cache();
             py::dict d;
             d["size"]   = nc.size();
             d["hits"]   = nc.hit_count();
             d["misses"] = nc.miss_count();
+            d["evictions"] = nc.eviction_count();
+            d["max_entries"] = nc.max_entries();
             return d;
-        }, "Return a dict with current cache size, hit count, miss count.")
+        }, "Return cache size, hits, misses, evictions, and entry bound.")
 
         .def("set_checkpoint_store",
             [](py::object self, py::object store_obj) {
@@ -1222,7 +1226,7 @@ void init_graph(py::module_& m) {
                 // std::function, it dies when this lambda returns and
                 // the coroutine reads dangling memory on the asio
                 // worker — segfault deep inside the engine before the
-                // node's Python execute() ever fires.
+                // node's Python run(input) ever fires.
                 //
                 // (Caught the hard way: the engine's run_async path
                 // sidesteps this because it constructs the empty

@@ -1,5 +1,7 @@
 # Troubleshooting
 
+**Languages:** [English](troubleshooting.md) | [한국어](troubleshooting.ko.md) | [日本語](troubleshooting.ja.md) | [简体中文](troubleshooting.zh-CN.md)
+
 Symptoms first, root causes and fixes after. If you hit something
 that's not here, please open an issue with the symptom — it'll likely
 go on this list afterwards.
@@ -201,9 +203,11 @@ The graph routed to `__end__` immediately. Most common causes:
 1. **Missing edge from `__start__`.** Every graph needs at least one
    `{"from": ng.START_NODE, "to": "..."}` edge.
 2. **Conditional returned a value not in the `routes` map.** When the
-   condition's return value doesn't match any key, the engine takes
-   the lexicographically-last entry as a fallback. If that maps to
-   `__end__`, you exit silently. Always include a default branch.
+   condition's return value doesn't match any key, an open or unspecified
+   condition uses the explicit `"default"` route. If that maps to `__end__`,
+   you exit normally. Without `"default"`, routing throws an error containing
+   the source node, condition, and returned label. Closed conditions always
+   reject labels outside their declared set.
 3. **`max_steps=0` or `max_steps=1`** — the run hit the ceiling
    immediately. Default is 25; ReAct loops typically need 10+.
 
@@ -834,6 +838,20 @@ something, and the message lists exactly what.
 - To fall back to the historical lenient parsing, remove
   `schema_version` — unknown keys are then ignored again and round-trip
   mismatches only warn on stderr. New documents should stay strict.
+
+### Compatibility timeline
+
+- Every `0.x` release keeps absent or zero `schema_version` documents on the
+  lenient compatibility path. No `0.x` update will silently reinterpret them as
+  strict documents.
+- New definitions, built-in graph factories, and maintained examples declare
+  the current version (`TOPOLOGY_SCHEMA_VERSION`, currently `1`).
+- The planned `1.0.0` boundary rejects absent or zero versions with a migration
+  diagnostic instead of silently changing their routing or parsing semantics.
+- Upgrade C++ input with `GraphCompiler::upgrade_to_latest()` or Python input
+  with `ng.upgrade_topology()`. Ignored legacy data is retained under collision-
+  safe `x-upgraded-*` annotations. For DSL sources, re-run the elaborator so the
+  lockfile and source map are regenerated together.
 
 ---
 

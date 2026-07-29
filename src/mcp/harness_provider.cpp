@@ -4,13 +4,20 @@
 
 #include "harness_journal_internal.h"
 
+#include <asio/error.hpp>
+#include <asio/system_error.hpp>
+
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -117,6 +124,57 @@ std::string host_call_id() {
     return out.str();
 }
 
+json effect_descriptor(const json& executor, const std::string& call_id) {
+    if (!executor.contains("effect")) return json();
+    const auto effect_namespace = detail::current_harness_run_id();
+    if (effect_namespace.empty()) {
+        throw std::runtime_error("Harness host-brokered effect is missing its run namespace");
+    }
+    const auto effect = executor["effect"];
+    const auto effect_id = effect_namespace + ":" + call_id;
+    return {
+        {"effect_id", effect_id},
+        {"idempotency_key", effect_id},
+        {"idempotency", effect.at("idempotency")},
+        {"status_query", effect.value("status_query", false)},
+        {"fencing", effect.value("fencing", false)},
+    };
+}
+
+class ProviderDeadline {
+public:
+    ProviderDeadline(std::shared_ptr<graph::CancelToken> cancel, int timeout_seconds)
+        : cancel_(std::move(cancel)) {
+        timer_ = std::thread([this, timeout_seconds] {
+            std::unique_lock lock(mutex_);
+            if (!cv_.wait_for(lock, std::chrono::seconds(timeout_seconds),
+                              [this] { return finished_; })) {
+                expired_.store(true, std::memory_order_release);
+                cancel_->cancel();
+            }
+        });
+    }
+
+    ~ProviderDeadline() {
+        {
+            std::lock_guard lock(mutex_);
+            finished_ = true;
+        }
+        cv_.notify_one();
+        timer_.join();
+    }
+
+    bool expired() const { return expired_.load(std::memory_order_acquire); }
+
+private:
+    std::shared_ptr<graph::CancelToken> cancel_;
+    std::atomic<bool> expired_{false};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool finished_ = false;
+    std::thread timer_;
+};
+
 } // namespace
 
 HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConfig config) {
@@ -137,7 +195,11 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
         CompletionParams params;
         params.model = config.model;
         params.temperature = 0.0f;
-        params.cancel_token = cancel;
+        const auto budget = call.worker.value("_harness_provider_budget", json::object());
+        const int provider_timeout = budget.value("provider_timeout_seconds", 0);
+        const int max_output_tokens = budget.value("max_output_tokens", -1);
+        params.max_tokens = max_output_tokens;
+        params.cancel_token = cancel->fork();
         params.tools = chat_tools(call.tool_catalog);
         ChatMessage initial;
         initial.role = "user";
@@ -152,23 +214,75 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
             detail::append_current_harness_journal_event(
                 "provider.call.started",
                 {{"message_count", params.messages.size()},
+                 {"max_output_tokens",
+                  max_output_tokens < 0 ? json(nullptr) : json(max_output_tokens)},
                  {"model", params.model},
+                 {"provider_timeout_seconds",
+                  provider_timeout == 0 ? json(nullptr) : json(provider_timeout)},
                  {"round", round + 1},
                  {"tool_count", params.tools.size()}},
                 provider_correlation);
+            std::unique_ptr<ProviderDeadline> deadline;
+            if (provider_timeout > 0) {
+                deadline = std::make_unique<ProviderDeadline>(params.cancel_token, provider_timeout);
+            }
+            const auto deadline_expired = [&deadline] {
+                return deadline && deadline->expired();
+            };
             try {
                 completion = config.provider->complete(params);
+                if (deadline_expired()) {
+                    detail::append_current_harness_journal_event(
+                        "provider.call.completed",
+                        {{"duration_ms",
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - provider_started)
+                              .count()},
+                         {"outcome", "timeout"}},
+                        provider_correlation);
+                    return HarnessWorkerResponse::timeout("provider request exceeded its timeout");
+                }
             } catch (const graph::CancelledException&) {
+                const bool timed_out = deadline_expired();
                 detail::append_current_harness_journal_event(
                     "provider.call.completed",
                     {{"duration_ms",
                       std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - provider_started)
                           .count()},
-                     {"outcome", "cancelled"}},
+                     {"outcome", timed_out ? "timeout" : "cancelled"}},
                     provider_correlation);
+                if (timed_out) {
+                    return HarnessWorkerResponse::timeout("provider request exceeded its timeout");
+                }
                 return HarnessWorkerResponse::cancelled();
+            } catch (const asio::system_error& error) {
+                const bool timed_out = error.code() == asio::error::timed_out ||
+                                       deadline_expired();
+                detail::append_current_harness_journal_event(
+                    "provider.call.completed",
+                    {{"duration_ms",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - provider_started)
+                          .count()},
+                     {"error", error.what()},
+                     {"outcome", timed_out ? "timeout" : "error"}},
+                    provider_correlation);
+                if (timed_out) return HarnessWorkerResponse::timeout(error.what());
+                return HarnessWorkerResponse::tool_error(error.what());
             } catch (const std::exception& error) {
+                if (deadline_expired()) {
+                    detail::append_current_harness_journal_event(
+                        "provider.call.completed",
+                        {{"duration_ms",
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - provider_started)
+                              .count()},
+                         {"error", error.what()},
+                         {"outcome", "timeout"}},
+                        provider_correlation);
+                    return HarnessWorkerResponse::timeout("provider request exceeded its timeout");
+                }
                 detail::append_current_harness_journal_event(
                     "provider.call.completed",
                     {{"duration_ms",
@@ -229,9 +343,13 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                             {"result_schema",
                              tool_it->second.value("output_schema", json::object())},
                         };
+                        if (const auto effect = effect_descriptor(executor, call_id); !effect.is_null()) {
+                            pending["effect"] = effect;
+                        }
                         detail::append_current_harness_journal_event(
                             "host_brokered.call.requested",
                             {{"arguments", pending["arguments"]},
+                             {"effect", pending.value("effect", json())},
                              {"interaction", executor.value("interaction", "tool_result")},
                              {"provider_call_id", tool_call.id},
                              {"tool_id", tool_call.name}},

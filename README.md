@@ -6,6 +6,8 @@
   </p>
 </p>
 
+**Languages:** [English](README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md)
+
 <p align="center">
   <a href="https://pypi.org/project/neograph-engine/"><img alt="PyPI" src="https://img.shields.io/pypi/v/neograph-engine?label=pip%20install%20neograph-engine&color=blue"></a>
   <a href="https://pypi.org/project/neograph-engine/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/neograph-engine"></a>
@@ -59,6 +61,7 @@ different agent (see [`docs/concepts.md`](docs/concepts.md)):
 
 ```json
 {
+  "schema_version": 1,
   "channels": { "messages": {"reducer": "append"}, "__route__": {"reducer": "overwrite"} },
   "nodes": {
     "planner":    {"type": "llm_call"},
@@ -191,6 +194,7 @@ pip install neograph-engine
 import neograph_engine as ng
 
 definition = {
+    "schema_version": ng.TOPOLOGY_SCHEMA_VERSION,
     "name": "demo",
     "channels": {"messages": {"reducer": "append"}},
     "nodes":    {"llm": {"type": "llm_call"}},

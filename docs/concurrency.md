@@ -1,5 +1,7 @@
 # Concurrency & Async
 
+**Languages:** [English](concurrency.md) | [한국어](concurrency.ko.md) | [日本語](concurrency.ja.md) | [简体中文](concurrency.zh-CN.md)
+
 NeoGraph supports two concurrency models out of the box — pick the
 one that fits your hosting pattern:
 
@@ -52,8 +54,8 @@ where N = 10,000 finishes in 52 ms. Within a single run, the
 researchers collapse from 370 ms sequential to 150 ms.
 
 Custom nodes join the async path by returning an `asio::awaitable`
-from the unified `run(NodeInput)` entry point (the one canonical
-override since v0.4.0; legacy 8-virtual chain removed in v1.0):
+from the unified `run(NodeInput)` entry point (introduced in v0.4.0;
+the legacy 8-virtual chain was removed in v0.9.0):
 
 ```cpp
 class FetchNode : public GraphNode {
@@ -166,7 +168,19 @@ log("pending={} active={} completed={} rejected={}",
 `RunResult` via a shared output slot (as above) or a per-task
 `std::promise<RunResult>`. The queue is backed by
 `moodycamel::ConcurrentQueue` (lock-free) and workers park on a
-condvar when idle — no busy-spin.
+condvar when idle — no busy-spin. Admission atomically reserves a pending
+slot, so concurrent callers cannot exceed `max_queue_size`. A full queue
+returns `{false, invalid_future}` for ordinary backpressure; an internal
+enqueue failure instead returns `{false, valid_future}`, and that future
+throws `std::runtime_error` when observed.
+
+Construct the queue with at least one worker. `close()` is idempotent: it
+rejects later submissions, waits for workers, lets a callable already claimed
+by a worker finish, and completes all unclaimed futures with
+`std::runtime_error("RequestQueue is closed")`. A callable may invoke `close()`
+itself to initiate shutdown, but that worker returns rather than waiting for
+itself. The destructor uses the same close path, so accepted futures are never
+silently stranded during teardown.
 
 ## Rules for safe concurrent use
 

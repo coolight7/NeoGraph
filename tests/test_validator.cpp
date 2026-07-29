@@ -49,11 +49,37 @@ void ensure_vtypes_registered() {
         },
         json::parse(R"({"type":"object"})"),
         json::parse(R"({"reads":["out"],"writes":[]})"));
+    NodeFactory::instance().register_type(
+        "vfx_exporter",
+        [](const std::string& name, const json&, const NodeContext&) {
+            return std::make_unique<VNoopNode>(name);
+        },
+        json::parse(R"({"type":"object"})"),
+        json::parse(R"({"reads":[],"writes":["out"],"exports":["out"]})"));
+    NodeFactory::instance().register_type(
+        "vfx_export_only",
+        [](const std::string& name, const json&, const NodeContext&) {
+            return std::make_unique<VNoopNode>(name);
+        },
+        json::parse(R"({"type":"object"})"),
+        json::parse(R"({"reads":[],"writes":[],"exports":["out"]})"));
+    NodeFactory::instance().register_type(
+        "vfx_mixed_exporter",
+        [](const std::string& name, const json&, const NodeContext&) {
+            return std::make_unique<VNoopNode>(name);
+        },
+        json::parse(R"({"type":"object"})"),
+        json::parse(
+            R"({"reads":[],"writes":["out","internal"],"exports":["out"]})"));
     // closed two-label condition for E10 tests.
     ConditionRegistry::instance().register_condition(
         "vcond_binary",
         [](const GraphState&) -> std::string { return "yes"; },
         ConditionSpec{{"no", "yes"}, /*open=*/false});
+    ConditionRegistry::instance().register_condition(
+        "vcond_literal_default",
+        [](const GraphState&) -> std::string { return "default"; },
+        ConditionSpec{{"default"}, /*open=*/false});
 }
 
 ValidationReport validate_def(const json& def) {
@@ -265,6 +291,36 @@ TEST(Validator, E10_OpenConditionUncoveredKnownLabelWarns) {
     EXPECT_FALSE(r.has_errors());
 }
 
+TEST(Validator, E10_OpenConditionExplicitDefaultCoversUnknownLabels) {
+    auto def = two_node_base();
+    def["conditional_edges"] = json::array({
+        {{"from", "a"}, {"condition", "route_channel"},
+         {"routes", {{"x", "b"}, {"default", "__end__"}}}} });
+    auto r = validate_def(def);
+    EXPECT_TRUE(by_code(r, "E10").empty()) << r.summary();
+}
+
+TEST(Validator, E10_ClosedConditionDefaultDoesNotReplaceDeclaredCoverage) {
+    auto def = two_node_base();
+    def["conditional_edges"] = json::array({
+        {{"from", "a"}, {"condition", "vcond_binary"},
+         {"routes", {{"yes", "b"}, {"default", "__end__"}}}} });
+    auto r = validate_def(def);
+    auto e10 = by_code(r, "E10");
+    ASSERT_EQ(e10.size(), 1u) << r.summary();
+    EXPECT_EQ(e10[0]->severity, "error");
+    EXPECT_EQ(e10[0]->witness["uncovered"][0].get<std::string>(), "no");
+}
+
+TEST(Validator, E10_DefaultCanBeADeclaredClosedConditionLabel) {
+    auto def = two_node_base();
+    def["conditional_edges"] = json::array({
+        {{"from", "a"}, {"condition", "vcond_literal_default"},
+         {"routes", {{"default", "__end__"}}}} });
+    auto r = validate_def(def);
+    EXPECT_TRUE(by_code(r, "E10").empty()) << r.summary();
+}
+
 TEST(Validator, E10_ExactCoverageIsClean) {
     auto def = two_node_base();
     def["conditional_edges"] = json::array({
@@ -316,6 +372,57 @@ TEST(Validator, E6_DeadChannelWarns) {
     auto e6 = by_code(r, "E6");
     ASSERT_EQ(e6.size(), 1u) << r.summary();
     EXPECT_EQ(e6[0]->witness["channel"].get<std::string>(), "unused");
+}
+
+TEST(Validator, E6_WriteOnlyChannelWarns) {
+    json def = {
+        {"channels", {{"out", {{"reducer", "overwrite"}}}}},
+        {"nodes", {{"w", {{"type", "vfx_writer"}}}}},
+        {"edges", json::array({{{"from", "__start__"}, {"to", "w"}}})},
+    };
+    auto r = validate_def(def);
+    auto e6 = by_code(r, "E6");
+    ASSERT_EQ(e6.size(), 1u) << r.summary();
+    EXPECT_EQ(e6[0]->witness["channel"].get<std::string>(), "out");
+    ASSERT_TRUE(e6[0]->witness.contains("writers"));
+    EXPECT_EQ(e6[0]->witness["writers"].size(), 1u);
+}
+
+TEST(Validator, E6_ExportedWriteOnlyChannelIsExternallyConsumed) {
+    json def = {
+        {"channels", {{"out", {{"reducer", "overwrite"}}}}},
+        {"nodes", {{"w", {{"type", "vfx_exporter"}}}}},
+        {"edges", json::array({{{"from", "__start__"}, {"to", "w"}}})},
+    };
+    auto r = validate_def(def);
+    EXPECT_TRUE(by_code(r, "E6").empty()) << r.summary();
+}
+
+TEST(Validator, E6_ExportWithoutMatchingWriteDoesNotSuppressWarning) {
+    json def = {
+        {"channels", {{"out", {{"reducer", "overwrite"}}}}},
+        {"nodes", {{"w", {{"type", "vfx_writer"}}},
+                   {"e", {{"type", "vfx_export_only"}}}}},
+        {"edges", json::array({{{"from", "__start__"}, {"to", "w"}},
+                               {{"from", "w"}, {"to", "e"}}})},
+    };
+    auto r = validate_def(def);
+    auto e6 = by_code(r, "E6");
+    ASSERT_EQ(e6.size(), 1u) << r.summary();
+    EXPECT_EQ(e6[0]->witness["channel"].get<std::string>(), "out");
+}
+
+TEST(Validator, E6_MixedExportsStillWarnForInternalWriteOnlyChannel) {
+    json def = {
+        {"channels", {{"out", {{"reducer", "overwrite"}}},
+                      {"internal", {{"reducer", "overwrite"}}}}},
+        {"nodes", {{"w", {{"type", "vfx_mixed_exporter"}}}}},
+        {"edges", json::array({{{"from", "__start__"}, {"to", "w"}}})},
+    };
+    auto r = validate_def(def);
+    auto e6 = by_code(r, "E6");
+    ASSERT_EQ(e6.size(), 1u) << r.summary();
+    EXPECT_EQ(e6[0]->witness["channel"].get<std::string>(), "internal");
 }
 
 TEST(Validator, E5_OverwriteRaceBetweenFanOutSiblingsWarns) {

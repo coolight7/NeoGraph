@@ -10,11 +10,14 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace neograph::graph {
 namespace {
+
+constexpr const char* kResearcherNodeName = "researcher";
 
 // =========================================================================
 // Prompts — inspired by langchain-ai/open_deep_research/prompts.py.
@@ -408,8 +411,8 @@ public:
             } catch (...) { /* empty topic handled by researcher */
             }
 
-            nr.sends.push_back(
-                Send{"researcher", json{{"current_topic", topic}, {"current_call_id", tc.id}}});
+            nr.sends.push_back(Send{kResearcherNodeName,
+                                    json{{"current_topic", topic}, {"current_call_id", tc.id}}});
         }
 
         // Write the think/skipped/unknown echoes alongside the Sends. The
@@ -1183,7 +1186,7 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(std::shared_ptr<Provider
          {{"type", "__dr_supervisor_dispatch"},
           {"max_iterations", cfg.max_supervisor_iterations},
           {"max_concurrent", cfg.max_concurrent_researchers}}},
-        {"researcher",
+        {kResearcherNodeName,
          {{"type", "__dr_researcher"}, {"max_iterations", cfg.max_researcher_iterations}}},
         {"final_report", {{"type", "__dr_final_report"}}}};
 
@@ -1205,6 +1208,12 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(std::shared_ptr<Provider
     edges.push_back({{"from", "supervisor"}, {"to", "dispatch"}});
     edges.push_back({{"from", "dispatch"}, {"to", "supervisor"}});
 
+    if (!nodes.contains(kResearcherNodeName)) {
+        throw std::logic_error(
+            "deep_research dispatch Send target 'researcher' is missing from "
+            "the factory-built node set");
+    }
+
     if (cfg.enable_human_review) {
         // Add the `messages` channel that engine.resume writes the user's
         // resume_value into. Overwrite reducer keeps a single-element
@@ -1222,7 +1231,8 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(std::shared_ptr<Provider
         edges.push_back({{"from", "final_report"}, {"to", "__end__"}});
     }
 
-    json definition = {{"name", "deep_research_agent"},
+    json definition = {{"schema_version", TOPOLOGY_SCHEMA_VERSION},
+                       {"name", "deep_research_agent"},
                        {"channels", channels},
                        {"nodes", nodes},
                        {"edges", edges}};
@@ -1248,7 +1258,7 @@ std::unique_ptr<GraphEngine> create_deep_research_graph(std::shared_ptr<Provider
     llm_retry.backoff_multiplier = 2.0f;
     llm_retry.max_delay_ms       = 45'000;
     engine->set_node_retry_policy("supervisor", llm_retry);
-    engine->set_node_retry_policy("researcher", llm_retry);
+    engine->set_node_retry_policy(kResearcherNodeName, llm_retry);
     engine->set_node_retry_policy("final_report", llm_retry);
 
     return engine;

@@ -3,6 +3,7 @@
 #include <neograph/graph/node.h>
 #include <neograph/tool_dispatch.h>
 
+#include "run_context_runtime.h"
 #include <asio/co_spawn.hpp>
 #include <asio/deferred.hpp>
 #include <asio/experimental/parallel_group.hpp>
@@ -12,9 +13,33 @@
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace neograph::graph {
+
+namespace {
+
+std::string length_frame(std::string_view value) {
+    return std::to_string(value.size()) + ":" + std::string(value);
+}
+
+// Child checkpoint identities must be stable for one logical invocation yet
+// distinct for sibling Send workers. Length-framing avoids delimiter collisions
+// when callers use arbitrary thread IDs or node names.
+std::string child_thread_id(const RunContext& parent, std::string_view node_name) {
+    // An empty root thread ID intentionally disables checkpointing. Deriving a
+    // shared anonymous child ID would re-enable it and let concurrent anonymous
+    // runs collide in the same child namespace.
+    if (parent.thread_id.empty()) return {};
+
+    const auto        runtime       = detail::runtime_for(parent);
+    const std::string invocation_id = runtime ? runtime->invocation_id : "root";
+    return "subgraph/" + length_frame(parent.thread_id) + length_frame(node_name) +
+           length_frame(std::to_string(parent.step)) + length_frame(invocation_id);
+}
+
+}  // namespace
 
 // v1.0 destructive removal (9b): the 8-virtual `execute*` legacy chain,
 // the ExecuteDefaultGuard recursion guard, and the
@@ -26,6 +51,18 @@ namespace neograph::graph {
 // What this file provides now: only the built-in node implementations
 // (LLMCallNode, ToolDispatchNode, IntentClassifierNode, SubgraphNode).
 // Their `run()` overrides live in their own sections below.
+
+SyncGraphNode::SyncGraphNode(std::string name) : name_(std::move(name)) {}
+
+SyncGraphNode::~SyncGraphNode() = default;
+
+asio::awaitable<NodeOutput> SyncGraphNode::run(NodeInput in) {
+    co_return run_sync(in);
+}
+
+std::string SyncGraphNode::get_name() const {
+    return name_;
+}
 
 // =========================================================================
 // LLMCallNode
@@ -163,8 +200,10 @@ asio::awaitable<NodeOutput> ToolDispatchNode::run(NodeInput in) {
     gctx.resume_value = in.ctx.resume_value;
     gctx.thread_id    = in.ctx.thread_id;
     gctx.step         = in.ctx.step;
-    auto tool_msgs    = co_await dispatch_tool_calls(assistant_msg->tool_calls, tools_,
-                                                     in.ctx.tool_gate, std::move(gctx));
+    ToolExecutionContext execution;
+    execution.cancel_token = in.ctx.cancel_token;
+    auto tool_msgs         = co_await dispatch_tool_calls(
+        assistant_msg->tool_calls, tools_, in.ctx.tool_gate, std::move(gctx), std::move(execution));
 
     json results = json::array();
     for (const auto& m : tool_msgs) {
@@ -296,53 +335,66 @@ json SubgraphNode::build_subgraph_input(const GraphState& state) const {
     return input;
 }
 
-std::vector<ChannelWrite> SubgraphNode::extract_output(const json& subgraph_output) const {
+std::vector<ChannelWrite> SubgraphNode::map_output_writes(
+    const std::vector<ChannelWrite>& child_writes) const {
     std::vector<ChannelWrite> writes;
-
-    if (!subgraph_output.contains("channels")) return writes;
-    const auto& channels = subgraph_output["channels"];
-
-    if (output_map_.empty()) {
-        // Default: write all child channels back to parent (same name)
-        for (const auto& [ch_name, ch_data] : channels.items()) {
-            if (ch_data.contains("value")) {
-                writes.push_back(ChannelWrite{ch_name, ch_data["value"]});
-            }
+    writes.reserve(child_writes.size());
+    for (const auto& child_write : child_writes) {
+        auto parent_channel = child_write.channel;
+        if (!output_map_.empty()) {
+            const auto mapped = output_map_.find(child_write.channel);
+            if (mapped == output_map_.end()) continue;
+            parent_channel = mapped->second;
         }
-    } else {
-        for (const auto& [child_ch, parent_ch] : output_map_) {
-            if (channels.contains(child_ch) && channels[child_ch].contains("value")) {
-                writes.push_back(ChannelWrite{parent_ch, channels[child_ch]["value"]});
-            }
-        }
+        auto parent_write    = child_write;
+        parent_write.channel = std::move(parent_channel);
+        writes.push_back(std::move(parent_write));
     }
-
     return writes;
 }
 
 asio::awaitable<NodeOutput> SubgraphNode::run(NodeInput in) {
     RunConfig config;
+    config.thread_id    = child_thread_id(in.ctx, name_);
     config.input        = build_subgraph_input(in.state);
+    config.stream_mode  = in.ctx.stream_mode;
     config.cancel_token = in.ctx.cancel_token;
     // #88: hand the parent's accumulator down. A subgraph runs on its own engine
     // with its own RunConfig, so without this a graph that delegates its LLM work
     // to a subgraph reports zero tokens — which reads as "this run was free".
     config.usage = in.ctx.usage;
 
-    json subgraph_output;
+    std::vector<ChannelWrite> child_writes;
     if (in.stream_cb) {
         // Forward the parent's stream sink so subgraph events (LLM
         // tokens, node enter/exit, etc.) surface at the parent
         // graph's caller without buffering.
-        auto result     = co_await subgraph_->run_stream_async(config, *in.stream_cb);
-        subgraph_output = std::move(result.output);
+        auto         result =
+            co_await subgraph_->run_subgraph_async(std::move(config), in.ctx, *in.stream_cb);
+        if (result.result.interrupted) {
+            const auto reason =
+                result.result.interrupt_value.value("reason", "subgraph interrupted");
+            if (result.result.interrupt_value.contains("value")) {
+                throw NodeInterrupt(reason, result.result.interrupt_value["value"]);
+            }
+            throw NodeInterrupt(reason);
+        }
+        child_writes = std::move(result.writes);
     } else {
-        auto result     = co_await subgraph_->run_async(config);
-        subgraph_output = std::move(result.output);
+        auto result = co_await subgraph_->run_subgraph_async(std::move(config), in.ctx, nullptr);
+        if (result.result.interrupted) {
+            const auto reason =
+                result.result.interrupt_value.value("reason", "subgraph interrupted");
+            if (result.result.interrupt_value.contains("value")) {
+                throw NodeInterrupt(reason, result.result.interrupt_value["value"]);
+            }
+            throw NodeInterrupt(reason);
+        }
+        child_writes = std::move(result.writes);
     }
 
     NodeOutput out;
-    out.writes = extract_output(subgraph_output);
+    out.writes = map_output_writes(child_writes);
     co_return out;
 }
 

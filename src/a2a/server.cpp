@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <list>
 #include <map>
@@ -172,6 +173,31 @@ Task build_failure_task(const std::string& task_id,
     return t;
 }
 
+Task build_rejected_task(const std::string& task_id,
+                        const std::string& context_id,
+                        const std::string& reason) {
+    Message reply;
+    reply.message_id = fresh_uuid_like();
+    reply.role       = Role::Agent;
+    reply.task_id    = task_id;
+    reply.context_id = context_id;
+    reply.parts.push_back(Part::text_part(reason));
+
+    Task t;
+    t.id             = task_id;
+    t.context_id     = context_id;
+    t.status.state   = TaskState::Rejected;
+    t.status.message = reply;
+    t.history.push_back(std::move(reply));
+    return t;
+}
+
+bool is_terminal(TaskState state) {
+    return state == TaskState::Completed || state == TaskState::Canceled
+        || state == TaskState::Failed || state == TaskState::Rejected
+        || state == TaskState::AuthRequired;
+}
+
 neograph::json jsonrpc_error(int code, std::string msg, const neograph::json& id) {
     neograph::json env;
     env["jsonrpc"] = "2.0";
@@ -215,20 +241,22 @@ struct A2AServer::Impl {
     /// the id to the back. On insert that would exceed the cap, we
     /// evict from the front.
     ///
-    /// `cancel_flags` holds atomics behind shared_ptrs so a worker
-    /// thread can capture the pointer at dispatch time (under the
-    /// lock) and read/write the flag thereafter without re-traversing
-    /// the map — `std::map<…, std::atomic<bool>>` would otherwise
-    /// invite concurrent-rebalance UB when a parallel insert from
-    /// `tasks/cancel` rotates a tree node the worker is reading.
+    struct ActiveRun {
+        std::shared_ptr<neograph::graph::CancelToken> cancel_token;
+        std::uint64_t                                  generation;
+    };
+
+    /// Active runs remain separately addressable until their owning
+    /// generation publishes its terminal task state.
     std::mutex                                                tasks_mu;
     std::unordered_map<std::string, Task>                     tasks;
-    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>>
-                                                              cancel_flags;
+    std::unordered_map<std::string, ActiveRun>                active_runs;
+    std::uint64_t                                              next_generation = 1;
     std::list<std::string>                                    task_lru;
     std::unordered_map<std::string, std::list<std::string>::iterator>
                                                               task_lru_pos;
     std::size_t max_tasks = 1024;
+    std::size_t max_inflight_runs = 32;
 
     /// Move a task_id to the most-recently-used (back) position, or
     /// insert it if it's new. Caller must hold tasks_mu.
@@ -244,12 +272,17 @@ struct A2AServer::Impl {
     /// Evict LRU entries until tasks.size() <= max_tasks. Caller must
     /// hold tasks_mu.
     void evict_lru_unlocked() {
-        while (tasks.size() > max_tasks && !task_lru.empty()) {
+        auto remaining = task_lru.size();
+        while (tasks.size() > max_tasks && remaining-- > 0 && !task_lru.empty()) {
             auto victim = task_lru.front();
             task_lru.pop_front();
+            if (active_runs.contains(victim)) {
+                task_lru.push_back(victim);
+                task_lru_pos[victim] = std::prev(task_lru.end());
+                continue;
+            }
             task_lru_pos.erase(victim);
             tasks.erase(victim);
-            cancel_flags.erase(victim);
         }
     }
 
@@ -270,6 +303,14 @@ struct A2AServer::Impl {
     void handle_tasks_cancel(const neograph::json& params, const neograph::json& id,
                              httplib::Response& res);
 };
+
+#ifdef NEOGRAPH_A2A_TESTING
+void test::A2AServerTestAccess::set_max_inflight_runs(
+    A2AServer& server, std::size_t cap) {
+    std::lock_guard lk(server.impl_->tasks_mu);
+    server.impl_->max_inflight_runs = cap;
+}
+#endif
 
 void A2AServer::Impl::register_routes() {
     svr.Get("/.well-known/agent-card.json",
@@ -335,29 +376,47 @@ Task A2AServer::Impl::run_graph(
     const std::string& context_id,
     std::function<void(const TaskStatusUpdateEvent&)> on_event) {
 
-    auto user_text = extract_user_text(inbound);
     auto& a = *adapter;
 
     neograph::graph::RunConfig cfg;
     cfg.thread_id = task_id;
-    cfg.input     = a.build_initial_state(user_text);
 
-    // Capture the cancel-flag shared_ptr while holding the mutex so the
-    // worker can read/write it later without re-traversing the map (see
-    // tasks_mu / cancel_flags doc comment for the rationale).
-    std::shared_ptr<std::atomic<bool>> my_cancel;
+    std::shared_ptr<neograph::graph::CancelToken> task_cancel;
+    std::optional<Task> rejected;
+    std::uint64_t generation = 0;
     {
         std::lock_guard lk(tasks_mu);
-        Task working;
-        working.id            = task_id;
-        working.context_id    = context_id;
-        working.status.state  = TaskState::Working;
-        tasks[task_id]        = working;
-        my_cancel             = std::make_shared<std::atomic<bool>>(false);
-        cancel_flags[task_id] = my_cancel;
-        touch_task_unlocked(task_id);
-        evict_lru_unlocked();
+        if (active_runs.contains(task_id)) {
+            rejected = build_rejected_task(
+                task_id, context_id, "task_id is already running");
+        } else if (active_runs.size() >= max_inflight_runs) {
+            rejected = build_rejected_task(
+                task_id, context_id, "A2A server is at its in-flight task limit");
+        } else {
+            Task working;
+            working.id             = task_id;
+            working.context_id     = context_id;
+            working.status.state   = TaskState::Working;
+            tasks[task_id]         = working;
+            task_cancel = std::make_shared<neograph::graph::CancelToken>();
+            generation = next_generation++;
+            active_runs[task_id] = ActiveRun{task_cancel, generation};
+            touch_task_unlocked(task_id);
+            evict_lru_unlocked();
+        }
     }
+    if (rejected) {
+        if (on_event) {
+            TaskStatusUpdateEvent ev;
+            ev.task_id = task_id;
+            ev.context_id = context_id;
+            ev.status = rejected->status;
+            ev.final = true;
+            on_event(ev);
+        }
+        return *rejected;
+    }
+    cfg.cancel_token = task_cancel;
 
     if (on_event) {
         TaskStatusUpdateEvent ev;
@@ -370,8 +429,11 @@ Task A2AServer::Impl::run_graph(
 
     Task result;
     try {
+        // Reserve the generation before adapter work so tasks/cancel can
+        // signal this run even while input preparation is still in progress.
+        cfg.input = a.build_initial_state(extract_user_text(inbound));
         auto rr = engine->run(cfg);
-        if (my_cancel->load(std::memory_order_acquire)) {
+        if (task_cancel->is_cancelled()) {
             result = build_failure_task(task_id, context_id, "(canceled)");
             result.status.state = TaskState::Canceled;
         } else {
@@ -379,6 +441,9 @@ Task A2AServer::Impl::run_graph(
             result = build_response_task(task_id, context_id, agent_text,
                                          a.build_output_artifact(rr.output, task_id));
         }
+    } catch (const neograph::graph::CancelledException&) {
+        result = build_failure_task(task_id, context_id, "(canceled)");
+        result.status.state = TaskState::Canceled;
     } catch (const std::exception& e) {
         result = build_failure_task(
             task_id, context_id,
@@ -387,8 +452,23 @@ Task A2AServer::Impl::run_graph(
 
     {
         std::lock_guard lk(tasks_mu);
-        tasks[task_id] = result;
-        touch_task_unlocked(task_id);
+        auto run_it = active_runs.find(task_id);
+        if (run_it != active_runs.end()
+            && run_it->second.generation == generation
+            && run_it->second.cancel_token == task_cancel) {
+            // The task-map lock is the terminal-state linearization point.
+            // A tasks/cancel that commits first must not be overwritten by a
+            // graph completion that was already preparing its response.
+            auto task_it = tasks.find(task_id);
+            if (task_it != tasks.end()
+                && task_it->second.status.state == TaskState::Canceled) {
+                result = task_it->second;
+            } else {
+                tasks[task_id] = result;
+            }
+            touch_task_unlocked(task_id);
+            active_runs.erase(run_it);
+        }
     }
 
     if (on_event) {
@@ -527,18 +607,18 @@ void A2AServer::Impl::handle_tasks_cancel(const neograph::json& params,
     auto task_id = params.value("id", std::string());
     Task t;
     bool found = false;
+    std::shared_ptr<neograph::graph::CancelToken> cancel_token;
     {
         std::lock_guard lk(tasks_mu);
         auto it = tasks.find(task_id);
         if (it != tasks.end()) {
             t = it->second;
             found = true;
-            auto cf_it = cancel_flags.find(task_id);
-            if (cf_it != cancel_flags.end() && cf_it->second) {
-                cf_it->second->store(true, std::memory_order_release);
-            }
-            if (t.status.state == TaskState::Working
-                || t.status.state == TaskState::Submitted) {
+            if (!is_terminal(t.status.state)) {
+                if (auto run_it = active_runs.find(task_id);
+                    run_it != active_runs.end()) {
+                    cancel_token = run_it->second.cancel_token;
+                }
                 t.status.state = TaskState::Canceled;
                 tasks[task_id] = t;
                 touch_task_unlocked(task_id);
@@ -551,6 +631,7 @@ void A2AServer::Impl::handle_tasks_cancel(const neograph::json& params,
                         "application/json");
         return;
     }
+    if (cancel_token) cancel_token->cancel();
     neograph::json tj;
     to_json(tj, t);
     res.status = 200;

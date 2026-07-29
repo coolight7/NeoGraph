@@ -80,6 +80,36 @@ def test_delete_and_list_namespaces():
     assert store.get(["users", "u1"], "a") is None
 
 
+def test_store_identity_preserves_components_and_slashes():
+    store = ng.InMemoryStore()
+    store.put(["a", "b"], "c", {"kind": "nested"})
+    store.put(["a"], "b/c", {"kind": "slash-key"})
+    store.put([], "root", {"kind": "empty-namespace"})
+    store.put([""], "root", {"kind": "empty-component"})
+
+    assert len(store) == 4
+    assert store.get(["a", "b"], "c").value == {"kind": "nested"}
+    assert store.get(["a"], "b/c").value == {"kind": "slash-key"}
+    assert store.get([], "root").value == {"kind": "empty-namespace"}
+    assert store.get([""], "root").value == {"kind": "empty-component"}
+
+
+def test_store_prefix_matches_complete_namespace_components():
+    store = ng.InMemoryStore()
+    store.put(["user", "one"], "key", 1)
+    store.put(["user", "two"], "key", 2)
+    store.put(["user2", "three"], "key", 3)
+
+    assert sorted(item.ns for item in store.search(["user"])) == [
+        ["user", "one"],
+        ["user", "two"],
+    ]
+    assert sorted(store.list_namespaces(["user"])) == [
+        ["user", "one"],
+        ["user", "two"],
+    ]
+
+
 def test_a_node_can_reach_the_store_through_its_context():
     """The point of the subsystem: a node remembering something across runs.
 
@@ -192,6 +222,23 @@ def test_it_gives_up_after_max_retries():
 def test_the_validator_exists():
     assert hasattr(ng, "validate")
     assert hasattr(ng, "ValidationReport")
+
+
+def test_legacy_topology_upgrade_is_lossless_and_strict():
+    legacy = {
+        "name": "legacy",
+        "conditionnal_edges": [],
+        "x-upgraded-conditionnal_edges": "existing-annotation",
+        "nodes": {},
+    }
+
+    upgraded = ng.upgrade_topology(legacy)
+
+    assert ng.TOPOLOGY_SCHEMA_VERSION == 1
+    assert upgraded["schema_version"] == ng.TOPOLOGY_SCHEMA_VERSION
+    assert upgraded["x-upgraded-conditionnal_edges"] == "existing-annotation"
+    assert upgraded["x-upgraded-conditionnal_edges-2"] == []
+    assert not ng.validate(upgraded).has_errors()
 
 
 def test_a_good_graph_has_no_errors():

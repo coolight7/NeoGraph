@@ -1,5 +1,7 @@
 #include <neograph/graph/checkpoint.h>
 #include <neograph/graph/compiler.h>
+#include <neograph/graph/node.h>
+#include <neograph/graph/registry.h>
 
 #include <gtest/gtest.h>
 #ifdef NEOGRAPH_TESTS_HAVE_SQLITE
@@ -11,10 +13,15 @@
 #include <neograph/mcp/server.h>
 #include <neograph/provider.h>
 
+#include <asio/error.hpp>
+#include <asio/system_error.hpp>
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,6 +37,8 @@ namespace {
 using neograph::json;
 using neograph::mcp::HarnessService;
 using neograph::mcp::HarnessServiceConfig;
+using neograph::mcp::HarnessAdmissionProfile;
+using neograph::mcp::HarnessServiceResources;
 using neograph::mcp::HarnessWorkerCall;
 using neograph::mcp::HarnessWorkerResponse;
 
@@ -107,6 +116,83 @@ json dsl_request(std::string judge_name, std::string worker_results_reducer = "a
     return value;
 }
 
+class AdmissionNoopNode final : public neograph::graph::GraphNode {
+public:
+    explicit AdmissionNoopNode(std::string name) : name_(std::move(name)) {}
+
+    asio::awaitable<neograph::graph::NodeOutput> run(neograph::graph::NodeInput) override {
+        co_return neograph::graph::NodeOutput{};
+    }
+
+    std::string get_name() const override { return name_; }
+
+private:
+    std::string name_;
+};
+
+json admission_descriptor(bool complete = true) {
+    json descriptor = {
+        {"availability", "available"},
+        {"implementation_identity", "test:admission-noop-v1"},
+        {"compatibility_class", "unclassified"},
+    };
+    if (complete) {
+        descriptor["lowering_descriptor"] = {
+            {"kind", "legacy_graph_engine"},
+            {"version", 1},
+        };
+    }
+    return descriptor;
+}
+
+std::shared_ptr<const HarnessAdmissionProfile>
+sealed_core_profile(std::atomic<int>& factory_calls, bool complete = true) {
+    auto registry = std::make_shared<neograph::graph::GraphRegistry>();
+    registry->register_type(
+        "test_admission_noop",
+        [&factory_calls](const std::string& name, const json&,
+                         const neograph::graph::NodeContext&)
+            -> std::unique_ptr<neograph::graph::GraphNode> {
+            ++factory_calls;
+            return std::make_unique<AdmissionNoopNode>(name);
+        },
+        json::parse(R"JSON({"type":"object","properties":{},"additionalProperties":false})JSON"),
+        json{{"reads", json::array()}, {"writes", json::array()}});
+
+    auto profile      = std::make_shared<HarnessAdmissionProfile>();
+    profile->id       = complete ? "test-sealed-core-v1" : "test-missing-lowering-v1";
+    profile->registry = std::move(registry);
+    profile->manifest = {
+        {"format", "neograph-harness-admission-profile-v1"},
+        {"id", profile->id},
+        {"source_semantics_profile", "precutover-graph-engine-v1"},
+        {"allow_global_fallback", false},
+        {"modes", {{"core", {{"binding_contract", "general_core"}}}}},
+        {"nodes", {{"test_admission_noop", admission_descriptor(complete)}}},
+        {"reducers", json::object()},
+        {"conditions", json::object()},
+    };
+    return profile;
+}
+
+json core_request(std::string node_type = "test_admission_noop") {
+    auto value       = request(json::array());
+    value["harness"] = {
+        {"mode", "core"},
+        {"definition",
+         {
+             {"schema_version", 1},
+             {"name", "sealed_core_admission"},
+             {"nodes", {{"work", {{"type", std::move(node_type)}}}}},
+             {"edges", json::array({
+                           {{"from", "__start__"}, {"to", "work"}},
+                           {{"from", "work"}, {"to", "__end__"}},
+                       })},
+         }},
+    };
+    return value;
+}
+
 json host_brokered_request(std::string interaction = "tool_result") {
     auto value                   = request();
     value["workers"][0]["tools"] = json::array({"host.lookup"});
@@ -130,6 +216,16 @@ json host_brokered_request(std::string interaction = "tool_result") {
         {"read_only", true},
         {"executor", {{"kind", "host_brokered"}, {"interaction", std::move(interaction)}}},
     }});
+    return value;
+}
+
+json non_idempotent_host_effect_request() {
+    auto value = host_brokered_request();
+    value["tool_catalog"][0]["executor"]["effect"] = {
+        {"idempotency", "unsupported"},
+        {"status_query", true},
+        {"fencing", true},
+    };
     return value;
 }
 
@@ -202,8 +298,56 @@ void expect_structured_text_fallback(const json& response) {
     ASSERT_GE(result["content"].size(), 2u) << result.dump();
     EXPECT_EQ(result["content"][1]["type"], "text");
     EXPECT_EQ(json::parse(result["content"][1]["text"].get<std::string>()),
-              result["structuredContent"]);
+               result["structuredContent"]);
 }
+
+bool has_diagnostic_code(const json& diagnostics, const std::string& code) {
+    for (const auto& diagnostic : diagnostics) {
+        if (diagnostic.value("code", "") == code) return true;
+    }
+    return false;
+}
+
+class MutableHarnessRecordStore final : public neograph::mcp::HarnessRecordStore {
+public:
+    void save_artifact(const std::string& artifact_id, const json& record) override {
+        std::lock_guard lock(mutex_);
+        artifacts_[artifact_id] = record;
+    }
+
+    std::optional<json> load_artifact(const std::string& artifact_id) override {
+        std::lock_guard lock(mutex_);
+        const auto it = artifacts_.find(artifact_id);
+        return it == artifacts_.end() ? std::nullopt : std::optional<json>{it->second};
+    }
+
+    void save_run(const std::string& run_id, const json& record) override {
+        std::lock_guard lock(mutex_);
+        runs_[run_id] = record;
+    }
+
+    std::optional<json> load_run(const std::string& run_id) override {
+        std::lock_guard lock(mutex_);
+        const auto it = runs_.find(run_id);
+        return it == runs_.end() ? std::nullopt : std::optional<json>{it->second};
+    }
+
+    void mutate_artifact(const std::string& artifact_id,
+                         const std::function<void(json&)>& mutation) {
+        std::lock_guard lock(mutex_);
+        mutation(artifacts_.at(artifact_id));
+    }
+
+    void mutate_run(const std::string& run_id, const std::function<void(json&)>& mutation) {
+        std::lock_guard lock(mutex_);
+        mutation(runs_.at(run_id));
+    }
+
+private:
+    std::mutex                  mutex_;
+    std::map<std::string, json> artifacts_;
+    std::map<std::string, json> runs_;
+};
 
 class ScriptedProvider final : public neograph::Provider {
 public:
@@ -219,6 +363,32 @@ public:
     }
 
     std::string get_name() const override { return "scripted-harness-provider"; }
+};
+
+class AsioErrorProvider final : public neograph::Provider {
+public:
+    explicit AsioErrorProvider(asio::error_code error) : error_(error) {}
+
+    neograph::ChatCompletion complete(const neograph::CompletionParams&) override {
+        throw asio::system_error(error_);
+    }
+
+    std::string get_name() const override { return "asio-error-harness-provider"; }
+
+private:
+    asio::error_code error_;
+};
+
+class CancellationAwareProvider final : public neograph::Provider {
+public:
+    neograph::ChatCompletion complete(const neograph::CompletionParams& params) override {
+        while (!params.cancel_token->is_cancelled()) {
+            std::this_thread::sleep_for(1ms);
+        }
+        throw neograph::graph::CancelledException("provider cancellation observed");
+    }
+
+    std::string get_name() const override { return "cancellation-aware-harness-provider"; }
 };
 
 class StartFailingJournal final : public neograph::mcp::HarnessJournal {
@@ -325,6 +495,11 @@ TEST(HarnessServiceTest, ExposesSmallStableMcpToolSurface) {
               std::string::npos);
 }
 
+TEST(HarnessServiceTest, LegacyEmptyJournalArgumentRemainsUnambiguous) {
+    HarnessService service(HarnessServiceConfig{}, {});
+    EXPECT_EQ(service.schema()["service"], "neograph-harness-m4");
+}
+
 TEST(HarnessServiceTest, MirrorsStructuredToolResultsIntoTextContent) {
     HarnessServiceConfig config;
     config.worker_executor = [](const HarnessWorkerCall&, const auto&) {
@@ -419,6 +594,412 @@ TEST(HarnessServiceTest, MalformedHarnessCannotProduceExecutableArtifact) {
     auto started = service.start({{"request", malformed}});
     EXPECT_FALSE(started["started"].get<bool>());
     EXPECT_EQ(started["status"], "compile_failed");
+}
+
+TEST(HarnessServiceTest, SchemaPaletteComesFromTheSealedAdmissionProfile) {
+    std::atomic<int> ambient_factory_calls{0};
+    neograph::graph::NodeFactory::instance().register_type(
+        "ambient_harness_vm_a01",
+        [&ambient_factory_calls](const std::string& name, const json&,
+                                 const neograph::graph::NodeContext&)
+            -> std::unique_ptr<neograph::graph::GraphNode> {
+            ++ambient_factory_calls;
+            return std::make_unique<AdmissionNoopNode>(name);
+        });
+
+    HarnessService service;
+    const auto schema = service.schema();
+    const auto palette = schema["node_palette"];
+    ASSERT_TRUE(palette["node_types"].contains("neograph_harness_worker"));
+    ASSERT_TRUE(palette["node_types"].contains("neograph_harness_judge"));
+    EXPECT_FALSE(palette["node_types"].contains("ambient_harness_vm_a01"));
+    EXPECT_FALSE(palette["admission_profile"]["global_fallback"].get<bool>());
+    EXPECT_EQ(schema["admission_profile"]["id"], "harness-precutover-sealed-v1");
+
+    const auto compiled = service.compile(request());
+    EXPECT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+    EXPECT_EQ(ambient_factory_calls.load(), 0);
+}
+
+TEST(HarnessServiceTest, CoreModeRejectsAmbientGlobalPrimitiveWithoutConstructionOrDispatch) {
+    std::atomic<int> factory_calls{0};
+    std::atomic<int> worker_dispatches{0};
+    neograph::graph::NodeFactory::instance().register_type(
+        "ambient_harness_vm_a02",
+        [&factory_calls](const std::string& name, const json&,
+                         const neograph::graph::NodeContext&)
+            -> std::unique_ptr<neograph::graph::GraphNode> {
+            ++factory_calls;
+            return std::make_unique<AdmissionNoopNode>(name);
+        });
+
+    HarnessServiceConfig config;
+    config.worker_executor = [&worker_dispatches](const HarnessWorkerCall&, const auto&) {
+        ++worker_dispatches;
+        return HarnessWorkerResponse::success(json::object());
+    };
+    HarnessService service(std::move(config));
+    const auto rejected = service.compile(core_request("ambient_harness_vm_a02"));
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+    EXPECT_FALSE(rejected.contains("artifact_id"));
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"], "H_UNSEALED_PRIMITIVE"))
+        << rejected.dump();
+    EXPECT_EQ(factory_calls.load(), 0);
+
+    const auto start_rejected =
+        service.start({{"request", core_request("ambient_harness_vm_a02")}});
+    EXPECT_FALSE(start_rejected["started"].get<bool>());
+    EXPECT_EQ(start_rejected["status"], "compile_failed");
+    EXPECT_EQ(factory_calls.load(), 0);
+    EXPECT_EQ(worker_dispatches.load(), 0);
+}
+
+TEST(HarnessServiceTest, CoreModeRejectsPrimitiveWithoutLoweringClassification) {
+    std::atomic<int> factory_calls{0};
+    HarnessServiceConfig config;
+    HarnessService service(
+        std::move(config), nullptr,
+        HarnessServiceResources{sealed_core_profile(factory_calls, false)});
+
+    const auto rejected = service.compile(core_request());
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"], "H_UNCLASSIFIED_LOWERING"))
+        << rejected.dump();
+    EXPECT_FALSE(service.schema()["node_palette"]["node_types"].contains(
+        "test_admission_noop"));
+    EXPECT_EQ(factory_calls.load(), 0);
+}
+
+TEST(HarnessServiceTest, CoreModeCompilesDeclarativelyAndPreservesCanonicalTopology) {
+    std::atomic<int> factory_calls{0};
+    HarnessServiceConfig config;
+    HarnessService service(
+        std::move(config), nullptr,
+        HarnessServiceResources{sealed_core_profile(factory_calls)});
+    const auto source = core_request();
+
+    const auto compiled = service.compile(source);
+    ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+    EXPECT_EQ(neograph::graph::GraphCompiler::canon(
+                  source["harness"]["definition"]),
+              neograph::graph::GraphCompiler::canon(
+                  compiled["artifacts"]["core_lockfile"]["content"]));
+    EXPECT_EQ(compiled["artifacts"]["admission_profile"]["content"]["id"],
+              "test-sealed-core-v1");
+    EXPECT_EQ(factory_calls.load(), 0)
+        << "Harness compile must stop at validated declarative topology";
+}
+
+TEST(HarnessServiceTest, CoreModeMalformedPrimitiveTypesFailClosedWithoutDispatch) {
+    std::atomic<int> factory_calls{0};
+    HarnessService service(
+        HarnessServiceConfig{}, nullptr,
+        HarnessServiceResources{sealed_core_profile(factory_calls)});
+
+    auto invalid_node = core_request();
+    invalid_node["harness"]["definition"]["nodes"]["work"]["type"] = 42;
+    json rejected;
+    EXPECT_NO_THROW(rejected = service.compile(invalid_node));
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+
+    auto invalid_reducer = core_request();
+    invalid_reducer["harness"]["definition"]["channels"] = {
+        {"state", {{"reducer", 42}, {"initial", nullptr}}},
+    };
+    EXPECT_NO_THROW(rejected = service.compile(invalid_reducer));
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+    EXPECT_EQ(factory_calls.load(), 0);
+}
+
+TEST(HarnessServiceTest, AdmissionProfileIsSnapshottedAtServiceConstruction) {
+    std::atomic<int> factory_calls{0};
+    auto mutable_profile =
+        std::const_pointer_cast<HarnessAdmissionProfile>(sealed_core_profile(factory_calls));
+    auto mutable_registry =
+        std::const_pointer_cast<neograph::graph::GraphRegistry>(mutable_profile->registry);
+
+    HarnessServiceConfig config;
+    HarnessService service(std::move(config), nullptr,
+                           HarnessServiceResources{mutable_profile});
+
+    mutable_registry->register_type(
+        "late_admission_node",
+        [&factory_calls](const std::string& name, const json&,
+                         const neograph::graph::NodeContext&)
+            -> std::unique_ptr<neograph::graph::GraphNode> {
+            ++factory_calls;
+            return std::make_unique<AdmissionNoopNode>(name);
+        });
+    mutable_profile->manifest["nodes"]["late_admission_node"] = admission_descriptor();
+
+    EXPECT_FALSE(service.schema()["node_palette"]["node_types"].contains(
+        "late_admission_node"));
+    const auto rejected = service.compile(core_request("late_admission_node"));
+    EXPECT_FALSE(rejected["ok"].get<bool>());
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"], "H_UNSEALED_PRIMITIVE"));
+    EXPECT_EQ(factory_calls.load(), 0);
+}
+
+TEST(HarnessServiceTest, MalformedAdmissionManifestFailsClosedWithoutBreakingSchema) {
+    auto malformed      = std::make_shared<HarnessAdmissionProfile>();
+    malformed->id       = "malformed-profile";
+    malformed->manifest = json::array({"not", "an", "object"});
+    malformed->registry = std::make_shared<neograph::graph::GraphRegistry>();
+    HarnessService service(HarnessServiceConfig{}, nullptr,
+                           HarnessServiceResources{malformed});
+
+    json schema;
+    EXPECT_NO_THROW(schema = service.schema());
+    ASSERT_TRUE(schema.is_object());
+    EXPECT_TRUE(schema["node_palette"]["node_types"].empty());
+
+    const auto rejected = service.compile(request());
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"], "H_PROFILE_FORMAT"))
+        << rejected.dump();
+    EXPECT_FALSE(rejected.contains("artifact_id"));
+
+    auto wrong_type = std::const_pointer_cast<HarnessAdmissionProfile>(
+        neograph::mcp::make_default_harness_admission_profile());
+    wrong_type->manifest["format"] = 42;
+    HarnessService typed_service(HarnessServiceConfig{}, nullptr,
+                                 HarnessServiceResources{wrong_type});
+    EXPECT_NO_THROW(schema = typed_service.schema());
+    const auto typed_rejected = typed_service.compile(request());
+    EXPECT_FALSE(typed_rejected["ok"].get<bool>());
+    EXPECT_TRUE(has_diagnostic_code(typed_rejected["diagnostics"],
+                                    "H_PROFILE_FORMAT"));
+}
+
+TEST(HarnessServiceTest, SchemaPaletteOmitsUnsupportedPreCutoverLowering) {
+    std::atomic<int> factory_calls{0};
+    auto profile = std::const_pointer_cast<HarnessAdmissionProfile>(
+        sealed_core_profile(factory_calls));
+    profile->manifest["nodes"]["test_admission_noop"]["lowering_descriptor"]["kind"] =
+        "graph_to_control";
+    HarnessService service(HarnessServiceConfig{}, nullptr,
+                           HarnessServiceResources{profile});
+
+    EXPECT_FALSE(service.schema()["node_palette"]["node_types"].contains(
+        "test_admission_noop"));
+    const auto rejected = service.compile(core_request());
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"],
+                                    "H_UNKNOWN_LOWERING_CLASS"));
+    EXPECT_EQ(factory_calls.load(), 0);
+}
+
+TEST(HarnessServiceTest, FutureAdmissionSemanticsRemainUnavailableBeforeVmCutover) {
+    std::atomic<int> factory_calls{0};
+    auto profile = std::const_pointer_cast<HarnessAdmissionProfile>(
+        sealed_core_profile(factory_calls));
+    profile->manifest["source_semantics_profile"] = "graph-compat-v1";
+    HarnessService service(HarnessServiceConfig{}, nullptr,
+                           HarnessServiceResources{profile});
+
+    EXPECT_FALSE(service.schema()["node_palette"]["node_types"].contains(
+        "test_admission_noop"));
+    const auto rejected = service.compile(core_request());
+    ASSERT_FALSE(rejected["ok"].get<bool>()) << rejected.dump();
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"], "H_PROFILE_FORMAT"));
+    EXPECT_EQ(factory_calls.load(), 0);
+}
+
+TEST(HarnessServiceTest, RetainedArtifactCannotStartAfterImplementationIdentityChanges) {
+    const auto root = unique_temp_path("neograph-harness-admission-profile");
+    TempDirectoryCleanup cleanup(root);
+    std::string artifact_id;
+    {
+        HarnessServiceConfig config;
+        config.record_store =
+            std::make_shared<neograph::mcp::FileHarnessRecordStore>(root.string());
+        HarnessService service(std::move(config));
+        const auto compiled = service.compile(request());
+        ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+        artifact_id = compiled["artifact_id"].get<std::string>();
+    }
+
+    std::atomic<int> worker_dispatches{0};
+    auto changed_profile = std::const_pointer_cast<HarnessAdmissionProfile>(
+        neograph::mcp::make_default_harness_admission_profile());
+    changed_profile->manifest["nodes"]["neograph_harness_worker"]
+                             ["implementation_identity"] =
+        "builtin:neograph-harness-worker-v2";
+    HarnessServiceConfig config;
+    config.record_store =
+        std::make_shared<neograph::mcp::FileHarnessRecordStore>(root.string());
+    config.worker_executor = [&worker_dispatches](const HarnessWorkerCall&, const auto&) {
+        ++worker_dispatches;
+        return HarnessWorkerResponse::success(json::object());
+    };
+    HarnessService service(
+        std::move(config), nullptr,
+        HarnessServiceResources{std::move(changed_profile)});
+    const auto rejected = service.start({{"artifact_id", artifact_id}});
+    EXPECT_FALSE(rejected["started"].get<bool>());
+    EXPECT_EQ(rejected["status"], "admission_failed");
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"],
+                                    "H_ARTIFACT_PROFILE_MISMATCH"));
+    EXPECT_EQ(worker_dispatches.load(), 0);
+}
+
+TEST(HarnessServiceTest, RetainedArtifactContentMustMatchImmutableRevision) {
+    auto records = std::make_shared<MutableHarnessRecordStore>();
+    std::string artifact_id;
+    {
+        HarnessServiceConfig config;
+        config.record_store = records;
+        HarnessService service(std::move(config));
+        const auto compiled = service.compile(request());
+        ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+        artifact_id = compiled["artifact_id"].get<std::string>();
+    }
+    records->mutate_artifact(artifact_id, [](json& record) {
+        record["core"]["name"] = "tampered-after-compile";
+    });
+
+    std::atomic<int> worker_dispatches{0};
+    HarnessServiceConfig config;
+    config.record_store = records;
+    config.worker_executor = [&worker_dispatches](const HarnessWorkerCall&, const auto&) {
+        ++worker_dispatches;
+        return HarnessWorkerResponse::success(json::object());
+    };
+    HarnessService service(std::move(config));
+    const auto rejected = service.start({{"artifact_id", artifact_id}});
+    ASSERT_FALSE(rejected["started"].get<bool>());
+    EXPECT_EQ(rejected["status"], "admission_failed");
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"],
+                                    "H_ARTIFACT_REVISION_MISMATCH"));
+    EXPECT_EQ(worker_dispatches.load(), 0);
+}
+
+TEST(HarnessServiceTest, ResumeRejectsProfileMismatchBeforeConsumingPendingResult) {
+    const auto root = unique_temp_path("neograph-harness-resume-profile-mismatch");
+    TempDirectoryCleanup cleanup(root);
+    std::filesystem::create_directories(root);
+    std::string run_id;
+    std::string call_id;
+    {
+        HarnessServiceConfig config;
+        config.checkpoint_store = std::make_shared<neograph::graph::InMemoryCheckpointStore>();
+        config.record_store =
+            std::make_shared<neograph::mcp::FileHarnessRecordStore>(root.string());
+        config.worker_executor = [](const HarnessWorkerCall& call, const auto&) {
+            if (!call.resume_value) {
+                return HarnessWorkerResponse::awaiting_tool_results({
+                    {"call_id", "profile-bound-call"},
+                    {"tool_id", "host.lookup"},
+                    {"arguments", {{"query", "needle"}}},
+                    {"result_schema",
+                     {{"type", "object"},
+                      {"required", json::array({"answer"})},
+                      {"properties", {{"answer", {{"type", "string"}}}}}}},
+                });
+            }
+            return HarnessWorkerResponse::success(
+                {{"status", "ok"}, {"findings", json::array()}});
+        };
+        HarnessService service(std::move(config));
+        const auto compiled = service.compile(host_brokered_request());
+        ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+        const auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+        run_id            = started["run_id"].get<std::string>();
+        const auto waiting = wait_terminal(service, run_id);
+        ASSERT_EQ(waiting["status"], "awaiting_tool_results") << waiting.dump();
+        call_id = waiting["pending"]["call_id"].get<std::string>();
+    }
+
+    auto changed_profile = std::const_pointer_cast<HarnessAdmissionProfile>(
+        neograph::mcp::make_default_harness_admission_profile());
+    changed_profile->id = "harness-precutover-sealed-v2";
+    changed_profile->manifest["id"] = changed_profile->id;
+    std::atomic<int> worker_dispatches{0};
+    HarnessServiceConfig config;
+    config.checkpoint_store = std::make_shared<neograph::graph::InMemoryCheckpointStore>();
+    auto records = std::make_shared<neograph::mcp::FileHarnessRecordStore>(root.string());
+    config.record_store = records;
+    config.worker_executor = [&worker_dispatches](const HarnessWorkerCall&, const auto&) {
+        ++worker_dispatches;
+        return HarnessWorkerResponse::success(
+            {{"status", "ok"}, {"findings", json::array()}});
+    };
+    HarnessService service(
+        std::move(config), nullptr,
+        HarnessServiceResources{std::move(changed_profile)});
+
+    const auto rejected = service.resume(
+        {{"run_id", run_id}, {"call_id", call_id}, {"result", {{"answer", "found"}}}});
+    EXPECT_FALSE(rejected["accepted"].get<bool>());
+    EXPECT_EQ(rejected["status"], "admission_failed");
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"],
+                                    "H_ARTIFACT_PROFILE_MISMATCH"));
+    EXPECT_EQ(worker_dispatches.load(), 0);
+    const auto waiting = service.get(run_id);
+    EXPECT_EQ(waiting["status"], "awaiting_tool_results");
+    EXPECT_EQ(waiting["pending"]["call_id"], call_id);
+    const auto persisted = records->load_run(run_id);
+    ASSERT_TRUE(persisted.has_value());
+    EXPECT_FALSE((*persisted)["consumed"].contains(call_id));
+}
+
+TEST(HarnessServiceTest, ResumeRejectsMismatchedRunArtifactBindingBeforeConsumption) {
+    auto records = std::make_shared<MutableHarnessRecordStore>();
+    auto checkpoints = std::make_shared<neograph::graph::InMemoryCheckpointStore>();
+    std::string run_id;
+    std::string call_id;
+    {
+        HarnessServiceConfig config;
+        config.checkpoint_store = checkpoints;
+        config.record_store     = records;
+        config.worker_executor = [](const HarnessWorkerCall& call, const auto&) {
+            if (!call.resume_value) {
+                return HarnessWorkerResponse::awaiting_tool_results({
+                    {"call_id", "run-artifact-call"},
+                    {"tool_id", "host.lookup"},
+                    {"arguments", {{"query", "needle"}}},
+                    {"result_schema",
+                     {{"type", "object"},
+                      {"required", json::array({"answer"})},
+                      {"properties", {{"answer", {{"type", "string"}}}}}}},
+                });
+            }
+            return HarnessWorkerResponse::success(
+                {{"status", "ok"}, {"findings", json::array()}});
+        };
+        HarnessService service(std::move(config));
+        const auto compiled = service.compile(host_brokered_request());
+        ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+        const auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+        run_id            = started["run_id"].get<std::string>();
+        const auto waiting = wait_terminal(service, run_id);
+        ASSERT_EQ(waiting["status"], "awaiting_tool_results") << waiting.dump();
+        call_id = waiting["pending"]["call_id"].get<std::string>();
+    }
+    records->mutate_run(run_id, [](json& record) {
+        record["revision_digest"] = "fnv1a64:0000000000000000";
+    });
+
+    std::atomic<int> worker_dispatches{0};
+    HarnessServiceConfig config;
+    config.checkpoint_store = checkpoints;
+    config.record_store     = records;
+    config.worker_executor = [&worker_dispatches](const HarnessWorkerCall&, const auto&) {
+        ++worker_dispatches;
+        return HarnessWorkerResponse::success(
+            {{"status", "ok"}, {"findings", json::array()}});
+    };
+    HarnessService service(std::move(config));
+    const auto rejected = service.resume(
+        {{"run_id", run_id}, {"call_id", call_id}, {"result", {{"answer", "found"}}}});
+    EXPECT_FALSE(rejected["accepted"].get<bool>());
+    EXPECT_EQ(rejected["status"], "admission_failed");
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"],
+                                    "H_RUN_ARTIFACT_BINDING"));
+    EXPECT_EQ(worker_dispatches.load(), 0);
+    const auto persisted = records->load_run(run_id);
+    ASSERT_TRUE(persisted.has_value());
+    EXPECT_FALSE((*persisted)["consumed"].contains(call_id));
 }
 
 TEST(HarnessServiceTest, JournalFailureFailsRunWithoutEscapingWorkerThread) {
@@ -519,6 +1100,17 @@ TEST(HarnessServiceTest, PresetAndEquivalentDslCompileToCanonicalCore) {
     auto preset = service.compile(preset_request);
     ASSERT_TRUE(preset["ok"].get<bool>()) << preset.dump();
 
+    const auto has_final_result_e6 = [](const json& diagnostics) {
+        for (const auto& diagnostic : diagnostics) {
+            if (diagnostic["code"] == "E6" &&
+                diagnostic["path"] == "channels.final_result") {
+                return true;
+            }
+        }
+        return false;
+    };
+    EXPECT_FALSE(has_final_result_e6(preset["diagnostics"])) << preset.dump();
+
     auto dsl_request = preset_request;
     dsl_request["harness"] = {
         {"mode", "dsl"},
@@ -526,11 +1118,34 @@ TEST(HarnessServiceTest, PresetAndEquivalentDslCompileToCanonicalCore) {
     };
     auto dsl = service.compile(dsl_request);
     ASSERT_TRUE(dsl["ok"].get<bool>()) << dsl.dump();
+    EXPECT_FALSE(has_final_result_e6(dsl["diagnostics"])) << dsl.dump();
+    EXPECT_EQ(preset["diagnostics"], dsl["diagnostics"]);
 
     EXPECT_EQ(
         neograph::graph::GraphCompiler::canon(preset["artifacts"]["core_lockfile"]["content"]),
         neograph::graph::GraphCompiler::canon(dsl["artifacts"]["core_lockfile"]["content"]));
 }
+
+#if GTEST_HAS_STREAM_REDIRECTION
+TEST(HarnessServiceTest, RuntimeValidationHonorsExportedFinalResult) {
+    HarnessServiceConfig config;
+    config.worker_executor = [](const HarnessWorkerCall&, const auto&) {
+        return HarnessWorkerResponse::success(
+            {{"status", "ok"}, {"findings", json::array()}});
+    };
+    HarnessService service(std::move(config));
+    const auto compiled = service.compile(request());
+    ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+
+    testing::internal::CaptureStderr();
+    const auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+    const auto terminal = wait_terminal(service, started["run_id"].get<std::string>());
+    const auto errors = testing::internal::GetCapturedStderr();
+
+    ASSERT_EQ(terminal["status"], "completed") << terminal.dump();
+    EXPECT_EQ(errors.find("[E6] channels.final_result"), std::string::npos) << errors;
+}
+#endif
 
 TEST(HarnessServiceTest, ShipsReviewTriageAndResearchPresets) {
     HarnessService service;
@@ -651,6 +1266,168 @@ TEST(HarnessServiceTest, ProviderExecutorRunsDeclaredToolsAndValidatesPaths) {
     ASSERT_EQ(provider->calls[1].messages.size(), 3u);
     EXPECT_EQ(provider->calls[1].messages.back().role, "tool");
     std::filesystem::remove_all(workspace);
+}
+
+TEST(HarnessServiceTest, ProviderExecutorPreservesTransportTimeoutKind) {
+    neograph::mcp::HarnessProviderExecutorConfig config;
+    config.provider = std::make_shared<AsioErrorProvider>(
+        asio::error::make_error_code(asio::error::timed_out));
+    auto executor = neograph::mcp::make_provider_harness_executor(std::move(config));
+
+    HarnessWorkerCall call;
+    call.task = {{"objective", "Review"}};
+    call.worker = worker("reviewer");
+    auto response = executor(call, std::make_shared<neograph::graph::CancelToken>());
+
+    EXPECT_EQ(response.kind, neograph::mcp::HarnessWorkerResponseKind::TIMEOUT);
+    EXPECT_FALSE(response.message.empty());
+}
+
+TEST(HarnessServiceTest, ProviderExecutorAppliesEffectiveOutputBudget) {
+    auto provider = std::make_shared<ScriptedProvider>();
+    neograph::ChatCompletion completion;
+    completion.message.content = R"({"status":"ok","findings":[]})";
+    provider->completions = {completion};
+    neograph::mcp::HarnessProviderExecutorConfig config;
+    config.provider = provider;
+    auto executor = neograph::mcp::make_provider_harness_executor(std::move(config));
+
+    HarnessWorkerCall call;
+    call.task = {{"objective", "Review"}};
+    call.worker = worker("reviewer");
+    call.worker["_harness_provider_budget"] = {
+        {"provider_timeout_seconds", 5}, {"max_output_tokens", 37}};
+    auto response = executor(call, std::make_shared<neograph::graph::CancelToken>());
+
+    ASSERT_EQ(response.kind, neograph::mcp::HarnessWorkerResponseKind::VALUE);
+    ASSERT_EQ(provider->calls.size(), 1u);
+    EXPECT_EQ(provider->calls[0].max_tokens, 37);
+}
+
+TEST(HarnessServiceTest, ProviderExecutorPreservesUnboundedDefaults) {
+    auto provider = std::make_shared<ScriptedProvider>();
+    neograph::ChatCompletion completion;
+    completion.message.content = R"({"status":"ok","findings":[]})";
+    provider->completions = {completion};
+    neograph::mcp::HarnessProviderExecutorConfig config;
+    config.provider = provider;
+    auto executor = neograph::mcp::make_provider_harness_executor(std::move(config));
+
+    HarnessWorkerCall call;
+    call.task = {{"objective", "Review"}};
+    call.worker = worker("reviewer");
+    const auto response = executor(call, std::make_shared<neograph::graph::CancelToken>());
+
+    ASSERT_EQ(response.kind, neograph::mcp::HarnessWorkerResponseKind::VALUE);
+    ASSERT_EQ(provider->calls.size(), 1u);
+    EXPECT_EQ(provider->calls[0].max_tokens, -1);
+}
+
+TEST(HarnessServiceTest, ProviderExecutorDeadlineCancelsOnlyProviderChild) {
+    neograph::mcp::HarnessProviderExecutorConfig config;
+    config.provider = std::make_shared<CancellationAwareProvider>();
+    auto executor = neograph::mcp::make_provider_harness_executor(std::move(config));
+
+    HarnessWorkerCall call;
+    call.task = {{"objective", "Review"}};
+    call.worker = worker("reviewer");
+    call.worker["_harness_provider_budget"] = {
+        {"provider_timeout_seconds", 1}, {"max_output_tokens", 10}};
+    auto parent = std::make_shared<neograph::graph::CancelToken>();
+    auto sibling = parent->fork();
+
+    const auto response = executor(call, parent);
+
+    EXPECT_EQ(response.kind, neograph::mcp::HarnessWorkerResponseKind::TIMEOUT);
+    EXPECT_FALSE(parent->is_cancelled());
+    EXPECT_FALSE(sibling->is_cancelled());
+}
+
+TEST(HarnessServiceTest, RejectsWorkerBudgetAboveHarnessMaximum) {
+    HarnessService service;
+    auto value = request();
+    value["budgets"]["provider_timeout_seconds"] = 10;
+    value["budgets"]["max_output_tokens"] = 100;
+    value["workers"][0]["provider_timeout_seconds"] = 11;
+    value["workers"][0]["max_output_tokens"] = 101;
+    const auto compiled = service.compile(value);
+    ASSERT_FALSE(compiled["ok"].get<bool>());
+    int budget_errors = 0;
+    for (const auto& diagnostic : compiled["diagnostics"])
+        if (diagnostic["code"] == "H_WORKER_BUDGET") ++budget_errors;
+    EXPECT_EQ(budget_errors, 2) << compiled.dump();
+}
+
+TEST(HarnessServiceTest, SuppliesEffectiveProviderBudgetsToWorker) {
+    json observed;
+    HarnessServiceConfig config;
+    config.worker_executor = [&observed](const HarnessWorkerCall& call, const auto&) {
+        observed = call.worker["_harness_provider_budget"];
+        return HarnessWorkerResponse::success({{"status", "ok"}, {"findings", json::array()}});
+    };
+    HarnessService service(std::move(config));
+    auto value = request();
+    value["budgets"]["provider_timeout_seconds"] = 30;
+    value["budgets"]["max_output_tokens"] = 100;
+    value["workers"][0]["provider_timeout_seconds"] = 5;
+    value["workers"][0]["max_output_tokens"] = 25;
+    const auto compiled = service.compile(value);
+    ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+    const auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+    ASSERT_TRUE(started["started"].get<bool>()) << started.dump();
+    const auto terminal = wait_terminal(service, started["run_id"].get<std::string>());
+
+    EXPECT_EQ(terminal["status"], "completed") << terminal.dump();
+    EXPECT_EQ(observed["provider_timeout_seconds"], 5);
+    EXPECT_EQ(observed["max_output_tokens"], 25);
+}
+
+TEST(HarnessServiceTest, SuppliesUnboundedProviderBudgetByDefault) {
+    json observed;
+    HarnessServiceConfig config;
+    config.worker_executor = [&observed](const HarnessWorkerCall& call, const auto&) {
+        observed = call.worker["_harness_provider_budget"];
+        return HarnessWorkerResponse::success({{"status", "ok"}, {"findings", json::array()}});
+    };
+    HarnessService service(std::move(config));
+    const auto compiled = service.compile(request());
+    ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+    const auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+    ASSERT_TRUE(started["started"].get<bool>()) << started.dump();
+    const auto terminal = wait_terminal(service, started["run_id"].get<std::string>());
+
+    EXPECT_EQ(terminal["status"], "completed") << terminal.dump();
+    EXPECT_EQ(observed["provider_timeout_seconds"], 0);
+    EXPECT_EQ(observed["max_output_tokens"], -1);
+}
+
+TEST(HarnessServiceTest, ProviderExecutorKeepsOtherAsioFailuresAsToolErrors) {
+    neograph::mcp::HarnessProviderExecutorConfig config;
+    config.provider = std::make_shared<AsioErrorProvider>(
+        asio::error::make_error_code(asio::error::connection_refused));
+    auto executor = neograph::mcp::make_provider_harness_executor(std::move(config));
+
+    HarnessWorkerCall call;
+    call.task = {{"objective", "Review"}};
+    call.worker = worker("reviewer");
+    auto response = executor(call, std::make_shared<neograph::graph::CancelToken>());
+
+    EXPECT_EQ(response.kind, neograph::mcp::HarnessWorkerResponseKind::TOOL_ERROR);
+    EXPECT_FALSE(response.message.empty());
+}
+
+TEST(HarnessServiceTest, ProviderExecutorKeepsGenericFailuresAsToolErrors) {
+    neograph::mcp::HarnessProviderExecutorConfig config;
+    config.provider = std::make_shared<ScriptedProvider>();
+    auto executor = neograph::mcp::make_provider_harness_executor(std::move(config));
+
+    HarnessWorkerCall call;
+    call.task = {{"objective", "Review"}};
+    call.worker = worker("reviewer");
+    auto response = executor(call, std::make_shared<neograph::graph::CancelToken>());
+
+    EXPECT_EQ(response.kind, neograph::mcp::HarnessWorkerResponseKind::TOOL_ERROR);
+    EXPECT_EQ(response.message, "no scripted completion");
 }
 
 TEST(HarnessServiceTest, ProviderExecutorRejectsWorkspaceEscapeBeforeToolCall) {
@@ -1863,6 +2640,10 @@ TEST(HarnessServiceTest, CompatibleForkResumesExactCheckpointWithTargetArtifact)
     EXPECT_EQ(finished["source_checkpoint_id"], source_checkpoint_id);
     ASSERT_EQ(finished["result"]["findings"].size(), 1u);
     EXPECT_EQ(finished["result"]["findings"][0]["evidence"], "source checkpoint");
+    EXPECT_EQ(finished["result"]["finding_sources"],
+              json::array({{{"finding_index", 0},
+                            {"worker_id", "reviewer"},
+                            {"local_index", 0}}}));
     EXPECT_EQ(live_calls.load(std::memory_order_relaxed), 1)
         << "forking after the worker checkpoint must not execute the worker again";
 
@@ -1875,6 +2656,24 @@ TEST(HarnessServiceTest, CompatibleForkResumesExactCheckpointWithTargetArtifact)
         saw_fork_anchor = true;
     }
     EXPECT_TRUE(saw_fork_anchor);
+
+    auto tampered = checkpoints->load_by_id(source_checkpoint_id);
+    ASSERT_TRUE(tampered.has_value());
+    ASSERT_TRUE(tampered->metadata["harness"].contains("admission_profile_id"));
+    ASSERT_TRUE(tampered->metadata["harness"].contains("admission_profile_fingerprint"));
+    tampered->metadata["harness"]["admission_profile_fingerprint"] = "tampered";
+    checkpoints->save(*tampered);
+    const auto rejected = service.start({
+        {"fork",
+         {{"source_run_id", source_run_id},
+          {"checkpoint_id", source_checkpoint_id},
+          {"artifact_id", target_artifact["artifact_id"]}}},
+    });
+    ASSERT_FALSE(rejected["started"].get<bool>());
+    EXPECT_EQ(rejected["status"], "incompatible_fork");
+    EXPECT_TRUE(has_diagnostic_code(rejected["diagnostics"],
+                                    "H_FORK_CHECKPOINT_BINDING"))
+        << rejected.dump();
 }
 
 TEST(HarnessServiceTest, CompatibleForkLoadsSourceAndTargetAcrossSqliteReconnect) {
@@ -2075,6 +2874,9 @@ TEST(HarnessServiceTest, RecordedReplaySurvivesReconnectWithoutCallingLiveExecut
     EXPECT_EQ(replayed["execution_mode"], "recorded_replay");
     EXPECT_EQ(replayed["source_run_id"], source_run_id);
     EXPECT_EQ(replayed["result"]["workers"], source_workers);
+    EXPECT_EQ(replayed["result"]["finding_sources"],
+              json::array({{{"finding_index", 0}, {"worker_id", "a"}, {"local_index", 0}},
+                           {{"finding_index", 1}, {"worker_id", "b"}, {"local_index", 0}}}));
     EXPECT_EQ(live_calls.load(std::memory_order_relaxed), 3)
         << "recorded replay must not invoke provider/tool execution";
 
@@ -2090,6 +2892,9 @@ TEST(HarnessServiceTest, RecordedReplaySurvivesReconnectWithoutCallingLiveExecut
     ASSERT_EQ(live_result["result"]["findings"].size(), 2u);
     EXPECT_EQ(live_result["result"]["findings"][0]["evidence"], "live a");
     EXPECT_EQ(live_result["result"]["findings"][1]["evidence"], "live b");
+    EXPECT_EQ(live_result["result"]["finding_sources"],
+              json::array({{{"finding_index", 0}, {"worker_id", "a"}, {"local_index", 0}},
+                           {{"finding_index", 1}, {"worker_id", "b"}, {"local_index", 0}}}));
 }
 
 TEST(HarnessServiceTest, RecordedReplayRejectsRedactedWorkerOutputs) {
@@ -2146,17 +2951,21 @@ TEST(HarnessServiceTest, RecordedReplayPreservesTerminalWorkerFailure) {
     const auto replayed = wait_terminal(service, replay["run_id"].get<std::string>());
     ASSERT_EQ(replayed["status"], "completed") << replayed.dump();
     EXPECT_EQ(replayed["result"]["workers"], source["result"]["workers"]);
-    EXPECT_EQ(live_calls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(live_calls.load(std::memory_order_relaxed), 2);
 
     const auto events               = records->list_events(source_run_id);
+    bool       saw_retry            = false;
     bool       saw_terminal_attempt = false;
     for (const auto& event : events) {
         if (event["event_type"] == "worker.attempt.completed" &&
             event["payload"].value("retry_reason", "") == "timeout") {
-            EXPECT_FALSE(event["payload"]["retry_scheduled"].get<bool>());
-            saw_terminal_attempt = true;
+            if (event["payload"]["retry_scheduled"].get<bool>())
+                saw_retry = true;
+            else
+                saw_terminal_attempt = true;
         }
     }
+    EXPECT_TRUE(saw_retry);
     EXPECT_TRUE(saw_terminal_attempt);
 }
 
@@ -2340,6 +3149,147 @@ TEST(HarnessServiceTest, PersistedResumeIntentRecoversBeforeThreadSpawn) {
     }
     std::filesystem::remove_all(root);
 }
+
+TEST(HarnessServiceTest, AmbiguousHostEffectSurvivesReconnectAndReconciles) {
+    const auto root     = unique_temp_path("neograph-harness-ambiguous-effect");
+    const auto database = root / "checkpoints.db";
+    const auto records_database = root / "runs.db";
+    std::filesystem::create_directories(root);
+    neograph::mcp::SqliteHarnessJournalConfig journal_config;
+    journal_config.mode = neograph::mcp::HarnessJournalPayloadMode::FULL;
+    auto provider = std::make_shared<ScriptedProvider>();
+    neograph::ChatCompletion tool_request;
+    tool_request.message.tool_calls.push_back(
+        {"provider-call", "host.lookup", R"({"query":"needle"})"});
+    neograph::ChatCompletion final;
+    final.message.content = R"({"status":"ok","findings":[]})";
+    provider->completions = {tool_request, final};
+
+    std::string run_id;
+    std::string call_id;
+    std::string effect_id;
+    {
+        HarnessServiceConfig config;
+        config.checkpoint_store =
+            std::make_shared<neograph::graph::SqliteCheckpointStore>(database.string());
+        config.record_store = std::make_shared<neograph::mcp::SqliteHarnessRecordStore>(
+            records_database.string(), 5s, journal_config);
+        neograph::mcp::HarnessProviderExecutorConfig provider_config;
+        provider_config.provider = provider;
+        config.worker_executor =
+            neograph::mcp::make_provider_harness_executor(std::move(provider_config));
+        HarnessService service(std::move(config));
+        auto compiled = service.compile(non_idempotent_host_effect_request());
+        ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+        auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+        run_id = started["run_id"].get<std::string>();
+        auto waiting = wait_terminal(service, run_id);
+        ASSERT_EQ(waiting["status"], "awaiting_tool_results") << waiting.dump();
+        call_id = waiting["pending"]["call_id"].get<std::string>();
+        const auto& effect = waiting["pending"]["effect"];
+        effect_id = effect["effect_id"].get<std::string>();
+        EXPECT_NE(effect_id, waiting["pending"]["provider_call_id"].get<std::string>());
+        EXPECT_EQ(effect["idempotency_key"], effect_id);
+    }
+
+    {
+        HarnessServiceConfig config;
+        config.checkpoint_store =
+            std::make_shared<neograph::graph::SqliteCheckpointStore>(database.string());
+        auto records = std::make_shared<neograph::mcp::SqliteHarnessRecordStore>(
+            records_database.string(), 5s, journal_config);
+        config.record_store = records;
+        neograph::mcp::HarnessProviderExecutorConfig provider_config;
+        provider_config.provider = provider;
+        config.worker_executor =
+            neograph::mcp::make_provider_harness_executor(std::move(provider_config));
+        HarnessService service(std::move(config));
+
+        auto ambiguous = service.get(run_id);
+        ASSERT_EQ(ambiguous["status"], "ambiguous_effect") << ambiguous.dump();
+        EXPECT_EQ(ambiguous["ambiguity"]["effect_id"], effect_id);
+        EXPECT_THROW(service.resume(
+                         {{"run_id", run_id}, {"call_id", call_id},
+                          {"result", {{"answer", "found"}}}}),
+                     std::invalid_argument);
+        auto unresolved = service.resume(
+            {{"run_id", run_id}, {"call_id", call_id}, {"resolution", "unknown"}});
+        EXPECT_FALSE(unresolved["accepted"].get<bool>());
+        auto accepted = service.resume(
+            {{"run_id", run_id}, {"call_id", call_id}, {"resolution", "completed"},
+             {"result", {{"answer", "found"}}}});
+        EXPECT_TRUE(accepted["accepted"].get<bool>());
+        auto duplicate = service.resume(
+            {{"run_id", run_id}, {"call_id", call_id}, {"resolution", "completed"},
+             {"result", {{"answer", "found"}}}});
+        EXPECT_TRUE(duplicate["duplicate"].get<bool>());
+        EXPECT_EQ(wait_terminal(service, run_id)["status"], "completed");
+
+        const auto events = records->list_events(run_id);
+        bool saw_ambiguous = false;
+        bool saw_reconciled = false;
+        for (const auto& event : events) {
+            if (event["event_type"] == "host_brokered.effect.ambiguous") saw_ambiguous = true;
+            if (event["event_type"] == "host_brokered.effect.reconciled") saw_reconciled = true;
+        }
+        EXPECT_TRUE(saw_ambiguous);
+        EXPECT_TRUE(saw_reconciled);
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST(HarnessServiceTest, AmbiguousHostEffectCanBeReconciledAsFailed) {
+    const auto root = unique_temp_path("neograph-harness-ambiguous-failed");
+    const auto database = root / "checkpoints.db";
+    const auto records_database = root / "runs.db";
+    std::filesystem::create_directories(root);
+    std::string run_id;
+    std::string call_id;
+    {
+        HarnessServiceConfig config;
+        config.checkpoint_store =
+            std::make_shared<neograph::graph::SqliteCheckpointStore>(database.string());
+        config.record_store =
+            std::make_shared<neograph::mcp::SqliteHarnessRecordStore>(records_database.string());
+        config.worker_executor = [](const HarnessWorkerCall&, const auto&) {
+            return HarnessWorkerResponse::awaiting_tool_results({
+                {"call_id", "host-call"},
+                {"tool_id", "host.lookup"},
+                {"result_schema", {{"type", "object"}}},
+                {"effect", {{"effect_id", "test:host-call"},
+                            {"idempotency_key", "test:host-call"},
+                            {"idempotency", "unsupported"}}},
+            });
+        };
+        HarnessService service(std::move(config));
+        auto compiled = service.compile(host_brokered_request());
+        ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+        auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+        run_id = started["run_id"].get<std::string>();
+        auto waiting = wait_terminal(service, run_id);
+        ASSERT_EQ(waiting["status"], "awaiting_tool_results");
+        call_id = waiting["pending"]["call_id"].get<std::string>();
+    }
+
+    {
+        HarnessServiceConfig config;
+        config.checkpoint_store =
+            std::make_shared<neograph::graph::SqliteCheckpointStore>(database.string());
+        config.record_store =
+            std::make_shared<neograph::mcp::SqliteHarnessRecordStore>(records_database.string());
+        HarnessService service(std::move(config));
+        ASSERT_EQ(service.get(run_id)["status"], "ambiguous_effect");
+        auto failed = service.resume(
+            {{"run_id", run_id}, {"call_id", call_id}, {"resolution", "failed"}});
+        EXPECT_TRUE(failed["accepted"].get<bool>());
+        EXPECT_EQ(failed["status"], "failed");
+        auto duplicate = service.resume(
+            {{"run_id", run_id}, {"call_id", call_id}, {"resolution", "failed"}});
+        EXPECT_TRUE(duplicate["duplicate"].get<bool>());
+        EXPECT_EQ(service.get(run_id)["status"], "failed");
+    }
+    std::filesystem::remove_all(root);
+}
 #endif
 
 TEST(HarnessServiceTest, BindingDiagnosticCarriesElaboratorSourceCoordinate) {
@@ -2468,6 +3418,39 @@ TEST(HarnessServiceTest, PreservesPartialWorkerOutcome) {
     EXPECT_EQ(finished["result"]["outcome"], "partial");
 }
 
+TEST(HarnessServiceTest, AggregatedFindingsRetainWorkerProvenance) {
+    HarnessServiceConfig config;
+    config.worker_executor = [](const HarnessWorkerCall& call, const auto&) {
+        return HarnessWorkerResponse::success({
+            {"status", "ok"},
+            {"findings",
+             json::array({{{"id", "F1"}, {"evidence", call.worker["id"]}},
+                          {{"id", "F2"}, {"evidence", call.worker["id"]}}})},
+        });
+    };
+    HarnessService service(std::move(config));
+    auto compiled = service.compile(request(json::array({worker("b"), worker("a")})));
+    ASSERT_TRUE(compiled["ok"].get<bool>()) << compiled.dump();
+    auto started = service.start({{"artifact_id", compiled["artifact_id"]}});
+    auto finished = wait_terminal(service, started["run_id"].get<std::string>());
+    ASSERT_EQ(finished["status"], "completed") << finished.dump();
+
+    ASSERT_EQ(finished["result"]["findings"].size(), 4u);
+    EXPECT_EQ(finished["result"]["findings"][0]["id"], "F1");
+    EXPECT_EQ(finished["result"]["findings"][2]["id"], "F1");
+    ASSERT_EQ(finished["result"]["finding_sources"].size(), 4u);
+    EXPECT_EQ(finished["result"]["finding_sources"][0],
+              json({{"finding_index", 0}, {"worker_id", "a"}, {"local_index", 0}}));
+    EXPECT_EQ(finished["result"]["finding_sources"][1],
+              json({{"finding_index", 1}, {"worker_id", "a"}, {"local_index", 1}}));
+    EXPECT_EQ(finished["result"]["finding_sources"][2],
+              json({{"finding_index", 2}, {"worker_id", "b"}, {"local_index", 0}}));
+    EXPECT_EQ(finished["result"]["finding_sources"][3],
+              json({{"finding_index", 3}, {"worker_id", "b"}, {"local_index", 1}}));
+    EXPECT_FALSE(finished["result"]["workers"][0]["output"]["findings"][0]
+                     .contains("worker_id"));
+}
+
 TEST(HarnessServiceTest, ReturnsCompactResultAndUriLinkedDetails) {
     HarnessServiceConfig config;
     config.worker_executor = [](const HarnessWorkerCall&, const auto&) {
@@ -2525,7 +3508,7 @@ TEST(HarnessServiceTest, DistinguishesEmptyResponseAndWorkerTimeout) {
         auto finished = wait_terminal(service, started["run_id"].get<std::string>());
         ASSERT_EQ(finished["status"], "completed") << finished.dump();
         EXPECT_EQ(finished["result"]["workers"][0]["failure_kind"], "timeout");
-        EXPECT_EQ(finished["result"]["workers"][0]["attempts"], 1);
+        EXPECT_EQ(finished["result"]["workers"][0]["attempts"], 2);
     }
 }
 

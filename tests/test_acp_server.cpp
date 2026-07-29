@@ -13,6 +13,7 @@
 #include <neograph/acp/server.h>
 #include <neograph/acp/types.h>
 #include <neograph/graph/engine.h>
+#include <neograph/graph/cancel.h>
 #include <neograph/graph/node.h>
 
 #include <chrono>
@@ -67,6 +68,218 @@ class EchoNode : public GraphNode {
     std::string name_;
 };
 
+struct CancelProbe {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> completed{false};
+};
+
+class CancelAwareNode : public GraphNode {
+  public:
+    CancelAwareNode(std::string n, std::shared_ptr<CancelProbe> probe)
+        : name_(std::move(n)), probe_(std::move(probe)) {}
+    asio::awaitable<NodeOutput> run(NodeInput in) override {
+        probe_->entered.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds(1);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (in.ctx.cancel_token && in.ctx.cancel_token->is_cancelled()) {
+                throw neograph::graph::CancelledException();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        probe_->completed.store(true, std::memory_order_release);
+        co_return NodeOutput{};
+    }
+    std::string get_name() const override { return name_; }
+  private:
+    std::string name_;
+    std::shared_ptr<CancelProbe> probe_;
+};
+
+struct DependencyProbe {
+    std::atomic<bool> provider_started{false};
+    std::atomic<bool> provider_release{false};
+    std::atomic<bool> provider_cancelled{false};
+    std::atomic<bool> tool_started{false};
+    std::atomic<bool> tool_cancelled{false};
+    std::shared_ptr<neograph::graph::CancelToken> token;
+};
+
+class CancellableProvider final : public neograph::Provider {
+  public:
+    explicit CancellableProvider(std::shared_ptr<DependencyProbe> probe)
+        : probe_(std::move(probe)) {}
+    asio::awaitable<neograph::ChatCompletion> complete_async(
+        const neograph::CompletionParams& params) override {
+        probe_->provider_started.store(true, std::memory_order_release);
+        while (true) {
+            if (probe_->provider_release.load(std::memory_order_acquire)) {
+                co_return neograph::ChatCompletion{};
+            }
+            if (params.cancel_token && params.cancel_token->is_cancelled()) {
+                probe_->provider_cancelled.store(true, std::memory_order_release);
+                throw neograph::graph::CancelledException();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    neograph::ChatCompletion complete(const neograph::CompletionParams&) override {
+        throw std::runtime_error("sync provider path not expected");
+    }
+    std::string get_name() const override { return "cancellable"; }
+  private:
+    std::shared_ptr<DependencyProbe> probe_;
+};
+
+class CancellableTool final : public neograph::AsyncTool {
+  public:
+    explicit CancellableTool(std::shared_ptr<DependencyProbe> probe)
+        : probe_(std::move(probe)) {}
+    neograph::ChatTool get_definition() const override {
+        return {"mock_tool", "mock", neograph::json::object()};
+    }
+    std::string get_name() const override { return "mock_tool"; }
+    asio::awaitable<std::string> execute_async(const neograph::json&) override {
+        probe_->tool_started.store(true, std::memory_order_release);
+        while (true) {
+            if (probe_->token && probe_->token->is_cancelled()) {
+                probe_->tool_cancelled.store(true, std::memory_order_release);
+                throw neograph::graph::CancelledException();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+  private:
+    std::shared_ptr<DependencyProbe> probe_;
+};
+
+class DependencyNode final : public GraphNode {
+  public:
+    DependencyNode(std::string name, std::shared_ptr<neograph::Provider> provider,
+                   std::shared_ptr<CancellableTool> tool,
+                   std::shared_ptr<DependencyProbe> probe)
+        : name_(std::move(name)), provider_(std::move(provider)),
+          tool_(std::move(tool)), probe_(std::move(probe)) {}
+    asio::awaitable<NodeOutput> run(NodeInput in) override {
+        probe_->token = in.ctx.cancel_token;
+        neograph::CompletionParams params;
+        params.model = "mock";
+        params.cancel_token = in.ctx.cancel_token;
+        (void)co_await provider_->complete_async(params);
+        (void)co_await tool_->execute_async({});
+        co_return NodeOutput{};
+    }
+    std::string get_name() const override { return name_; }
+  private:
+    std::string name_;
+    std::shared_ptr<neograph::Provider> provider_;
+    std::shared_ptr<CancellableTool> tool_;
+    std::shared_ptr<DependencyProbe> probe_;
+};
+
+std::shared_ptr<GraphEngine> build_dependency_engine(
+    const std::shared_ptr<neograph::Provider>& provider,
+    const std::shared_ptr<CancellableTool>& tool,
+    const std::shared_ptr<DependencyProbe>& probe) {
+    NodeFactory::instance().register_type("acp_dependency",
+        [provider, tool, probe](const std::string& name, const neograph::json&, const NodeContext&) {
+            return std::make_unique<DependencyNode>(name, provider, tool, probe);
+        });
+    neograph::json def = {
+        {"name", "acp-dependency"},
+        {"channels", {{"prompt", {{"reducer", "overwrite"}}}}},
+        {"nodes", {{"worker", {{"type", "acp_dependency"}}}}},
+        {"edges", neograph::json::array({
+            neograph::json{{"from", "__start__"}, {"to", "worker"}},
+            neograph::json{{"from", "worker"}, {"to", "__end__"}},
+        })},
+    };
+    return std::shared_ptr<GraphEngine>(GraphEngine::compile(def, NodeContext{}));
+}
+
+struct ToolDispatchProbe {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> cancelled{false};
+};
+
+class CancellableToolDispatchTool final : public Tool,
+                                          public ContextualAsyncTool {
+  public:
+    explicit CancellableToolDispatchTool(std::shared_ptr<ToolDispatchProbe> probe)
+        : probe_(std::move(probe)) {}
+
+    ChatTool get_definition() const override {
+        return {"cancel_tool", "waits for cancellation", neograph::json::object()};
+    }
+
+    std::string execute(const neograph::json&) override {
+        throw std::logic_error("context-aware tool overload was not used");
+    }
+
+    asio::awaitable<std::string> execute_async(
+        const neograph::json&, ToolExecutionContext execution) override {
+        if (!execution.cancel_token) {
+            throw std::logic_error("missing tool cancellation token");
+        }
+        probe_->entered.store(true, std::memory_order_release);
+        while (!execution.cancel_token->is_cancelled()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        probe_->cancelled.store(true, std::memory_order_release);
+        throw neograph::graph::CancelledException("tool observed cancellation");
+        co_return "";
+    }
+
+    std::string get_name() const override { return "cancel_tool"; }
+
+  private:
+    std::shared_ptr<ToolDispatchProbe> probe_;
+};
+
+class ToolCallSeedNode final : public GraphNode {
+  public:
+    asio::awaitable<NodeOutput> run(NodeInput) override {
+        neograph::json assistant = {
+            {"role", "assistant"},
+            {"content", ""},
+            {"tool_calls", neograph::json::array({{
+                {"id", "cancel-tool-call"},
+                {"name", "cancel_tool"},
+                {"arguments", "{}"},
+            }})},
+        };
+        NodeOutput out;
+        out.writes.push_back(ChannelWrite{"messages", neograph::json::array({assistant})});
+        co_return out;
+    }
+
+    std::string get_name() const override { return "seed"; }
+};
+
+std::shared_ptr<GraphEngine> build_tool_dispatch_engine(Tool* tool) {
+    NodeFactory::instance().register_type("acp_tool_call_seed",
+        [](const std::string&, const neograph::json&, const NodeContext&) {
+            return std::make_unique<ToolCallSeedNode>();
+        });
+    neograph::json def = {
+        {"name", "acp-tool-dispatch"},
+        {"channels", {{"messages", {{"reducer", "append"}}}}},
+        {"nodes", {
+            {"seed", {{"type", "acp_tool_call_seed"}}},
+            {"tools", {{"type", "tool_dispatch"}}},
+        }},
+        {"edges", neograph::json::array({
+            neograph::json{{"from", "__start__"}, {"to", "seed"}},
+            neograph::json{{"from", "seed"}, {"to", "tools"}},
+            neograph::json{{"from", "tools"}, {"to", "__end__"}},
+        })},
+    };
+    NodeContext ctx;
+    ctx.tools = {tool};
+    auto unique = GraphEngine::compile(def, ctx);
+    return std::shared_ptr<GraphEngine>(std::move(unique));
+}
+
 std::shared_ptr<GraphEngine> build_echo_engine() {
     NodeFactory::instance().register_type("acp_echo",
         [](const std::string& n, const neograph::json&, const NodeContext&) {
@@ -89,6 +302,24 @@ std::shared_ptr<GraphEngine> build_echo_engine() {
     NodeContext ctx;
     auto unique = GraphEngine::compile(def, ctx);
     return std::shared_ptr<GraphEngine>(std::move(unique));
+}
+
+std::shared_ptr<GraphEngine> build_cancel_aware_engine(
+    const std::shared_ptr<CancelProbe>& probe) {
+    NodeFactory::instance().register_type("acp_cancel_probe",
+        [probe](const std::string& n, const neograph::json&, const NodeContext&) {
+            return std::make_unique<CancelAwareNode>(n, probe);
+        });
+    neograph::json def = {
+        {"name", "acp-cancel"},
+        {"channels", {{"prompt", {{"reducer", "overwrite"}}}}},
+        {"nodes", {{"worker", {{"type", "acp_cancel_probe"}}}}},
+        {"edges", neograph::json::array({
+            neograph::json{{"from", "__start__"}, {"to", "worker"}},
+            neograph::json{{"from", "worker"}, {"to", "__end__"}},
+        })},
+    };
+    return std::shared_ptr<GraphEngine>(GraphEngine::compile(def, NodeContext{}));
 }
 
 class InterruptNode : public GraphNode {
@@ -690,6 +921,239 @@ TEST(ACPServer, CancelBeforeFinalReturnsCancelled) {
     EXPECT_EQ(resp["result"].value("stopReason", std::string()), "cancelled");
 }
 
+TEST(ACPServer, CancelAbortsInflightPrompt) {
+    auto probe = std::make_shared<CancelProbe>();
+    ACPServer server(build_cancel_aware_engine(probe),
+                     {{"name", "test-acp"}, {"version", "0.0.1"}});
+    CapturingSink cap;
+    server.set_notification_sink(cap.as_sink());
+    const std::string sid = "acp-cancel-inflight";
+    server.handle_message(make_request(1, "session/prompt",
+        {{"sessionId", sid}, {"prompt", neograph::json::array({
+            neograph::json{{"type", "text"}, {"text", "cancel"}}})}}));
+    for (int i = 0; i < 200 && !probe->entered.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(probe->entered.load(std::memory_order_acquire));
+    neograph::json cancel = {{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                              {"params", {{"sessionId", sid}}}};
+    server.handle_message(cancel);
+    server.handle_message(cancel);
+    auto response = cap.wait_for_response(1, std::chrono::milliseconds(500));
+    ASSERT_TRUE(response.contains("result")) << response.dump();
+    EXPECT_EQ(response["result"].value("stopReason", std::string()), "cancelled");
+    EXPECT_FALSE(probe->completed.load(std::memory_order_acquire));
+    int response_count = 0;
+    for (const auto& env : cap.envs) {
+        if (env.value("id", 0) == 1 && env.contains("result")) ++response_count;
+    }
+    EXPECT_EQ(response_count, 1);
+}
+
+TEST(ACPServer, CancelReachesProviderAndToolFixtures) {
+    auto probe = std::make_shared<DependencyProbe>();
+    auto provider = std::make_shared<CancellableProvider>(probe);
+    auto tool = std::make_shared<CancellableTool>(probe);
+    ACPServer server(build_dependency_engine(provider, tool, probe),
+                     {{"name", "test-acp"}, {"version", "0.0.1"}});
+    CapturingSink cap;
+    server.set_notification_sink(cap.as_sink());
+    const std::string sid = "acp-dependency-cancel";
+    server.handle_message(make_request(1, "session/prompt",
+        {{"sessionId", sid}, {"prompt", neograph::json::array({
+            neograph::json{{"type", "text"}, {"text", "provider"}}})}}));
+    for (int i = 0; i < 200 && !probe->provider_started.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(probe->provider_started.load());
+    server.handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                           {"params", {{"sessionId", sid}}}});
+    auto canceled_provider = cap.wait_for_response(1);
+    ASSERT_TRUE(canceled_provider.contains("result"));
+    EXPECT_EQ(canceled_provider["result"].value("stopReason", std::string()),
+              "cancelled");
+    EXPECT_TRUE(probe->provider_cancelled.load());
+
+    probe->provider_release.store(true, std::memory_order_release);
+    const std::string tool_sid = "acp-tool-cancel";
+    server.handle_message(make_request(2, "session/prompt",
+        {{"sessionId", tool_sid}, {"prompt", neograph::json::array({
+            neograph::json{{"type", "text"}, {"text", "tool"}}})}}));
+    for (int i = 0; i < 200 && !probe->tool_started.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(probe->tool_started.load());
+    server.handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                           {"params", {{"sessionId", tool_sid}}}});
+    auto canceled_tool = cap.wait_for_response(2);
+    ASSERT_TRUE(canceled_tool.contains("result"));
+    EXPECT_EQ(canceled_tool["result"].value("stopReason", std::string()),
+              "cancelled");
+    EXPECT_TRUE(probe->tool_cancelled.load());
+}
+
+TEST(ACPServer, CancelReachesToolDispatchAndEmitsOneTerminalResponse) {
+    auto probe = std::make_shared<ToolDispatchProbe>();
+    auto tool = std::make_shared<CancellableToolDispatchTool>(probe);
+    CapturingSink cap;
+    ACPServer server(build_tool_dispatch_engine(tool.get()),
+                     {{"name", "test-acp"}, {"version", "0.0.1"}});
+    server.set_notification_sink(cap.as_sink());
+    const std::string sid = "acp-tool-dispatch-cancel";
+    server.handle_message(make_request(1, "session/prompt",
+        {{"sessionId", sid}, {"prompt", neograph::json::array({
+            neograph::json{{"type", "text"}, {"text", "tool"}}})}}));
+
+    for (int i = 0; i < 200 && !probe->entered.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(probe->entered.load(std::memory_order_acquire));
+    server.handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                           {"params", {{"sessionId", sid}}}});
+    server.handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                           {"params", {{"sessionId", sid}}}});
+
+    auto response = cap.wait_for_response(1, std::chrono::milliseconds(500));
+    ASSERT_TRUE(response.contains("result")) << response.dump();
+    EXPECT_EQ(response["result"].value("stopReason", std::string()), "cancelled");
+    EXPECT_TRUE(probe->cancelled.load(std::memory_order_acquire));
+    EXPECT_TRUE(cap.notifications_for("session/update").empty());
+
+    int responses = 0;
+    {
+        std::lock_guard lk(cap.mu);
+        for (const auto& env : cap.envs) {
+            if (!env.contains("method") && env.value("id", 0) == 1
+                && env.contains("result")) {
+                ++responses;
+            }
+        }
+    }
+    EXPECT_EQ(responses, 1);
+}
+
+TEST(ACPServer, CancelDuringFinalUpdateWinsTerminalResponse) {
+    CapturingSink cap;
+    auto server = make_server();
+    auto cap_sink = cap.as_sink();
+    std::promise<void> update_entered;
+    auto update_ready = update_entered.get_future();
+    std::promise<void> release_update;
+    auto release = release_update.get_future().share();
+    std::atomic<bool> blocked{false};
+    server.set_notification_sink([&](const neograph::json& env) {
+        if (env.value("method", std::string()) == "session/update" &&
+            !blocked.exchange(true, std::memory_order_acq_rel)) {
+            update_entered.set_value();
+            release.wait();
+        }
+        cap_sink(env);
+    });
+
+    const std::string sid = "acp-cancel-during-final-update";
+    server.handle_message(make_request(1, "session/prompt",
+        {{"sessionId", sid}, {"prompt", neograph::json::array({
+            neograph::json{{"type", "text"}, {"text", "done"}}})}}));
+    ASSERT_EQ(update_ready.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+
+    server.handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                           {"params", {{"sessionId", sid}}}});
+    release_update.set_value();
+
+    auto response = cap.wait_for_response(1, std::chrono::seconds(1));
+    ASSERT_TRUE(response.contains("result")) << response.dump();
+    EXPECT_EQ(response["result"].value("stopReason", std::string()), "cancelled");
+    EXPECT_EQ(cap.notifications_for("session/update").size(), 1u);
+
+    std::lock_guard lock(cap.mu);
+    int responses = 0;
+    for (const auto& env : cap.envs) {
+        if (!env.contains("method") && env.value("id", 0) == 1 &&
+            env.contains("result")) {
+            ++responses;
+        }
+    }
+    EXPECT_EQ(responses, 1);
+}
+
+TEST(ACPServer, CancelAfterTerminalCommitCannotReachLaterPrompt) {
+    CapturingSink cap;
+    auto server = make_server();
+    auto cap_sink = cap.as_sink();
+    std::promise<void> response_entered;
+    auto response_ready = response_entered.get_future();
+    std::promise<void> release_response;
+    auto release = release_response.get_future().share();
+    std::atomic<bool> blocked{false};
+    server.set_notification_sink([&](const neograph::json& env) {
+        if (!env.contains("method") && env.value("id", 0) == 1 &&
+            env.contains("result") &&
+            !blocked.exchange(true, std::memory_order_acq_rel)) {
+            response_entered.set_value();
+            release.wait();
+        }
+        cap_sink(env);
+    });
+
+    const std::string sid = "acp-cancel-after-terminal-commit";
+    auto prompt = [](const char* text) {
+        return neograph::json::array({
+            neograph::json{{"type", "text"}, {"text", text}}});
+    };
+    server.handle_message(make_request(1, "session/prompt",
+        {{"sessionId", sid}, {"prompt", prompt("first")}}));
+    ASSERT_EQ(response_ready.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+
+    // The first response has committed its terminal state but is still blocked
+    // in the sink. With no newer prompt active, this cancel is stale rather
+    // than a pre-cancel for a later turn.
+    server.handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                           {"params", {{"sessionId", sid}}}});
+    release_response.set_value();
+
+    auto first = cap.wait_for_response(1, std::chrono::seconds(1));
+    ASSERT_TRUE(first.contains("result")) << first.dump();
+    EXPECT_EQ(first["result"].value("stopReason", std::string()), "end_turn");
+
+    server.handle_message(make_request(2, "session/prompt",
+        {{"sessionId", sid}, {"prompt", prompt("second")}}));
+    auto second = cap.wait_for_response(2, std::chrono::seconds(1));
+    ASSERT_TRUE(second.contains("result")) << second.dump();
+    EXPECT_EQ(second["result"].value("stopReason", std::string()), "end_turn");
+}
+
+TEST(ACPServer, CancelAndDestructorDrainWithoutDuplicateResponse) {
+    auto probe = std::make_shared<CancelProbe>();
+    CapturingSink cap;
+    {
+        auto server = std::make_unique<ACPServer>(
+            build_cancel_aware_engine(probe),
+            neograph::json{{"name", "test-acp"}, {"version", "0.0.1"}});
+        server->set_notification_sink(cap.as_sink());
+        const std::string sid = "acp-dtor-cancel";
+        server->handle_message(make_request(7, "session/prompt",
+            {{"sessionId", sid}, {"prompt", neograph::json::array({
+                neograph::json{{"type", "text"}, {"text", "dtor"}}})}}));
+        for (int i = 0; i < 200 && !probe->entered.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ASSERT_TRUE(probe->entered.load());
+        server->handle_message({{"jsonrpc", "2.0"}, {"method", "session/cancel"},
+                                {"params", {{"sessionId", sid}}}});
+        auto response = cap.wait_for_response(7, std::chrono::milliseconds(500));
+        ASSERT_TRUE(response.contains("result")) << response.dump();
+        EXPECT_EQ(response["result"].value("stopReason", std::string()), "cancelled");
+    }
+    int responses = 0;
+    for (const auto& env : cap.envs) {
+        if (env.value("id", 0) == 7 && env.contains("result")) ++responses;
+    }
+    EXPECT_EQ(responses, 1);
+    EXPECT_FALSE(probe->completed.load());
+}
+
 TEST(ACPServer, UnknownMethodReturnsMethodNotFound) {
     auto server = make_server();
     auto resp = server.handle_message(make_request(1, "session/load",
@@ -908,23 +1372,26 @@ TEST(ACPServer, NodeCallsBackToEditorViaFsRead) {
     neograph::json info = {{"name", "acp-bidir"}, {"version", "0.0.1"}};
     auto server = std::make_shared<ACPServer>(engine, info);
     server->attach_client(client);
+    auto weak_server = std::weak_ptr<ACPServer>(server);
 
     // Stub editor. The sink does double duty: capture envelopes for
     // assertions AND respond to outbound fs/read_text_file requests by
     // feeding a synthetic response back through handle_message.
     CapturingSink cap;
     auto cap_sink = cap.as_sink();
-    server->set_notification_sink([&, cap_sink, server](const neograph::json& env) {
+    server->set_notification_sink([&, cap_sink, weak_server](const neograph::json& env) {
         cap_sink(env);
         if (env.value("method", std::string()) == "fs/read_text_file"
             && env.contains("id")) {
             auto reply_id = env["id"];
-            std::thread([server, reply_id]() {
+            std::thread([weak_server, reply_id]() {
                 neograph::json reply;
                 reply["jsonrpc"] = "2.0";
                 reply["id"]      = reply_id;
                 reply["result"]  = {{"content", "void main(){}\n"}};
-                server->handle_message(reply);
+                if (auto server = weak_server.lock()) {
+                    server->handle_message(reply);
+                }
             }).detach();
         }
     });
@@ -1039,20 +1506,23 @@ make_gated_server(std::shared_ptr<ACPClient> client,
     neograph::json info = {{"name", "acp-gate"}, {"version", "0.0.1"}};
     auto server = std::make_shared<ACPServer>(engine, info);
     server->attach_client(client);
+    auto weak_server = std::weak_ptr<ACPServer>(server);
 
     auto cap_sink = cap.as_sink();
-    server->set_notification_sink([cap_sink, server, reply_for](const neograph::json& env) {
+    server->set_notification_sink([cap_sink, weak_server, reply_for](const neograph::json& env) {
         cap_sink(env);
         if (env.value("method", std::string()) == "session/request_permission"
             && env.contains("id")) {
             auto reply_id = env["id"];
             auto outcome  = reply_for(env);
-            std::thread([server, reply_id, outcome]() {
+            std::thread([weak_server, reply_id, outcome]() {
                 neograph::json reply;
                 reply["jsonrpc"] = "2.0";
                 reply["id"]      = reply_id;
                 reply["result"]  = outcome;
-                server->handle_message(reply);
+                if (auto server = weak_server.lock()) {
+                    server->handle_message(reply);
+                }
             }).detach();
         }
     });
@@ -1201,11 +1671,12 @@ TEST(ACPServer, FsWriteTextFileRoundTrip) {
     neograph::json info = {{"name", "acp-write-test"}, {"version", "0.0.1"}};
     auto server = std::make_shared<ACPServer>(engine, info);
     server->attach_client(client);
+    auto weak_server = std::weak_ptr<ACPServer>(server);
 
     CapturingSink cap;
     auto cap_sink = cap.as_sink();
     std::string seen_path, seen_body;
-    server->set_notification_sink([&, cap_sink, server](const neograph::json& env) {
+    server->set_notification_sink([&, cap_sink, weak_server](const neograph::json& env) {
         cap_sink(env);
         if (env.value("method", std::string()) == "fs/write_text_file"
             && env.contains("id")) {
@@ -1214,12 +1685,14 @@ TEST(ACPServer, FsWriteTextFileRoundTrip) {
             seen_path = p.value("path", std::string());
             seen_body = p.value("content", std::string());
             auto reply_id = env["id"];
-            std::thread([server, reply_id]() {
+            std::thread([weak_server, reply_id]() {
                 neograph::json reply;
                 reply["jsonrpc"] = "2.0";
                 reply["id"]      = reply_id;
                 reply["result"]  = neograph::json::object();
-                server->handle_message(reply);
+                if (auto server = weak_server.lock()) {
+                    server->handle_message(reply);
+                }
             }).detach();
         }
     });

@@ -1,5 +1,7 @@
 # NeoGraph core concepts — a narrative guide
 
+**Languages:** [English](concepts.md) | [한국어](concepts.ko.md) | [日本語](concepts.ja.md) | [简体中文](concepts.zh-CN.md)
+
 Read this once before diving into the examples. It builds up the
 mental model in the order you'd construct one yourself: graph →
 channels → nodes → edges → fan-out → routing override →
@@ -13,7 +15,7 @@ generated reference).
 > **If you've used LangGraph before:** the primitives are intentionally
 > the same — channels with reducers, nodes that emit writes, conditional
 > edges, `Send`, `Command`, checkpoints. The differences are described in
-> [Comparison with LangGraph](../README.md#comparison-with-langgraph) on
+> [Comparison with LangGraph](../README.md#vs-langgraph) on
 > the README. The narrative below assumes nothing.
 
 ---
@@ -120,9 +122,9 @@ The shape of the value must match the reducer:
 ### Reading state from a node
 
 ```python
-def execute(self, state):
-    msgs    = state.get("messages") or []     # list of message dicts
-    counter = state.get("counter") or 0
+def run(self, input):
+    msgs    = input.state.get("messages") or []  # list of message dicts
+    counter = input.state.get("counter") or 0
     ...
 ```
 
@@ -170,8 +172,9 @@ subclass `GraphNode`.
 
 ### 3.3 The full `GraphNode` subclass
 
-Override `run(input)` for full control. As of v0.4.0 this is the
-canonical entry point — one method, one signature:
+Override `run(input)` for full control. It was introduced in v0.4.0 and is
+the only custom-node entry point from v0.9.0 onward — one method, one
+signature:
 
 ```python
 class Researcher(ng.GraphNode):
@@ -196,21 +199,17 @@ class Researcher(ng.GraphNode):
 ```
 
 Python exposes `cancel_token`, `thread_id`, `step`, `stream_mode`, `store`,
-and `resume_value` on `input.ctx`. The C++ `deadline` and `trace_id` slots are
-reserved for future `RunConfig` fields; the engine does not populate them and
-Python does not expose them yet.
+and `resume_value` on `input.ctx`. C++ callers may set `deadline` and
+`trace_id` on `RunMetadata`; the engine propagates them through nested subgraphs.
+Those two fields are not exposed by the Python binding yet.
 
 You can also return a bare `list[ChannelWrite]` when you don't need
 `Send` or `Command` — the binding lifts it into a `NodeResult`
 automatically.
 
-> **Migrating from v0.3.x:** the 8-virtual chain (`execute`,
-> `execute_async`, `execute_full`, `execute_full_async`,
-> `execute_stream`, `execute_stream_async`, `execute_full_stream`,
-> `execute_full_stream_async`) still compiles in v0.4.x but is
-> `[[deprecated]]` and removed in v1.0.0. Replace with a single
-> `run(input)` override; read state from `input.state`, emit tokens
-> via `input.stream_cb` when non-None, read the cancel token from
+> **Migrating from v0.3.x:** the removed pre-v0.4 multi-entry node API has one
+> replacement: override `run(input)`. Read state from `input.state`, emit tokens
+> through `input.stream_cb` when non-None, and read the cancel token from
 > `input.ctx.cancel_token`.
 
 Register the type so the JSON loader can instantiate it:
@@ -330,8 +329,8 @@ researcher invocations.
 
 ```python
 class Planner(ng.GraphNode):
-    def execute_full(self, state):
-        topics = decide_topics(state)                  # e.g. 5 strings
+    def run(self, input):
+        topics = decide_topics(input.state)            # e.g. 5 strings
         return ng.NodeResult(
             writes=[],
             sends=[ng.Send("researcher", {"topic": t}) for t in topics],
@@ -397,8 +396,8 @@ same return value. It bypasses the regular outgoing edges.
 
 ```python
 class Evaluator(ng.GraphNode):
-    def execute_full(self, state):
-        if score(state) >= 0.8:
+    def run(self, input):
+        if score(input.state) >= 0.8:
             return ng.NodeResult(
                 writes=[],
                 command=ng.Command(
@@ -411,7 +410,7 @@ class Evaluator(ng.GraphNode):
                 writes=[],
                 command=ng.Command(
                     goto_node="planner",                  # loop back
-                    updates=[ng.ChannelWrite("retries",  state.get("retries", 0) + 1)],
+                    updates=[ng.ChannelWrite("retries",  input.state.get("retries", 0) + 1)],
                 ),
             )
 ```
@@ -683,8 +682,11 @@ older wheels, only form B works.
 
 Routing fell through to `__end__`. Most likely a missing edge from
 your start node, or your conditional returned a value not in the
-`routes` map (in which case the engine takes the
-lexicographically-last route as a fallback — surprise factor).
+`routes` map and an explicit `"default"` route points to `__end__`.
+Strict graphs no longer choose a route by map ordering: an open or
+unspecified condition uses `"default"` when declared, otherwise the
+engine throws with the source node, condition, and returned label. A
+closed condition always throws if it returns outside its declared labels.
 
 ---
 

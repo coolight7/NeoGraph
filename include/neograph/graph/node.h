@@ -17,8 +17,7 @@
  *
  * The engine threads `RunContext` through `NodeInput::ctx`. Nodes can use
  * cancellation, usage accounting, thread/step/stream metadata, Store access,
- * and resume values. The deadline and trace-id fields are reserved extension
- * slots and are not populated by current `RunConfig` APIs.
+ * resume values, and C++ RunMetadata deadline/trace metadata.
  *
  * Example overrides that match the v0.4.x surface:
  *   - `examples/01_react_agent.cpp` — basic ReAct agent
@@ -55,8 +54,8 @@ struct NodeInput {
     GraphState& state;
 
     /// Per-run metadata threaded by the engine — cancel token, usage,
-    /// thread_id, current super-step, stream mode, Store, and resume value.
-    /// Deadline and trace-id members are reserved and currently unpopulated.
+    /// thread_id, current super-step, stream mode, Store, resume value, and
+    /// any deadline/trace metadata supplied through C++ RunMetadata.
     const RunContext& ctx;
 
     /// Streaming sink. ``nullptr`` for non-streaming runs (the engine
@@ -140,6 +139,48 @@ public:
      * @return Node name string.
      */
     virtual std::string get_name() const = 0;
+};
+
+/**
+ * @brief Adapter for CPU-light synchronous custom nodes.
+ *
+ * Subclasses implement only `run_sync(NodeInput) -> NodeOutput`; this adapter
+ * lifts that result into the one canonical `GraphNode::run` coroutine exactly
+ * once. `NodeInput` is forwarded unchanged, so state, RunContext, and the
+ * optional stream sink remain available. The returned `NodeOutput` preserves
+ * channel-write modes, Command, and Send values without reconstruction.
+ *
+ * `run_sync` executes inline on the graph's current executor. It is intended
+ * for short computations and state transformations. Do not perform blocking
+ * network/file I/O, sleeps, or other waits here: those stall the graph loop.
+ * Derive directly from `GraphNode` and `co_await` an asynchronous dependency
+ * for such work.
+ *
+ * @code
+ * class NormalizeNode : public SyncGraphNode {
+ * public:
+ *     NormalizeNode() : SyncGraphNode("normalize") {}
+ * protected:
+ *     NodeOutput run_sync(NodeInput in) override {
+ *         return NodeOutput{{ChannelWrite{
+ *             "text", normalize(in.state.get("text").get<std::string>())}}};
+ *     }
+ * };
+ * @endcode
+ */
+class NEOGRAPH_API SyncGraphNode : public GraphNode {
+public:
+    explicit SyncGraphNode(std::string name);
+    ~SyncGraphNode() override;
+
+    asio::awaitable<NodeOutput> run(NodeInput in) final;
+    std::string                 get_name() const final;
+
+protected:
+    virtual NodeOutput run_sync(NodeInput in) = 0;
+
+private:
+    std::string name_;
 };
 
 /**
@@ -260,8 +301,23 @@ private:
 /**
  * @brief Node that runs a compiled GraphEngine as a single node (hierarchical composition).
  *
- * Enables the Supervisor pattern and nested workflows. Channels are
- * mapped between parent and child graphs via input_map and output_map.
+ * Enables the Supervisor pattern and nested workflows. Input mappings seed the
+ * child from the parent's current channel values. Output mappings forward only
+ * child-produced ChannelWrite deltas, in execution order and with Mode intact;
+ * they never feed the child's final state snapshot through the parent reducer.
+ * An explicit child Mode::Overwrite is the snapshot-replacement operation.
+ *
+ * Runtime context is deliberately derived at the engine boundary rather than
+ * stored in additional public RunContext fields: cancellation reaches a child
+ * through a descendant operation token; usage, deadline, trace ID, and stream
+ * mode are inherited; and a non-empty child thread ID is a deterministic
+ * derivative of the parent invocation. An unscoped parent (empty thread ID)
+ * leaves the child unscoped, preserving the checkpoint coordinator's disabled
+ * behavior. A parent Store or checkpoint backend takes precedence when present,
+ * otherwise the child engine keeps its own configured resource.
+ * Parent ToolGate policy runs before the child's policy, so a child can narrow
+ * access but cannot bypass a parent deny or interrupt. A resumed parent resumes
+ * a child only when that child's derived checkpoint identity exists.
  *
  * @code
  * // Map parent "messages" -> child "messages", child "result" -> parent "findings"
@@ -277,7 +333,8 @@ public:
      * @param name Unique node name within the parent graph.
      * @param subgraph Compiled GraphEngine to run as a sub-workflow.
      * @param input_map Mapping of parent_channel -> child_channel for input.
-     * @param output_map Mapping of child_channel -> parent_channel for output.
+     * @param output_map Mapping of child_channel -> parent_channel for ordered
+     *                   child write deltas. Empty means identity mapping.
      */
     SubgraphNode(const std::string&                 name,
                  std::shared_ptr<GraphEngine>       subgraph,
@@ -300,7 +357,8 @@ private:
     std::map<std::string, std::string> output_map_;
 
     json                      build_subgraph_input(const GraphState& state) const;
-    std::vector<ChannelWrite> extract_output(const json& subgraph_output) const;
+    std::vector<ChannelWrite> map_output_writes(
+        const std::vector<ChannelWrite>& child_writes) const;
 };
 
 }  // namespace neograph::graph

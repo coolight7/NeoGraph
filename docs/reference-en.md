@@ -1,5 +1,7 @@
 # NeoGraph API — Narrative Tour
 
+**Languages:** [English](reference-en.md) | [한국어](reference-ko.md) | [日本語](reference-ja.md) | [简体中文](reference-zh-CN.md)
+
 This document is a **guided narrative tour** of NeoGraph's public API,
 not a complete reference. It walks through the modules in the order
 you'll meet them when building a real agent: foundation types →
@@ -27,14 +29,14 @@ shape map onto `include/neograph/`.
 
 | Module | Namespace | Description | Tour | Doxygen |
 |--------|-----------|-------------|------|---------|
-| Core | `neograph` | Foundation types, Provider and Tool interfaces | [§1–§3](#1-foundation-types) | [link](https://fox1245.github.io/NeoGraph/namespaceneograph.html) |
-| Graph | `neograph::graph` | Graph engine, nodes, state, checkpointing, store | [§4–§11](#4-graph-types) | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1graph.html) |
-| LLM | `neograph::llm` | LLM provider implementations and Agent | [§12](#12-llm-module) | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1llm.html) |
-| MCP | `neograph::mcp` | Model Context Protocol client | [§13](#13-mcp-module) | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1mcp.html) |
-| Util | `neograph::util` | Concurrency utilities | [§14](#14-util-module) | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1util.html) |
-| **A2A** | `neograph::a2a` | Agent-to-Agent JSON-RPC bridge (client + server + streaming) | _Doxygen-only_ | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1a2a.html) |
-| **ACP** | `neograph::acp` | Agent Client Protocol — editor↔agent bidirectional RPC over stdio | _Doxygen-only_ | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1acp.html) |
-| **Async** | `neograph::async` | Asio HTTP/SSE/WS helpers, ConnPool, run_sync | _Doxygen-only_ | [link](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1async.html) |
+| Core | `neograph` | Foundation types, Provider and Tool interfaces | [§1–§3](#1-foundation-types) | [Provider](https://fox1245.github.io/NeoGraph/classneograph_1_1Provider.html) |
+| Graph | `neograph::graph` | Graph engine, nodes, state, checkpointing, store | [§4–§11](#4-graph-types) | [GraphEngine](https://fox1245.github.io/NeoGraph/classneograph_1_1graph_1_1GraphEngine.html) |
+| LLM | `neograph::llm` | LLM provider implementations and Agent | [§12](#12-llm-module) | [Agent](https://fox1245.github.io/NeoGraph/classneograph_1_1llm_1_1Agent.html) |
+| MCP | `neograph::mcp` | Model Context Protocol client | [§13](#13-mcp-module) | [MCPClient](https://fox1245.github.io/NeoGraph/classneograph_1_1mcp_1_1MCPClient.html) |
+| Util | `neograph::util` | Concurrency utilities | [§14](#14-util-module) | [RequestQueue](https://fox1245.github.io/NeoGraph/classneograph_1_1util_1_1RequestQueue.html) |
+| **A2A** | `neograph::a2a` | Agent-to-Agent JSON-RPC bridge (client + server + streaming) | _Doxygen-only_ | [A2AClient](https://fox1245.github.io/NeoGraph/classneograph_1_1a2a_1_1A2AClient.html) |
+| **ACP** | `neograph::acp` | Agent Client Protocol — editor↔agent bidirectional RPC over stdio | _Doxygen-only_ | [ACPServer](https://fox1245.github.io/NeoGraph/classneograph_1_1acp_1_1ACPServer.html) |
+| **Async** | `neograph::async` | Asio HTTP/SSE/WS helpers, ConnPool, run_sync | _Doxygen-only_ | [WsClient](https://fox1245.github.io/NeoGraph/classneograph_1_1async_1_1WsClient.html) |
 
 The three "_Doxygen-only_" rows are net-new modules added across
 recent audit and protocol-bridge work. They have full headers under
@@ -93,7 +95,7 @@ before a hand-written tour is worth the maintenance.
   - [EngineConfig and EngineResources](#engineconfig-and-engineresources)
   - [RunConfig](#runconfig)
   - [RunResult](#runresult)
-  - [GraphEngine](#graphengine-1)
+  - [GraphEngine](#graphengine)
 - [7b. Engine Internals](#7b-engine-internals)
   - [GraphCompiler](#graphcompiler)
   - [Scheduler](#scheduler)
@@ -210,6 +212,7 @@ Result of a single LLM completion call.
 ```cpp
 struct ChatCompletion {
     ChatMessage message;   // The assistant's response message
+    std::string stop_reason = "unknown";
     struct Usage {
         int prompt_tokens = 0;      // Tokens in the prompt
         int completion_tokens = 0;  // Tokens in the completion
@@ -221,9 +224,14 @@ struct ChatCompletion {
 | Field | Type | Description |
 |-------|------|-------------|
 | `message` | `ChatMessage` | The assistant's response (may include tool calls) |
+| `stop_reason` | `std::string` | Normalized provider completion reason: `end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `content_filter`, `refusal`, or `unknown` |
 | `usage.prompt_tokens` | `int` | Number of tokens in the input prompt |
 | `usage.completion_tokens` | `int` | Number of tokens in the generated completion |
 | `usage.total_tokens` | `int` | Total tokens consumed (prompt + completion) |
+
+`stop_reason` was added to the public C++ struct. Recompile applications and
+shared-library consumers when upgrading to this release because the struct's
+binary layout changed.
 
 ### Helper Functions
 
@@ -915,8 +923,8 @@ class GraphNode {
 public:
     virtual ~GraphNode() = default;
 
-    // v0.4 unified dispatch entry. Override this in new code.
-    virtual asio::awaitable<NodeOutput> run(NodeInput in);
+    // The only custom-node dispatch entry.
+    virtual asio::awaitable<NodeOutput> run(NodeInput in) = 0;
 
     virtual std::string get_name() const = 0;
 };
@@ -979,14 +987,9 @@ public:
 };
 ```
 
-> **Legacy chain (removed in v1.0).** Pre-v0.4
-> code overrode one of `execute` / `execute_async` / `execute_full` /
-> `execute_full_async` / `execute_stream` / `execute_stream_async` /
-> `execute_full_stream` / `execute_full_stream_async`. Picking the
-> wrong one silently dropped `Command` / `Send`, froze the event loop,
-> or infinite-recursed — that's the seam `run()` collapses. The 8
-> legacy virtuals are no longer members of `GraphNode`; subclasses
-> migrating from an older release must implement `run(NodeInput)`.
+> **Migration note.** `GraphNode` has one node entry point:
+> `run(NodeInput)`. It preserves `Command` and `Send`, participates in async and
+> streaming execution, and is the override subclasses must implement.
 
 ### LLMCallNode
 
@@ -1009,10 +1012,8 @@ public:
 | `name` | Node name |
 | `ctx` | Node context providing the LLM provider, tools, model, and instructions |
 
-(LLMCallNode overrides `run(NodeInput)` directly as of v0.4.0
-(PR 9a / commit `d1070dc`) — legacy 8-virtual chain is no longer
-on its hot path. The same applies to `ToolDispatchNode`,
-`IntentClassifierNode`, and `SubgraphNode`.)
+(LLMCallNode, `ToolDispatchNode`, `IntentClassifierNode`, and `SubgraphNode`
+all implement the same `run(NodeInput)` contract.)
 
 ### ToolDispatchNode
 
@@ -1082,9 +1083,32 @@ public:
 | `name` | `std::string` | Node name in the parent graph |
 | `subgraph` | `std::shared_ptr<GraphEngine>` | The compiled child graph engine |
 | `input_map` | `std::map<std::string, std::string>` | `parent_channel -> child_channel` mapping. Read from parent, write to child input |
-| `output_map` | `std::map<std::string, std::string>` | `child_channel -> parent_channel` mapping. Read from child result, write to parent |
+| `output_map` | `std::map<std::string, std::string>` | `child_channel -> parent_channel` mapping. Rename and forward child-produced write deltas to the parent |
 
 If the maps are empty, channels are mapped by name (identity mapping).
+
+Input mapping copies the parent's current channel values into the child's input.
+Output mapping is deliberately different: it forwards the child's ordered
+`ChannelWrite` deltas, preserving each write's `Mode`, rather than treating the
+child's final serialized state as a new reducer input. Consequently inherited
+append/custom values are not applied twice. Output mapping does not infer
+snapshot replacement; a child must emit `ChannelWrite::Mode::Overwrite` when it
+intends to replace the mapped parent value.
+
+#### Runtime-context propagation
+
+`SubgraphNode` derives a child execution context at the engine boundary. It
+does not change the public `RunContext` layout.
+
+| Context value | Child semantics |
+|---------------|-----------------|
+| `cancel_token` | A descendant operation token is created, so parent cancellation reaches every child and grandchild. |
+| `usage`, `deadline`, `trace_id`, `stream_mode` | Inherited. `deadline` and `trace_id` originate from `RunMetadata`; a child cannot widen the parent's stream mode. |
+| `thread_id` | When the parent thread ID is non-empty, deterministically derived from it, the subgraph node name, super-step, and invocation identity. Sibling `Send` invocations therefore receive distinct checkpoint identities. An empty parent thread ID keeps the child unscoped and checkpointing disabled. |
+| `step` | Local to the child execution; it starts from the child checkpoint or zero. |
+| `store` | The parent Store is inherited when present; otherwise the child engine retains its configured Store. |
+| Tool policy | Parent `ToolGate` runs before the child's gate. A child may further restrict or rewrite an allowed call, but cannot bypass a parent deny or interrupt. |
+| Checkpoint backend and resume value | The parent backend is inherited when present; otherwise the child keeps its own backend. A parent resume follows a child checkpoint only when the child's derived checkpoint identity exists, forwarding a non-null resume value. Checkpoint routing is internal, not a public `RunContext` field. |
 
 ---
 
@@ -1154,21 +1178,22 @@ struct RunConfig {
 ### RunContext (v0.4 PR 1, exposed to nodes via `NodeInput.ctx`)
 
 Per-run dispatch metadata threaded by the engine. Constructed from `RunConfig`
-(with a new usage accumulator when none was supplied), the engine's Store,
-and an optional resume value. Nodes consume it inside a
+(with a new usage accumulator when none was supplied), `RunMetadata`, the
+effective Store, and an optional resume value. Nodes consume it inside a
 `run(NodeInput) -> NodeOutput` override via `in.ctx`.
 
 ```cpp
 struct RunContext {
     std::shared_ptr<CancelToken>  cancel_token;
     std::shared_ptr<UsageAccumulator> usage;
-    std::optional<std::chrono::steady_clock::time_point> deadline; // reserved
-    std::string                   trace_id;     // reserved
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    std::string                   trace_id;
     std::string                   thread_id;
     int                           step;
     StreamMode                    stream_mode;
     std::optional<json>           resume_value;
     std::shared_ptr<Store>        store;
+    ToolGate                      tool_gate;
 };
 ```
 
@@ -1176,13 +1201,14 @@ struct RunContext {
 |-------|-------------|
 | `cancel_token` | The active token. Pass to `provider.complete(params)` so an LLM HTTP socket aborts on cancel, or poll `is_cancelled()` for your own loops |
 | `usage` | Shared token-accounting sink populated by the engine |
-| `deadline` | Reserved (no `RunConfig.deadline` field yet) |
-| `trace_id` | Reserved for OTel integration |
+| `deadline` | Optional absolute deadline from C++ `RunMetadata` |
+| `trace_id` | Optional trace correlator from C++ `RunMetadata` |
 | `thread_id` | Mirror of `RunConfig.thread_id` |
 | `step` | Current super-step index, updated each iteration |
 | `stream_mode` | Mirror of `RunConfig.stream_mode` |
 | `resume_value` | Value supplied to `GraphEngine::resume()`, or empty on a fresh run |
 | `store` | Store installed on the engine, or `nullptr` when none is configured |
+| `tool_gate` | Effective policy for this invocation, including any inherited parent policy |
 
 ### CancelToken
 
@@ -1577,9 +1603,15 @@ Returns the checkpoint history for a thread, ordered by timestamp (newest first)
 void update_state(const std::string& thread_id,
                   const json& channel_writes,
                   const std::string& as_node = "");
+
+void update_state_writes(const std::string& thread_id,
+                         const std::vector<ChannelWrite>& channel_writes,
+                         const std::string& as_node = "");
 ```
 
-Manually updates the state for a thread by applying channel writes. Creates a new
+Manually updates the state for a thread by applying channel writes. The JSON
+object form applies reducer writes by channel name. The `ChannelWrite` vector
+form preserves write order and explicit overwrite modes. Both create a new
 checkpoint with the updated state.
 
 | Parameter | Type | Description |
@@ -3021,12 +3053,13 @@ public:
     struct Stats {
         size_t pending;        // Tasks waiting in queue
         size_t active;         // Tasks currently executing
-        size_t completed;      // Total completed tasks
-        size_t rejected;       // Tasks rejected due to full queue
+        size_t completed;      // Total settled tasks, including cancellation
+        size_t rejected;       // Tasks rejected during admission
         size_t num_workers;    // Number of worker threads
         size_t max_queue_size; // Maximum queue capacity
     };
 
+    // num_workers must be greater than zero.
     RequestQueue(size_t num_workers = 128, size_t max_queue_size = 10000);
     ~RequestQueue();
 
@@ -3034,10 +3067,15 @@ public:
     RequestQueue(const RequestQueue&) = delete;
     RequestQueue& operator=(const RequestQueue&) = delete;
 
-    // Submit a task. Returns {accepted, future}.
-    // If the queue is full, returns {false, invalid_future}.
+    // Submit a task. Concurrent callers cannot exceed max_queue_size.
+    // A full queue returns {false, invalid_future}; an internal enqueue
+    // failure returns {false, valid_future}, which throws on get().
     template<typename F>
     std::pair<bool, std::future<void>> submit(F&& task);
+
+    // Idempotently reject new work, cancel queued tasks, and wait for workers.
+    void close();
+    bool is_closed() const noexcept;
 
     // Get current queue statistics
     Stats stats() const;
@@ -3046,12 +3084,14 @@ public:
 
 | Constructor Parameter | Type | Default | Description |
 |-----------------------|------|---------|-------------|
-| `num_workers` | `size_t` | `128` | Number of worker threads in the pool |
+| `num_workers` | `size_t` | `128` | Number of worker threads in the pool; zero throws `std::invalid_argument` |
 | `max_queue_size` | `size_t` | `10000` | Maximum number of pending tasks. Tasks beyond this limit are rejected |
 
 | Method | Description |
 |--------|-------------|
-| `submit(task)` | Enqueues a callable. Returns a pair: `first` is `true` if accepted (or `false` if the queue is full -- backpressure), `second` is a `std::future<void>` that resolves when the task completes or propagates exceptions |
+| `submit(task)` | Atomically reserves pending capacity, then enqueues a callable. Returns a pair: `first` is `true` if accepted. A full or closed queue returns `false` with an invalid future; an internal enqueue failure returns `false` with a valid future that propagates the error. Accepted futures resolve when the task completes or propagates task exceptions. |
+| `close()` | Idempotently rejects new work. An external caller waits for all workers to finish shutdown, then unclaimed work completes with `std::runtime_error("RequestQueue is closed")`. A callable claimed by a worker before closure may finish. A callable may invoke `close()` to initiate shutdown, but cannot wait for itself. |
+| `is_closed()` | Reports whether `close()` has begun rejecting new work. |
 | `stats()` | Returns a snapshot of current queue statistics |
 
 The queue uses `moodycamel::ConcurrentQueue` internally for lock-free enqueue/dequeue
@@ -3364,8 +3404,9 @@ NeoGraph `GraphEngine` into an A2A endpoint via
 `GraphAgentAdapter`. Dual `v0.3` / `v1` method-name dispatch —
 see commit `bc675a1`. Streaming uses `SseFrameSplitter` (client)
 and httplib chunked (server). Caller node embeds an A2A call as
-a graph node. **Full reference:**
-[Doxygen `namespaceneograph_1_1a2a`](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1a2a.html).
+a graph node.
+
+**Full reference:** [Doxygen class list](https://fox1245.github.io/NeoGraph/annotated.html), grouped by namespace.
 
 ### `neograph::acp` — Agent Client Protocol
 
@@ -3376,8 +3417,9 @@ Gemini CLI, Neovim CodeCompanion). Bidirectional: client→agent
 (`fs/{read,write}_text_file`, `session/request_permission`) via
 late-bound `ACPClient`. `ACPServer::handle_message` async-dispatches
 prompts on a worker thread, capped at `max_inflight_prompts=32`
-with per-session single-flight + `-32000` backpressure. **Full
-reference:** [Doxygen `namespaceneograph_1_1acp`](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1acp.html).
+with per-session single-flight + `-32000` backpressure.
+
+**Full reference:** [Doxygen class list](https://fox1245.github.io/NeoGraph/annotated.html), grouped by namespace.
 
 ### `neograph::async` — HTTP/SSE/WS helpers
 
@@ -3388,8 +3430,9 @@ silently double-apply); `SseEventParser` for OpenAI/Claude
 streaming; `WsClient` for OpenAI Responses WebSocket; libcurl
 `CurlH2Pool` for HTTP/2 + multiplexing on Cloudflare-fronted
 endpoints; `run_sync` for awaitable→sync bridges in the engine
-defaults. **Full reference:**
-[Doxygen `namespaceneograph_1_1async`](https://fox1245.github.io/NeoGraph/namespaceneograph_1_1async.html).
+defaults.
+
+**Full reference:** [Doxygen class list](https://fox1245.github.io/NeoGraph/annotated.html), grouped by namespace.
 
 ### Persistent checkpoint backends
 

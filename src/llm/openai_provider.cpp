@@ -1,4 +1,8 @@
 #include <neograph/llm/openai_provider.h>
+#include <neograph/graph/cancel.h>
+#include <asio/bind_cancellation_slot.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/use_awaitable.hpp>
 
 #include <neograph/async/conn_pool.h>
 #include <neograph/async/endpoint.h>
@@ -95,6 +99,16 @@ static std::pair<std::string, std::string> parse_url(const std::string& base_url
 
 namespace {
 
+std::string chat_completions_path(std::string prefix) {
+    while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+    // OpenRouter documents an OpenAI-compatible base URL ending in /api/v1.
+    // Source: https://openrouter.ai/docs/quickstart (fetched 2026-07-23).
+    if (prefix.size() >= 3 && prefix.compare(prefix.size() - 3, 3, "/v1") == 0) {
+        return prefix + "/chat/completions";
+    }
+    return prefix + "/v1/chat/completions";
+}
+
 // Parse Retry-After. Supports the seconds-integer shape only (the
 // HTTP-date shape is rare in practice for LLM endpoints; matching
 // SchemaProvider's behavior). Returns -1 when missing or unparsable.
@@ -106,6 +120,18 @@ int parse_retry_after_seconds(std::string_view raw) {
     auto [ptr, ec] = std::from_chars(begin, end, seconds);
     if (ec != std::errc{} || ptr != end || seconds < 0) return -1;
     return seconds;
+}
+
+std::string normalize_finish_reason(const json& choice) {
+    if (!choice.contains("finish_reason") || choice["finish_reason"].is_null()) {
+        return {};
+    }
+    const auto reason = choice.value("finish_reason", "");
+    if (reason == "stop") return "end_turn";
+    if (reason == "length") return "max_tokens";
+    if (reason == "tool_calls" || reason == "function_call") return "tool_use";
+    if (reason == "content_filter") return "content_filter";
+    return "unknown";
 }
 
 } // namespace
@@ -127,14 +153,27 @@ OpenAIProvider::complete_async(const CompletionParams& params)
         opts.timeout = std::chrono::seconds(config_.timeout_seconds);
     }
 
-    auto res = co_await conn_pool_->async_post(
+    auto request = conn_pool_->async_post(
         endpoint.host,
         endpoint.port,
-        endpoint.prefix + "/v1/chat/completions",
+        chat_completions_path(endpoint.prefix),
         body_str,
         std::move(headers),
         endpoint.tls,
         opts);
+    auto executor = co_await asio::this_coro::executor;
+    auto operation = params.cancel_token
+        ? params.cancel_token->fork()
+        : std::shared_ptr<neograph::graph::CancelToken>{};
+    if (operation) {
+        operation->bind_executor(executor);
+    }
+    auto res = operation
+        ? co_await asio::co_spawn(
+              executor, std::move(request),
+              asio::bind_cancellation_slot(
+                  operation->slot(), asio::use_awaitable))
+        : co_await std::move(request);
 
     if (res.status == 429) {
         throw RateLimitError(
@@ -152,6 +191,10 @@ OpenAIProvider::complete_async(const CompletionParams& params)
 
     ChatCompletion completion;
     completion.message = parse_response_message(choice);
+    completion.stop_reason = normalize_finish_reason(choice);
+    if (completion.stop_reason.empty()) {
+        completion.stop_reason = completion.message.tool_calls.empty() ? "end_turn" : "tool_use";
+    }
 
     if (resp_json.contains("usage")) {
         auto u = resp_json["usage"];
@@ -197,12 +240,13 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
     // Buffer for partial SSE lines across chunk boundaries
     std::string line_buffer;
     std::exception_ptr stream_error;
+    std::string observed_stop_reason;
 
     int response_status = 0;
     std::string error_body;
     httplib::Request request;
     request.method = "POST";
-    request.path = prefix + "/v1/chat/completions";
+    request.path = chat_completions_path(prefix);
     request.headers = headers;
     request.body = body.dump();
     request.set_header("Content-Type", "application/json");
@@ -266,6 +310,10 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
 
                     if (!j.contains("choices") || !j["choices"].is_array()
                         || j["choices"].empty()) continue;
+                    if (const auto reason = normalize_finish_reason(j["choices"][0]);
+                        !reason.empty()) {
+                        observed_stop_reason = reason;
+                    }
                     auto delta = j["choices"][0]["delta"];
 
                     // Content token
@@ -328,6 +376,9 @@ OpenAIProvider::complete_stream(const CompletionParams& params,
     for (auto& [idx, tc] : tc_map) {
         completion.message.tool_calls.push_back(tc);
     }
+    completion.stop_reason = observed_stop_reason.empty()
+        ? (completion.message.tool_calls.empty() ? "end_turn" : "tool_use")
+        : observed_stop_reason;
 
     return completion;
 }

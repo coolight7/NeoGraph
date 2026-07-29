@@ -8,14 +8,9 @@
 // as `unique_ptr<GraphNode>` and pybind11's trampoline holders don't
 // compose cleanly with that.
 //
-// Engine entry points (graph_executor.cpp:140-143):
-//
-//   execute_full_async(state)         ← every async run
-//   execute_full_stream_async(s, cb)  ← every streaming run
-//
-// Both are coroutines. We override them to `co_return` the sync
-// counterparts so a Python user only has to provide `execute()` (or
-// `execute_full()`) without thinking about coroutines.
+// The engine calls GraphNode::run(NodeInput). PyGraphNodeOwner keeps the
+// coroutine boundary in C++ and invokes the user's regular Python
+// `run(self, input)` method while holding the GIL.
 //
 // GIL contract:
 //   - Every Python attribute access acquires the GIL via
@@ -33,8 +28,8 @@
 #include "json_bridge.h"
 #include "opaque_types.h"
 
-#include <neograph/api.h>  // NEOGRAPH_PUSH/POP_IGNORE_DEPRECATED
 #include <neograph/graph/engine.h>
+#include <neograph/graph/cancel.h>
 #include <neograph/graph/loader.h>
 #include <neograph/graph/node.h>
 #include <neograph/graph/state.h>
@@ -126,13 +121,13 @@ NodeResult coerce_to_node_result(py::handle obj) {
             } else if (py::isinstance<Command>(item)) {
                 if (r.command.has_value()) {
                     throw py::type_error(
-                        "execute_full() returned multiple Command "
+                        "run(input) returned multiple Command "
                         "instances; only one is allowed per node.");
                 }
                 r.command = item.cast<Command>();
             } else {
                 throw py::type_error(
-                    "execute_full() result list must contain "
+                    "run(input) result list must contain "
                     "ChannelWrite / Send / Command instances; got " +
                     std::string(py::str(item.get_type()).cast<std::string>()));
             }
@@ -141,7 +136,7 @@ NodeResult coerce_to_node_result(py::handle obj) {
     }
 
     throw py::type_error(
-        "execute() / execute_full() must return a list of "
+        "run(input) must return an iterable of "
         "ChannelWrite, a NodeResult, a Command, a Send, or None; got " +
         std::string(py::str(obj.get_type()).cast<std::string>()));
 }
@@ -214,7 +209,8 @@ asio::thread_pool& async_tool_pool() {
 // `unique_ptr<Tool>` ownership while Python keeps its shared_ptr. Forwards
 // everything, and — the point — forwards `execute_async` to the real tool, so a
 // tool that genuinely suspends still does (issue #95).
-class SharedToolRef final : public neograph::Tool {
+class SharedToolRef final : public neograph::Tool,
+                            public neograph::ContextualAsyncTool {
 public:
     explicit SharedToolRef(std::shared_ptr<neograph::Tool> tool)
         : tool_(std::move(tool)) {}
@@ -232,6 +228,21 @@ public:
     // reference the caller keeps alive across the await either way.
     asio::awaitable<std::string> execute_async(const json& arguments) override {
         return tool_->execute_async(arguments);
+    }
+
+    asio::awaitable<std::string> execute_async(
+        const json& arguments, neograph::ToolExecutionContext execution) override {
+        if (auto* contextual = dynamic_cast<neograph::ContextualAsyncTool*>(tool_.get())) {
+            co_return co_await contextual->execute_async(arguments, std::move(execution));
+        }
+        if (execution.cancel_token) {
+            execution.cancel_token->throw_if_cancelled("before tool execution");
+        }
+        auto result = co_await tool_->execute_async(arguments);
+        if (execution.cancel_token) {
+            execution.cancel_token->throw_if_cancelled("after tool execution");
+        }
+        co_return result;
     }
 
     std::string get_name() const override { return tool_->get_name(); }
@@ -347,10 +358,9 @@ public:
     //
     // The Python user's class MUST define `run(self, input)` returning
     // a list of ChannelWrite (or NodeResult / NodeOutput with optional
-    // Command / Send fields). The legacy 8-virtual chain
-    // (`execute` / `execute_full` / `execute_stream` / ...) was
-    // deprecated in v0.4 and removed in v1.0 (9b–9e). Python code
-    // still defining one of the legacy methods will hit AttributeError
+    // Command / Send fields). The removed pre-v1 multi-entry dispatch
+    // surface is not consulted. Python code still defining only an obsolete
+    // node method will hit the base class's actionable NotImplementedError
     // here — see docs/migration-v0.4-to-v1.0.md for the rewrite.
     //
     // Cancel propagation is now first-class: the user's run() body
@@ -378,37 +388,6 @@ public:
     }
 
 private:
-    bool has_user_method(const char* name) const {
-        // Walk the actual __class__ MRO rather than just calling
-        // hasattr — the Python GraphNode base supplies stubs that
-        // hasattr would always see, masking whether the *subclass*
-        // overrode the method. We're looking for a method that's
-        // defined on a class strictly derived from `neograph.GraphNode`
-        // (i.e. user code, not the base).
-        if (!py::hasattr(py_obj_, name)) return false;
-        py::object cls = py_obj_.attr("__class__");
-        py::object base_module;
-        try {
-            base_module = py::module_::import("neograph_engine");
-        } catch (const py::error_already_set&) {
-            // Should never happen — if neograph isn't importable we
-            // wouldn't be here. Conservative fallback: hasattr.
-            return true;
-        }
-        py::object base = base_module.attr("GraphNode");
-        // Iterate the MRO; the first class that defines `name` in its
-        // own __dict__ wins. If that class IS the base, the user did
-        // not override.
-        py::tuple mro = cls.attr("__mro__");
-        for (auto klass : mro) {
-            py::object dict = klass.attr("__dict__");
-            if (py::cast<py::dict>(dict).contains(name)) {
-                return !klass.is(base);
-            }
-        }
-        return false;
-    }
-
     py::object py_obj_;
 };
 
@@ -500,7 +479,7 @@ void init_node(py::module_& m) {
         "Full node return shape: writes + optional Command (routing "
         "override) + optional Sends (dynamic fan-out). Construct one "
         "explicitly when emitting Command/Send; for writes-only nodes, "
-        "just return a list of ChannelWrite from execute().")
+        "just return a list of ChannelWrite from run(input).")
         .def(py::init([](std::vector<ChannelWrite> writes,
                          py::object command,
                          std::vector<Send> sends) {
@@ -557,8 +536,8 @@ void init_node(py::module_& m) {
     // cancel_token (so they can pass it explicitly to
     // provider.complete instead of relying on the smuggling thread-local),
     // step (super-step counter), thread_id (RunConfig.thread_id), and
-    // stream_mode, store, and resume_value. ``deadline`` and ``trace_id`` are
-    // reserved for future RunConfig fields and stay default-constructed for now.
+    // stream_mode, store, and resume_value. C++ RunMetadata can also supply
+    // deadline and trace_id; those remain intentionally unbound in Python.
     py::class_<RunContext>(m, "RunContext",
         "Per-run dispatch metadata threaded by the engine. New nodes "
         "read this from ``input.ctx`` inside their ``run(input)`` "

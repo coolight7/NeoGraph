@@ -270,9 +270,21 @@ asio::awaitable<HttpResponse> ConnPool::async_post(
     std::vector<std::pair<std::string, std::string>> headers,
     bool                                             tls,
     RequestOptions                                   opts) {
-    Key         key{std::string(host), std::string(port), tls};
+    return async_post_owned(std::string(host), std::string(port), std::string(path),
+                            std::string(body), std::move(headers), tls, opts);
+}
+
+asio::awaitable<HttpResponse> ConnPool::async_post_owned(
+    std::string                                      host,
+    std::string                                      port,
+    std::string                                      path,
+    std::string                                      body,
+    std::vector<std::pair<std::string, std::string>> headers,
+    bool                                             tls,
+    RequestOptions                                   opts) {
     std::string req =
         detail::build_request(host, path, body, headers, detail::ConnDirective::keep_alive);
+    Key key{std::move(host), std::move(port), tls};
 
     if (opts.timeout.count() <= 0) {
         co_return co_await impl_->dispatch(std::move(key), req);
@@ -285,12 +297,16 @@ asio::awaitable<HttpResponse> ConnPool::async_post(
     using asio::experimental::awaitable_operators::operator||;
     asio::steady_timer timer(impl_->ex);
     timer.expires_after(opts.timeout);
-    auto res =
-        co_await(impl_->dispatch(std::move(key), req) || timer.async_wait(asio::use_awaitable));
-    if (res.index() == 1) {
-        throw neograph_asio_system_error(asio::error::timed_out, "ConnPool::async_post: timeout");
+    try {
+        auto res =
+            co_await(impl_->dispatch(std::move(key), req) || timer.async_wait(asio::use_awaitable));
+        if (res.index() == 1) {
+            throw asio::system_error(asio::error::timed_out, "ConnPool::async_post: timeout");
+        }
+        co_return std::get<0>(std::move(res));
+    } catch (const asio::multiple_exceptions& error) {
+        detail::rethrow_first_exception(error);
     }
-    co_return std::get<0>(std::move(res));
 }
 
 }  // namespace neograph::async

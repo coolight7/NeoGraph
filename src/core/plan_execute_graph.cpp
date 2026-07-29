@@ -392,6 +392,7 @@ std::unique_ptr<GraphEngine> create_plan_execute_graph(std::shared_ptr<Provider>
     // the loop with plain conditional edges — including the executor's
     // self-referential "keep going" branch.
     json definition = {
+        {"schema_version", TOPOLOGY_SCHEMA_VERSION},
         {"name", "plan_execute_agent"},
         {"channels",
          {{"messages", {{"reducer", "append"}}},
