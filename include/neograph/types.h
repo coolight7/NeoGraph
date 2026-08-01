@@ -126,7 +126,7 @@ class ChatStreamChunk {
 public:
     inline static constexpr int TYPE_CONTENT  = 1;
     inline static constexpr int TYPE_THINKING = 1 << 2;
-    inline static constexpr int TYPE_UNKNOWN  = 1 << 31;
+    inline static constexpr int TYPE_UNKNOWN  = 1 << 30;
 
     int         type = TYPE_CONTENT;
     std::string data;
