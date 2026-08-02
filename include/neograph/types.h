@@ -82,7 +82,6 @@ struct ChatMessage {
 
     /// [@coolight] 用于支持 修改、重新生成 消息历史
     std::vector<std::string> history_contents;
-    std::string              summaryContent;
     std::string              reasoning_content;
 
     /// 消息标记位掩码（不序列化到 LLM API 请求）
