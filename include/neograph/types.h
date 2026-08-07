@@ -13,7 +13,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace neograph {
@@ -70,7 +72,14 @@ struct ToolCall {
  * @brief A message in the conversation history.
  *
  * Supports all standard roles (user, assistant, tool, system) and
- * multi-modal content via image_urls for vision-capable models.
+ * multi-modal content via image_urls / audio_urls / video_urls for
+ * vision / audio / video capable models.
+ *
+ * 每个 media 条目可以是:
+ *   - HTTP(S) URL, 或
+ *   - data URL (RFC 2397): "data:<mime>;base64,<payload>"
+ *     (音频必须使用 data URL, 各 API 的 input_audio 只接受 base64 数据;
+ *      图片/视频两者皆可, 由 provider 按目标 API 能力转换)
  */
 struct ChatMessage {
     std::string           role;        ///< Message role: "user", "assistant", "tool", or "system".
@@ -79,6 +88,10 @@ struct ChatMessage {
     std::string tool_call_id;          ///< ID of the tool call being responded to (role == "tool").
     std::string tool_name;             ///< Name of the tool being called.
     std::vector<std::string> image_urls;  ///< Base64 data URLs or HTTP URLs for vision support.
+    /// 音频附件: data URL 或 HTTP URL (data URL 才能转换为各 API 的 input_audio)
+    std::vector<std::string> audio_urls;
+    /// 视频附件: data URL 或 HTTP URL
+    std::vector<std::string> video_urls;
 
     /// [@coolight] 用于支持 修改、重新生成 消息历史
     std::vector<std::string> history_contents;
@@ -214,6 +227,8 @@ inline void to_json(json& j, const ChatMessage& msg) {
     if (!msg.tool_call_id.empty()) j["tool_call_id"] = msg.tool_call_id;
     if (!msg.tool_name.empty()) j["tool_name"] = msg.tool_name;
     if (!msg.image_urls.empty()) j["image_urls"] = msg.image_urls;
+    if (!msg.audio_urls.empty()) j["audio_urls"] = msg.audio_urls;
+    if (!msg.video_urls.empty()) j["video_urls"] = msg.video_urls;
     if (!msg.history_contents.empty()) j["history_contents"] = msg.history_contents;
     if (msg.flags != MessageFlag::None) j["flags"] = static_cast<uint64_t>(msg.flags);
     if (!msg.extra.empty()) j["extra"] = msg.extra;
@@ -246,6 +261,12 @@ inline void from_json(const json& j, ChatMessage& msg) {
     if (j.contains("image_urls") && j["image_urls"].is_array()) {
         msg.image_urls = j["image_urls"].get<std::vector<std::string>>();
     }
+    if (j.contains("audio_urls") && j["audio_urls"].is_array()) {
+        msg.audio_urls = j["audio_urls"].get<std::vector<std::string>>();
+    }
+    if (j.contains("video_urls") && j["video_urls"].is_array()) {
+        msg.video_urls = j["video_urls"].get<std::vector<std::string>>();
+    }
     if (j.contains("history_contents") && j["history_contents"].is_array()) {
         msg.history_contents = j["history_contents"].get<std::vector<std::string>>();
     }
@@ -268,11 +289,112 @@ inline void from_json(const json& j, neograph::ChatStreamChunk& e) {
 
 // --- JSON serialization helpers ---
 
+/// @brief 解析 data URL (RFC 2397): "data:[<mediatype>][;base64],<data>"
+///
+/// 仅支持 base64 编码的 data URL; 非 data URL 或无法解析时返回 nullopt。
+/// @return 成功返回 {media_type, base64 payload}; media_type 可能为空字符串
+///         (data:;base64,xxx 形式), 由调用方决定如何处理。
+inline std::optional<std::pair<std::string, std::string>> parse_data_url(std::string_view url) {
+    constexpr std::string_view kPrefix = "data:";
+    if (!url.starts_with(kPrefix)) {
+        return std::nullopt;
+    }
+    url.remove_prefix(kPrefix.size());
+    auto comma = url.find(',');
+    if (comma == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::string_view header  = url.substr(0, comma);
+    std::string      payload{url.substr(comma + 1)};
+
+    std::string_view mime = header;
+    bool             isBase64 = false;
+    auto             semi     = header.find(';');
+    if (semi != std::string_view::npos) {
+        mime            = header.substr(0, semi);
+        auto params     = header.substr(semi + 1);
+        // 逐段检查参数, 兼容 "data:image/png;base64,xxx" 与
+        // "data:image/png;name=a.png;base64,xxx" 等形式
+        while (!params.empty()) {
+            auto next  = params.find(';');
+            auto param = params.substr(0, next);
+            if (param == "base64") {
+                isBase64 = true;
+            }
+            params = (next == std::string_view::npos) ? std::string_view{}
+                                                      : params.substr(next + 1);
+        }
+    }
+    if (!isBase64) {
+        // 非 base64 (percent-encoded) data URL 暂不支持
+        return std::nullopt;
+    }
+    return std::make_pair(std::string(mime), std::move(payload));
+}
+
+/// @brief 从 media type 推导各 API 需要的 audio/video format 标识。
+///
+/// 归一化常见别名并去除参数 (如 ";codecs=..."):
+///   audio/wav|x-wav|wave → wav; audio/mpeg|audio/mp3|audio/mpga → mp3;
+///   audio/ogg → ogg; audio/aac → aac; audio/flac → flac; audio/webm → webm;
+///   video/mp4 → mp4; video/mpeg → mpeg; video/quicktime → mov;
+///   video/webm → webm; video/x-msvideo → avi; video/x-matroska → mkv;
+///   video/mp2t → mpegts; video/vnd.apple.mpegurl → m3u8
+/// 其他类型返回 "/" 之后的子类型原文 (小写), 无 "/" 返回原文小写。
+inline std::string media_format_from_mime(std::string_view mime) {
+    std::string m(mime);
+    for (auto& c : m) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    auto semi = m.find(';');
+    if (semi != std::string::npos) {
+        m.resize(semi);
+    }
+    auto    slash   = m.find('/');
+    std::string type    = (slash == std::string::npos) ? m : m.substr(0, slash);
+    std::string subtype = (slash == std::string::npos) ? m : m.substr(slash + 1);
+
+    if (subtype == "x-wav" || subtype == "wave") {
+        return "wav";
+    }
+    if (subtype == "mpeg" || subtype == "mpga") {
+        return (type == "audio") ? "mp3" : "mpeg";
+    }
+    if (subtype == "quicktime") {
+        return "mov";
+    }
+    if (subtype == "x-msvideo") {
+        return "avi";
+    }
+    if (subtype == "x-matroska") {
+        return "mkv";
+    }
+    if (subtype == "mp2t") {
+        return "mpegts";
+    }
+    if (subtype == "vnd.apple.mpegurl") {
+        return "m3u8";
+    }
+    return subtype;
+}
+
+/// @brief 判断字符串是否为 HTTP(S) URL (供 media 附件转换时区分 data URL 与远程 URL)
+inline bool is_http_url(std::string_view url) {
+    return url.starts_with("http://") || url.starts_with("https://");
+}
+
 /**
  * @brief Convert a vector of ChatMessages to OpenAI-compatible JSON format.
  *
  * Handles tool call messages, tool result messages, and multi-modal
- * messages (text + images in OpenAI Vision format).
+ * messages (text + images/audio/video) in OpenAI multimodal format:
+ *   - image: {"type":"image_url","image_url":{"url":<url>}}
+ *   - audio: {"type":"input_audio","input_audio":{"data":<base64>,"format":<fmt>}}
+ *            (data URL 转换为 data+format; HTTP URL 无法转为 base64, 以
+ *             {"url":...} 扩展字段透传, 供兼容网关使用)
+ *   - video: {"type":"video_url","video_url":{"url":<url>}}
  *
  * @param messages Vector of ChatMessage objects to convert.
  * @return JSON array in OpenAI messages format.
@@ -295,14 +417,33 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
                                   {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}});
             }
             j["tool_calls"] = tc_arr;
-        } else if (!msg.image_urls.empty()) {
-            // Multi-modal: text + images (OpenAI Vision format)
+        } else if (!msg.image_urls.empty() || !msg.audio_urls.empty() || !msg.video_urls.empty()) {
+            // Multi-modal: text + images/audio/video (OpenAI multimodal format)
             json parts = json::array();
             if (!msg.content.empty()) {
                 parts.push_back({{"type", "text"}, {"text", msg.content}});
             }
-            for (auto& url : msg.image_urls) {
+            for (const auto& url : msg.image_urls) {
                 parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+            }
+            for (const auto& url : msg.audio_urls) {
+                if (auto parsed = parse_data_url(url)) {
+                    parts.push_back({
+                        {"type", "input_audio"},
+                        {"input_audio",
+                         {{"data", parsed->second},
+                          {"format", media_format_from_mime(parsed->first)}}},
+                    });
+                } else {
+                    // HTTP URL 或无法解析的 data URL: 以 url 扩展字段透传
+                    parts.push_back({
+                        {"type", "input_audio"},
+                        {"input_audio", {{"url", url}}},
+                    });
+                }
+            }
+            for (const auto& url : msg.video_urls) {
+                parts.push_back({{"type", "video_url"}, {"video_url", {{"url", url}}}});
             }
             j["content"] = parts;
         } else {
@@ -357,6 +498,10 @@ inline ChatMessage parse_response_message(const json& choice) {
                                 : "";
     if (msg.reasoning_content.empty() && m.contains("thinking") && !m["thinking"].is_null()) {
         msg.reasoning_content = m["thinking"].get<std::string>();
+    }
+    // Vercel AI Gateway / 部分网关把推理内容放在 message.reasoning 字段
+    if (msg.reasoning_content.empty() && m.contains("reasoning") && !m["reasoning"].is_null()) {
+        msg.reasoning_content = m["reasoning"].get<std::string>();
     }
 
     if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
