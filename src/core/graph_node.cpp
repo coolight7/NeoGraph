@@ -152,7 +152,7 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
 }
 
 asio::awaitable<ChatCompletion> LLMCallNode::onReceiveToken(CompletionParams&          params,
-                                                            neograph::graph::NodeInput in) {
+                                                            neograph::graph::NodeInput& in) {
     auto                                          callback = in.stream_cb;
     std::function<void(const std::string& chunk)> onToken;
     if (nullptr != callback) {

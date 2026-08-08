@@ -209,7 +209,7 @@ public:
     asio::awaitable<NodeOutput> run(NodeInput in) override;
 
     virtual asio::awaitable<ChatCompletion> onReceiveToken(CompletionParams&          params,
-                                                           neograph::graph::NodeInput in);
+                                                           neograph::graph::NodeInput& in);
 
     std::string get_name() const override { return name_; }
 
