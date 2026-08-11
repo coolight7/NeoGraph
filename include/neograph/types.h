@@ -230,6 +230,7 @@ inline void to_json(json& j, const ChatMessage& msg) {
     if (!msg.audio_urls.empty()) j["audio_urls"] = msg.audio_urls;
     if (!msg.video_urls.empty()) j["video_urls"] = msg.video_urls;
     if (!msg.history_contents.empty()) j["history_contents"] = msg.history_contents;
+    if (!msg.reasoning_content.empty()) j["reasoning_content"] = msg.reasoning_content;
     if (msg.flags != MessageFlag::None) j["flags"] = static_cast<uint64_t>(msg.flags);
     if (!msg.extra.empty()) j["extra"] = msg.extra;
 }
@@ -269,6 +270,9 @@ inline void from_json(const json& j, ChatMessage& msg) {
     }
     if (j.contains("history_contents") && j["history_contents"].is_array()) {
         msg.history_contents = j["history_contents"].get<std::vector<std::string>>();
+    }
+    if (j.contains("reasoning_content") && j["reasoning_content"].is_string()) {
+        msg.reasoning_content = j["reasoning_content"].get<std::string>();
     }
     if (j.contains("flags")) {
         msg.flags = static_cast<MessageFlag>(j["flags"].get<uint64_t>());
