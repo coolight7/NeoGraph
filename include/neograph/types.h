@@ -472,11 +472,14 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
 inline json tools_to_json(const std::vector<ChatTool>& tools) {
     json arr = json::array();
     for (const auto& tool : tools) {
+        // parameters 缺失/null 时兜底为空对象 schema (部分严格网关如 SCNet
+        // 会因 "parameters": null 返回 400 "Format Error")
+        json params = tool.parameters.is_object() ? tool.parameters : json::object();
         arr.push_back({{"type", "function"},
                        {"function",
                         {{"name", tool.name},
                          {"description", tool.description},
-                         {"parameters", tool.parameters}}}});
+                         {"parameters", std::move(params)}}}});
     }
     return arr;
 }
