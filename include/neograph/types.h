@@ -131,6 +131,7 @@ struct ChatCompletion {
         int prompt_tokens     = 0;  ///< Number of tokens in the prompt.
         int completion_tokens = 0;  ///< Number of tokens in the completion.
         int total_tokens      = 0;  ///< Total tokens used (prompt + completion).
+        int reasoning_tokens  = 0;  ///< Number of reasoning tokens (if reported).
     } usage;
 };
 
@@ -173,6 +174,7 @@ public:
         prompt_.fetch_add(u.prompt_tokens, std::memory_order_relaxed);
         completion_.fetch_add(u.completion_tokens, std::memory_order_relaxed);
         total_.fetch_add(total, std::memory_order_relaxed);
+        reasoning_.fetch_add(u.reasoning_tokens, std::memory_order_relaxed);
     }
 
     /// Read the running total. Not a consistent snapshot across the three
@@ -182,6 +184,7 @@ public:
         u.prompt_tokens     = static_cast<int>(prompt_.load(std::memory_order_relaxed));
         u.completion_tokens = static_cast<int>(completion_.load(std::memory_order_relaxed));
         u.total_tokens      = static_cast<int>(total_.load(std::memory_order_relaxed));
+        u.reasoning_tokens  = static_cast<int>(reasoning_.load(std::memory_order_relaxed));
         return u;
     }
 
@@ -189,6 +192,7 @@ private:
     std::atomic<long long> prompt_{0};
     std::atomic<long long> completion_{0};
     std::atomic<long long> total_{0};
+    std::atomic<long long> reasoning_{0};
 };
 
 // --- ADL serialization: ChatMessage/ToolCall <-> json ---
