@@ -291,6 +291,8 @@ public:
         std::string strategy;
         json item_template;
         json text_part_template;
+        json url_item_template;
+        bool remote_url_supported = false;
     };
 
     struct ResponseConfig {
@@ -471,6 +473,11 @@ class SchemaProviderTestAccess {
     static json build_body(const SchemaProvider& sp,
                            const CompletionParams& params) {
         return sp.build_body(params);
+    }
+
+    static ChatMessage parse_response(const SchemaProvider& sp,
+                                      const json& response) {
+        return sp.parse_response(response);
     }
 };
 
