@@ -648,11 +648,18 @@ inline ChatMessage parse_response_message(const json& choice) {
     msg.role = m.value("role", "assistant");
     msg.content = (m.contains("content") && !m["content"].is_null())
                   ? m["content"].get<std::string>() : "";
-    if (m.contains("reasoning") && m["reasoning"].is_string()) {
-        msg.reasoning_content = m["reasoning"].get<std::string>();
-    } else if (m.contains("reasoning_content") &&
-               m["reasoning_content"].is_string()) {
+    if (m.contains("reasoning_content") && !m["reasoning_content"].is_null()) {
         msg.reasoning_content = m["reasoning_content"].get<std::string>();
+    }
+    // Providers disagree on the field name for the trace and it may sit next
+    // to "content" instead of inside it: DeepSeek-style gateways answer with
+    // "reasoning_content", several OpenAI-compatible servers use "thinking",
+    // and Vercel AI Gateway uses "reasoning".
+    if (msg.reasoning_content.empty() && m.contains("thinking") && !m["thinking"].is_null()) {
+        msg.reasoning_content = m["thinking"].get<std::string>();
+    }
+    if (msg.reasoning_content.empty() && m.contains("reasoning") && !m["reasoning"].is_null()) {
+        msg.reasoning_content = m["reasoning"].get<std::string>();
     }
     if (m.contains("reasoning_details") && m["reasoning_details"].is_array()) {
         msg.reasoning_details = m["reasoning_details"];
