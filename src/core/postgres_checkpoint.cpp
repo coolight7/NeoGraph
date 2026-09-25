@@ -993,7 +993,7 @@ asio::awaitable<Result> run_connection_step_off_executor(
 bool is_operation_aborted(const std::exception_ptr& error) {
     try {
         std::rethrow_exception(error);
-    } catch (const asio::system_error& e) {
+    } catch (const neograph_asio_system_error& e) {
         return e.code() == asio::error::operation_aborted;
     } catch (...) {
         return false;
@@ -1026,7 +1026,7 @@ asio::awaitable<SocketReady> wait_socket_either(Socket& sock) {
     // the loser, prefer read so server NOTICE traffic cannot be starved.
     if (!read_error) co_return SocketReady::Read;
     if (order[0] == 1 && !write_error) co_return SocketReady::Write;
-    throw asio::system_error(order[0] == 0 ? read_error : write_error);
+    throw neograph_asio_system_error(order[0] == 0 ? read_error : write_error);
 }
 
 template <typename Socket>
@@ -1046,7 +1046,7 @@ asio::awaitable<void> wait_socket_until(Socket&                               so
     if (order[0] == 1 && !timer_error) {
         throw_connect_timeout(timeout);
     }
-    if (socket_error) throw asio::system_error(socket_error);
+    if (socket_error) throw neograph_asio_system_error(socket_error);
 }
 
 asio::awaitable<SocketReady> wait_pg_socket_either(pg_conn* c) {

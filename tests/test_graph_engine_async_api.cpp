@@ -129,7 +129,7 @@ struct ReleasableHttpServer {
     ~ReleasableHttpServer() {
         release();
         asio::post(io, [this] {
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             acceptor.close(ec);
         });
         if (worker.joinable()) worker.join();
@@ -168,7 +168,7 @@ struct ReleasableHttpServer {
     asio::awaitable<void> accept_loop() {
         for (;;) {
             asio::ip::tcp::socket socket{io};
-            asio::error_code      ec;
+            neograph_asio_error_code      ec;
             co_await acceptor.async_accept(socket, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
             asio::co_spawn(io, handle(std::move(socket)), asio::detached);

@@ -3,7 +3,6 @@
 #include <neograph/runtime_interposition_controller.h>
 #include <neograph/tool_dispatch.h>
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -163,9 +162,9 @@ Agent::run_stream(std::vector<ChatMessage>& messages,
             try {
                 completion = runtime_interposition_ ? runtime_interposition_->invoke(params)
                     : neograph::async::run_sync(provider_->invoke(params, nullptr));
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 if (error.code() != asio::error::timed_out) throw;
-                throw asio::system_error(
+                throw neograph_asio_system_error(
                     error.code(),
                     "Agent::run_stream tool-detection phase timed out: " +
                     std::string(error.what()));

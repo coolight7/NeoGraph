@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <neograph/define.h>
 #include <neograph/json.h>
 
 namespace neograph {

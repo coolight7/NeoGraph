@@ -258,7 +258,7 @@ struct WsClient::Impl {
     void poison() noexcept {
         poisoned = true;
         std::string{}.swap(read_buf);
-        asio::error_code ignored;
+        neograph_asio_error_code ignored;
         socket.cancel(ignored);
         socket.close(ignored);
     }
@@ -694,7 +694,7 @@ asio::awaitable<std::unique_ptr<WsClient>> WsClient::connect_owned(
         impl->tls_stream = std::make_unique<asio::ssl::stream<asio::ip::tcp::socket&>>(
             impl->socket, *impl->ssl_ctx);
         if (!SSL_set_tlsext_host_name(impl->tls_stream->native_handle(), host.c_str())) {
-            throw asio::system_error{asio::error_code{static_cast<int>(::ERR_get_error()),
+            throw neograph_asio_system_error{neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
                                                       asio::error::get_ssl_category()},
                                      "ws: SNI setup"};
         }

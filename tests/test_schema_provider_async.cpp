@@ -13,7 +13,6 @@
 #include <asio/detached.hpp>
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
-#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -100,7 +99,7 @@ void expect_socket_cancel(bool prefer_libcurl) {
     params.cancel_token = token;
 
     asio::io_context io;
-    std::promise<asio::error_code> completion;
+    std::promise<neograph_asio_error_code> completion;
     auto result = completion.get_future();
     graph::CancelExecutorLease token_lease(token);
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
@@ -108,7 +107,7 @@ void expect_socket_cancel(bool prefer_libcurl) {
             token->bind_executor(co_await asio::this_coro::executor);
             (void)co_await provider->complete_async(params);
             completion.set_value(asio::error::fault);
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             completion.set_value(error.code());
         } catch (...) {
             completion.set_value(asio::error::fault);
@@ -238,7 +237,7 @@ TEST(SchemaProviderAsync, LibcurlPerCallTimeoutRemainsTyped) {
     try {
         (void)async::run_sync(provider->complete_async(params));
         FAIL() << "expected per-call timeout";
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::timed_out);
     }
 }

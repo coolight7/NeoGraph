@@ -104,22 +104,22 @@ asio::awaitable<HttpResponse> async_post_once(
 
     if (!tls) {
         auto r = co_await detail::run_exchange(sock, req, opts);
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.set_option(asio::socket_base::linger(true, 0), ec);
         sock.close(ec);
         co_return r.response;
     }
 
     asio::ssl::context ctx{asio::ssl::context::tls_client};
-    asio::error_code ca_ec;
+    neograph_asio_error_code ca_ec;
     ctx.set_default_verify_paths(ca_ec);
-    if (ca_ec) throw asio::system_error(ca_ec, "TLS default trust paths");
+    if (ca_ec) throw neograph_asio_system_error(ca_ec, "TLS default trust paths");
     ctx.set_verify_mode(asio::ssl::verify_peer);
 
     asio::ssl::stream<asio::ip::tcp::socket&> tls_stream{sock, ctx};
     if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
                              asio::error::get_ssl_category()},
             "SNI setup"};
     }
@@ -134,7 +134,7 @@ asio::awaitable<HttpResponse> async_post_once(
     } catch (const std::exception&) {
         // Peer commonly closes first after responding — benign.
     }
-    asio::error_code ec;
+    neograph_asio_error_code ec;
     sock.close(ec);
     co_return r.response;
 }
@@ -161,22 +161,22 @@ asio::awaitable<detail::StreamExchangeResult> async_post_stream_once(
 
     if (!tls) {
         auto r = co_await detail::run_exchange_stream(sock, req, on_chunk, opts);
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.set_option(asio::socket_base::linger(true, 0), ec);
         sock.close(ec);
         co_return r;
     }
 
     asio::ssl::context ctx{asio::ssl::context::tls_client};
-    asio::error_code ca_ec;
+    neograph_asio_error_code ca_ec;
     ctx.set_default_verify_paths(ca_ec);
-    if (ca_ec) throw asio::system_error(ca_ec, "TLS default trust paths");
+    if (ca_ec) throw neograph_asio_system_error(ca_ec, "TLS default trust paths");
     ctx.set_verify_mode(asio::ssl::verify_peer);
 
     asio::ssl::stream<asio::ip::tcp::socket&> tls_stream{sock, ctx};
     if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
                              asio::error::get_ssl_category()},
             "SNI setup"};
     }
@@ -191,7 +191,7 @@ asio::awaitable<detail::StreamExchangeResult> async_post_stream_once(
     } catch (const std::exception&) {
         // Peer commonly closes first on long streams — benign.
     }
-    asio::error_code ec;
+    neograph_asio_error_code ec;
     sock.close(ec);
     co_return r;
 }
@@ -227,7 +227,7 @@ asio::awaitable<HttpResponse> async_post_once_timed(
                 std::move(body), std::move(headers), tls, opts))
             || timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out,
+            throw neograph_asio_system_error(asio::error::timed_out,
                                      "async_post: per-hop timeout");
         }
         auto captured = std::get<0>(std::move(res));
@@ -265,7 +265,7 @@ asio::awaitable<detail::StreamExchangeResult> async_post_stream_once_timed(
                 std::move(on_chunk), opts))
             || timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out,
+            throw neograph_asio_system_error(asio::error::timed_out,
                                      "async_post_stream: per-hop timeout");
         }
         auto captured = std::get<0>(std::move(res));
@@ -359,22 +359,22 @@ asio::awaitable<HttpResponse> async_get_once(
 
     if (!tls) {
         auto r = co_await detail::run_exchange(sock, req, opts);
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.set_option(asio::socket_base::linger(true, 0), ec);
         sock.close(ec);
         co_return r.response;
     }
 
     asio::ssl::context ctx{asio::ssl::context::tls_client};
-    asio::error_code ca_ec;
+    neograph_asio_error_code ca_ec;
     ctx.set_default_verify_paths(ca_ec);
-    if (ca_ec) throw asio::system_error(ca_ec, "TLS default trust paths");
+    if (ca_ec) throw neograph_asio_system_error(ca_ec, "TLS default trust paths");
     ctx.set_verify_mode(asio::ssl::verify_peer);
 
     asio::ssl::stream<asio::ip::tcp::socket&> tls_stream{sock, ctx};
     if (!SSL_set_tlsext_host_name(tls_stream.native_handle(), host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
                              asio::error::get_ssl_category()},
             "SNI setup"};
     }
@@ -388,7 +388,7 @@ asio::awaitable<HttpResponse> async_get_once(
     } catch (const std::exception&) {
         // Peer commonly closes first after responding — benign.
     }
-    asio::error_code ec;
+    neograph_asio_error_code ec;
     sock.close(ec);
     co_return r.response;
 }
@@ -413,7 +413,7 @@ asio::awaitable<HttpResponse> async_get_once_timed(
                 std::move(headers), tls, opts))
             || timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out,
+            throw neograph_asio_system_error(asio::error::timed_out,
                                      "async_get: per-hop timeout");
         }
         auto captured = std::get<0>(std::move(res));

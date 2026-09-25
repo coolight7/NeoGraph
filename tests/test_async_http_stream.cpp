@@ -67,7 +67,7 @@ struct ChunkedMockServer {
     }
 
     ~ChunkedMockServer() {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         acceptor.close(ec);
         io.stop();
         if (worker.joinable()) worker.join();
@@ -116,14 +116,14 @@ struct ChunkedMockServer {
             std::string term = "0\r\n" + trailers + "\r\n";
             co_await asio::async_write(sock, asio::buffer(term), asio::use_awaitable);
         } catch (...) {}
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.close(ec);
     }
 
     asio::awaitable<void> accept_loop() {
         for (;;) {
             asio::ip::tcp::socket sock{io};
-            asio::error_code      ec;
+            neograph_asio_error_code      ec;
             co_await acceptor.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
             asio::co_spawn(io, handle(std::move(sock)), asio::detached);
@@ -154,7 +154,7 @@ struct CloseDelimitedMockServer {
     }
 
     ~CloseDelimitedMockServer() {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         acceptor.close(ec);
         io.stop();
         if (worker.joinable()) worker.join();
@@ -172,14 +172,14 @@ struct CloseDelimitedMockServer {
             co_await asio::async_write(sock, asio::buffer(head), asio::use_awaitable);
             co_await asio::async_write(sock, asio::buffer(body), asio::use_awaitable);
         } catch (...) {}
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.close(ec);
     }
 
     asio::awaitable<void> accept_loop() {
         for (;;) {
             asio::ip::tcp::socket sock{io};
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             co_await acceptor.async_accept(
                 sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
@@ -295,7 +295,7 @@ TEST(AsyncPost, ChunkedBodyLimitReturnsMessageSizeBeforeOverflowAppend) {
                 co_await neograph::async::async_post(
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/body-limit", "{}", {}, false, opts);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -318,7 +318,7 @@ TEST(AsyncPost, ChunkLimitReturnsMessageSizeBeforeChunkAllocation) {
                 co_await neograph::async::async_post(
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/chunk-limit", "{}", {}, false, opts);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -343,7 +343,7 @@ TEST(AsyncPostStream, ChunkLimitReturnsMessageSizeBeforeCallback) {
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/stream-chunk-limit", "{}", {}, false,
                     [&](std::string_view) { ++callbacks; }, opts);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -370,7 +370,7 @@ TEST(AsyncPostStream, BodyLimitStopsBeforeOverflowCallback) {
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/stream-body-limit", "{}", {}, false,
                     [&](std::string_view chunk) { received.emplace_back(chunk); }, opts);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -393,7 +393,7 @@ TEST(AsyncPost, ChunkSizeOverflowReturnsMessageSize) {
                 co_await neograph::async::async_post(
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/chunk-overflow", "{}", {}, false);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -417,7 +417,7 @@ TEST(AsyncPost, TrailerBytesCountTowardHeaderLimit) {
                 co_await neograph::async::async_post(
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/trailer-limit", "{}", {}, false, opts);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -482,7 +482,7 @@ TEST(AsyncPostStream, ServerErrorStatusStillDelivered) {
             worker = std::thread([this] { io.run(); });
         }
         ~ErrorServer() {
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             acc.close(ec);
             io.stop();
             if (worker.joinable()) worker.join();
@@ -490,7 +490,7 @@ TEST(AsyncPostStream, ServerErrorStatusStillDelivered) {
         asio::awaitable<void> loop() {
             for (;;) {
                 asio::ip::tcp::socket sock{io};
-                asio::error_code      ec;
+                neograph_asio_error_code      ec;
                 co_await acc.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
                 if (ec) co_return;
                 try {
@@ -504,7 +504,7 @@ TEST(AsyncPostStream, ServerErrorStatusStillDelivered) {
                         "0\r\n\r\n";
                     co_await asio::async_write(sock, asio::buffer(resp), asio::use_awaitable);
                 } catch (...) {}
-                asio::error_code ec2;
+                neograph_asio_error_code ec2;
                 sock.close(ec2);
             }
         }
@@ -574,13 +574,13 @@ TEST(AsyncHttpOwnership, StreamCancellationOwnsCallbackUntilAwaitableCompletes) 
         ~SlowStreamServer() {
             io.stop();
             if (worker.joinable()) worker.join();
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             acceptor.close(ec);
         }
 
         asio::awaitable<void> accept_loop() {
             asio::ip::tcp::socket sock{io};
-            asio::error_code      ec;
+            neograph_asio_error_code      ec;
             co_await acceptor.async_accept(sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
             try {
@@ -597,7 +597,7 @@ TEST(AsyncHttpOwnership, StreamCancellationOwnsCallbackUntilAwaitableCompletes) 
                     "0\r\n\r\n";
                 co_await asio::async_write(sock, asio::buffer(resp), asio::use_awaitable);
             } catch (...) {}
-            asio::error_code ignored;
+            neograph_asio_error_code ignored;
             sock.close(ignored);
         }
     } srv;
@@ -629,7 +629,7 @@ TEST(AsyncHttpOwnership, StreamCancellationOwnsCallbackUntilAwaitableCompletes) 
     auto future = asio::co_spawn(io, std::move(operation), asio::use_future);
     io.run();
 
-    EXPECT_THROW((void)future.get(), asio::system_error);
+    EXPECT_THROW((void)future.get(), neograph_asio_system_error);
     EXPECT_TRUE(weak_callback.expired())
         << "cancelled stream should release callback captures on completion";
     EXPECT_EQ(chunks.load(std::memory_order_relaxed), 0)

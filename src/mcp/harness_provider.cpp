@@ -5,7 +5,6 @@
 #include "harness_journal_internal.h"
 
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -414,7 +413,7 @@ HarnessWorkerExecutor make_provider_harness_executor(HarnessProviderExecutorConf
                 if (timed_out_after_event)
                     return HarnessWorkerResponse::timeout("provider request exceeded its timeout");
                 return HarnessWorkerResponse::cancelled();
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 const bool timed_out = deadline_expired() ||
                                        error.code() == asio::error::timed_out;
                 const bool cancelled = parent_cancelled();

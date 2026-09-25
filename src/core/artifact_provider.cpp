@@ -197,7 +197,7 @@ ArtifactProvider::execute_async(ArtifactRequest request, ArtifactEventCallback o
             operation_executor,
             execute_unbound(std::move(request), std::move(on_event)),
             asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         if (operation->is_cancelled() && error.code() == asio::error::operation_aborted) {
             throw graph::CancelledException("Artifact operation cancelled");
         }

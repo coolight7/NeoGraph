@@ -903,10 +903,10 @@ asio::awaitable<HostResourceLease> HostAdmissionController::reserve_async(
         }
         poll.expires_after(std::min(std::chrono::milliseconds{2},
                                     std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
-        asio::error_code error;
+        neograph_asio_error_code error;
         co_await poll.async_wait(asio::redirect_error(asio::use_awaitable, error));
-        if (error && error != asio::error::operation_aborted) throw asio::system_error(error);
-        if (error == asio::error::operation_aborted) throw asio::system_error(error);
+        if (error && error != asio::error::operation_aborted) throw neograph_asio_system_error(error);
+        if (error == asio::error::operation_aborted) throw neograph_asio_system_error(error);
     }
 }
 

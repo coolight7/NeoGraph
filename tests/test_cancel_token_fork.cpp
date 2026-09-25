@@ -269,7 +269,7 @@ TEST(CancelTokenFork, SerialExecutorOwnsSlotDuringConcurrentCancellation) {
             co_await timer.async_wait(asio::use_awaitable);
             unexpected = std::make_exception_ptr(
                 std::runtime_error("cancellation did not abort the timer"));
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             if (error.code() == asio::error::operation_aborted) {
                 got_cancelled = true;
             } else {

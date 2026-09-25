@@ -647,7 +647,7 @@ std::shared_ptr<asio::steady_timer> arm_host_admission_deadline(
     asio::co_spawn(
         control->deadline_executor,
         [control, timer]() -> asio::awaitable<void> {
-            asio::error_code error;
+            neograph_asio_error_code error;
             co_await         timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
             if (!error) (void)control->cancel(detail::CancellationCause::Timeout);
             co_return;
@@ -2692,7 +2692,7 @@ asio::awaitable<ProgramResult> RunControl::wait_async_with_control(
                     co_return;
                 control->waiters_.push_back(AsyncWaiter{timer});
             }
-            asio::error_code error;
+            neograph_asio_error_code error;
             co_await         timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
         },
         asio::use_awaitable);
@@ -2842,7 +2842,7 @@ asio::awaitable<HeldProgramHandoff> RunControl::wait_handoff_async(
                 }
                 control->handoff_waiters_.push_back(AsyncWaiter{timer});
             }
-            asio::error_code error;
+            neograph_asio_error_code error;
             co_await timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
         },
         asio::use_awaitable);
@@ -2909,7 +2909,7 @@ asio::awaitable<void> RunControl::hold_latest_handoff_if_requested(std::uint64_t
         handoff_release_waiter_ = timer;
     }
 
-    asio::error_code error;
+    neograph_asio_error_code error;
     co_await timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
     co_return;
 }
@@ -3332,7 +3332,7 @@ asio::awaitable<void> RunControl::hold_graph_migration(
         }
         graph_migration_release_waiter_ = timer;
     }
-    asio::error_code error;
+    neograph_asio_error_code error;
     co_await timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
 }
 

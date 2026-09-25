@@ -117,7 +117,7 @@ public:
     /// back and surfaced to the caller as op==Close (after which the
     /// connection is no longer usable).
     ///
-    /// Throws asio::system_error on transport failure or
+    /// Throws neograph_asio_system_error on transport failure or
     /// std::runtime_error on malformed frames (reserved bits set,
     /// masked server-to-client frame, unknown opcode).
     asio::awaitable<WsMessage> recv();
@@ -173,7 +173,7 @@ private:
 ///                the client sets those itself.
 /// @param tls     Use wss:// (TLS) vs ws:// (plain TCP).
 ///
-/// Throws asio::system_error on transport failure, std::runtime_error
+/// Throws neograph_asio_system_error on transport failure, std::runtime_error
 /// if the server refuses the upgrade (non-101 status or bad Accept).
 /// Request inputs are copied before the returned awaitable is exposed.
 NEOGRAPH_API asio::awaitable<std::unique_ptr<WsClient>> ws_connect(

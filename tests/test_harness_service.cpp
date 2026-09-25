@@ -14,7 +14,6 @@
 #include <neograph/provider.h>
 
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -334,16 +333,16 @@ public:
 
 class AsioErrorProvider final : public neograph::Provider {
 public:
-    explicit AsioErrorProvider(asio::error_code error) : error_(error) {}
+    explicit AsioErrorProvider(neograph_asio_error_code error) : error_(error) {}
 
     neograph::ChatCompletion complete(const neograph::CompletionParams&) override {
-        throw asio::system_error(error_);
+        throw neograph_asio_system_error(error_);
     }
 
     std::string get_name() const override { return "asio-error-harness-provider"; }
 
 private:
-    asio::error_code error_;
+    neograph_asio_error_code error_;
 };
 
 class CancellationAwareProvider final : public neograph::Provider {

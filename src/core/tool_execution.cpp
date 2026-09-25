@@ -691,7 +691,7 @@ public:
 
         std::lock_guard<std::mutex> lock(mu_);
         if (stopping_) {
-            throw asio::system_error(asio::error::operation_aborted);
+            throw neograph_asio_system_error(asio::error::operation_aborted);
         }
         auto [found, inserted] = resources_.try_emplace(
             request.resource_key, Resource{request.capacity, 0, {}});
@@ -705,7 +705,7 @@ public:
             return Registration{ResourceLease(shared_from_this(), found->first), {}};
         }
         if (resource.waiters.size() >= request.max_pending) {
-            throw asio::system_error(asio::error::no_buffer_space);
+            throw neograph_asio_system_error(asio::error::no_buffer_space);
         }
 
         auto waiter = std::make_shared<Waiter>();
@@ -726,7 +726,7 @@ public:
     ResourceLease claim(const std::shared_ptr<Waiter>& waiter) {
         std::lock_guard<std::mutex> lock(mu_);
         if (waiter->state != Waiter::State::Granted) {
-            throw asio::system_error(asio::error::operation_aborted);
+            throw neograph_asio_system_error(asio::error::operation_aborted);
         }
         waiter->state = Waiter::State::Claimed;
         return ResourceLease(shared_from_this(), waiter->resource_key);
@@ -917,7 +917,7 @@ asio::awaitable<ResourceLease> ResourceArbiter::acquire_async(
                 if (cancel_token && cancel_token->is_cancelled()) {
                     throw graph::CancelledException("while waiting for a tool resource");
                 }
-                throw asio::system_error(asio::error::operation_aborted);
+                throw neograph_asio_system_error(asio::error::operation_aborted);
             case detail::ResourceArbiterImpl::Waiter::State::Claimed:
                 throw std::logic_error("tool resource waiter was claimed twice");
             case detail::ResourceArbiterImpl::Waiter::State::Queued:
@@ -925,17 +925,17 @@ asio::awaitable<ResourceLease> ResourceArbiter::acquire_async(
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) throw asio::system_error(asio::error::timed_out);
+        if (now >= deadline) throw neograph_asio_system_error(asio::error::timed_out);
         poll.expires_after(std::min(std::chrono::milliseconds{1},
                                     std::chrono::duration_cast<std::chrono::milliseconds>(
                                         deadline - now)));
-        asio::error_code wait_error;
+        neograph_asio_error_code wait_error;
         co_await poll.async_wait(asio::redirect_error(asio::use_awaitable, wait_error));
         if (wait_error && wait_error != asio::error::operation_aborted) {
-            throw asio::system_error(wait_error);
+            throw neograph_asio_system_error(wait_error);
         }
         if (wait_error == asio::error::operation_aborted) {
-            throw asio::system_error(wait_error);
+            throw neograph_asio_system_error(wait_error);
         }
     }
 }
@@ -1029,7 +1029,7 @@ asio::awaitable<ToolExecutionResult> ToolExecutionController::execute_result_asy
                     singleflight_state = found->second;
                     std::lock_guard<std::mutex> state_lock(singleflight_state->mutex);
                     if (singleflight_state->waiters >= policy.max_pending) {
-                        throw asio::system_error(asio::error::no_buffer_space);
+                        throw neograph_asio_system_error(asio::error::no_buffer_space);
                     }
                     ++singleflight_state->waiters;
                 } else {
@@ -1056,17 +1056,17 @@ asio::awaitable<ToolExecutionResult> ToolExecutionController::execute_result_asy
                     }
                     const auto now = std::chrono::steady_clock::now();
                     if (now >= deadline) {
-                        throw asio::system_error(asio::error::timed_out);
+                        throw neograph_asio_system_error(asio::error::timed_out);
                     }
                     poll.expires_after(std::min(
                         std::chrono::milliseconds{1},
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             deadline - now)));
-                    asio::error_code wait_error;
+                    neograph_asio_error_code wait_error;
                     co_await poll.async_wait(
                         asio::redirect_error(asio::use_awaitable, wait_error));
                     if (wait_error && wait_error != asio::error::operation_aborted) {
-                        throw asio::system_error(wait_error);
+                        throw neograph_asio_system_error(wait_error);
                     }
                 }
             }
@@ -1116,12 +1116,12 @@ asio::awaitable<ToolExecutionResult> ToolExecutionController::execute_result_asy
                 auto result = co_await (
                     invoke() || timer.async_wait(asio::use_awaitable));
                 if (result.index() == 1) {
-                    throw asio::system_error(asio::error::timed_out,
+                    throw neograph_asio_system_error(asio::error::timed_out,
                                              "tool execution deadline expired");
                 }
                 co_return std::get<0>(std::move(result));
             } catch (const asio::multiple_exceptions&) {
-                throw asio::system_error(asio::error::timed_out,
+                throw neograph_asio_system_error(asio::error::timed_out,
                                          "tool execution deadline expired");
             }
         };
@@ -1134,7 +1134,7 @@ asio::awaitable<ToolExecutionResult> ToolExecutionController::execute_result_asy
                     output.emplace(co_await invoke_with_timeout());
                 } catch (const graph::CancelledException&) {
                     throw;
-                } catch (const asio::system_error& error) {
+                } catch (const neograph_asio_system_error& error) {
                     if (error.code() == asio::error::operation_aborted) throw;
                     last_error = std::current_exception();
                 } catch (...) {
@@ -1159,7 +1159,7 @@ asio::awaitable<ToolExecutionResult> ToolExecutionController::execute_result_asy
         auto reserve_host = [host_admission, &policy, &tool, &identity, &context,
                              queue_deadline]() -> asio::awaitable<HostResourceLease> {
             const auto now = std::chrono::steady_clock::now();
-            if (now >= queue_deadline) throw asio::system_error(asio::error::timed_out);
+            if (now >= queue_deadline) throw neograph_asio_system_error(asio::error::timed_out);
 
             auto request = host_request_for(policy, tool.get_name(), identity);
             const auto inherited = std::max(context.requested_priority,
@@ -1232,7 +1232,7 @@ asio::awaitable<ToolExecutionResult> ToolExecutionController::execute_result_asy
             started ? ToolTerminalStatus::CancellationRequested
                     : ToolTerminalStatus::CancelledBeforeStart,
             {}, error.what(), false, started && policy.effect != ToolEffectClass::ReadOnly});
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         const auto code = error.code();
         const auto queue_failure = code == asio::error::timed_out
                                 || code == asio::error::no_buffer_space;
@@ -1286,9 +1286,9 @@ asio::awaitable<std::string> ToolExecutionController::execute_async(
             throw graph::CancelledException(result.error);
         case ToolTerminalStatus::Expired:
         case ToolTerminalStatus::TimedOut:
-            throw asio::system_error(asio::error::timed_out);
+            throw neograph_asio_system_error(asio::error::timed_out);
         case ToolTerminalStatus::Rejected:
-            throw asio::system_error(asio::error::no_buffer_space);
+            throw neograph_asio_system_error(asio::error::no_buffer_space);
         default:
             throw std::runtime_error(result.error.empty()
                                          ? "tool execution failed"

@@ -200,7 +200,7 @@ asio::awaitable<void> handle_client(asio::ip::tcp::socket sock, int latency_ms) 
                 // Non-keep-alive: match the old SO_LINGER-0 behavior so
                 // the --mode sync / --mode async numbers stay comparable
                 // to pre-1.6 runs.
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 sock.set_option(asio::socket_base::linger(true, 0), ec);
                 sock.close(ec);
                 co_return;

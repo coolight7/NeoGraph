@@ -100,7 +100,7 @@ struct RequestOptions {
 };
 
 /// Async HTTP(S) POST. Returns the response body and status on the
-/// given executor's thread(s). Throws asio::system_error (or
+/// given executor's thread(s). Throws neograph_asio_system_error (or
 /// std::system_error wrapping SSL errors) on transport failure —
 /// caller decides retry policy.
 ///
@@ -157,7 +157,7 @@ struct HttpStreamResponse {
 /// status line. Used for LLM streaming endpoints (OpenAI chat
 /// completions, Anthropic messages in `stream: true` mode).
 ///
-/// Throws asio::system_error on transport failure or
+/// Throws neograph_asio_system_error on transport failure or
 /// std::runtime_error if the response isn't chunked. HTTP-level
 /// errors (4xx, 5xx) surface as status + their usually-small body
 /// delivered to on_chunk — the caller decides what to do.

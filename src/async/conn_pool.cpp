@@ -92,12 +92,12 @@ struct Connection {
 
 struct HostGate {
     using SlotChannel = asio::experimental::concurrent_channel<
-        void(asio::error_code, int)>;
+        void(neograph_asio_error_code, int)>;
 
     HostGate(asio::any_io_executor ex, std::size_t capacity)
         : slots(std::move(ex), capacity) {
         for (std::size_t i = 0; i < capacity; ++i) {
-            slots.try_send(asio::error_code{}, 1);
+            slots.try_send(neograph_asio_error_code{}, 1);
         }
     }
 
@@ -127,7 +127,7 @@ struct HostPermit {
 private:
     void release() noexcept {
         if (gate) {
-            (void)gate->slots.try_send(asio::error_code{}, 1);
+            (void)gate->slots.try_send(neograph_asio_error_code{}, 1);
             gate.reset();
         }
     }
@@ -153,9 +153,9 @@ struct ConnPool::Impl {
         : ex(std::move(e)),
           opts(o),
           ssl_ctx(asio::ssl::context::tls_client) {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         ssl_ctx.set_default_verify_paths(ec);
-        if (ec) throw asio::system_error(ec, "TLS default trust paths");
+        if (ec) throw neograph_asio_system_error(ec, "TLS default trust paths");
         ssl_ctx.set_verify_mode(asio::ssl::verify_peer);
     }
 
@@ -200,10 +200,10 @@ struct ConnPool::Impl {
     asio::awaitable<HostPermit> acquire(const Key& k) {
         auto gate = gate_for(k);
         if (!gate) co_return HostPermit{};
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         (void)co_await gate->slots.async_receive(
             asio::redirect_error(asio::use_awaitable, ec));
-        if (ec) throw asio::system_error(ec, "ConnPool host gate");
+        if (ec) throw neograph_asio_system_error(ec, "ConnPool host gate");
         co_return HostPermit(std::move(gate));
     }
 
@@ -244,8 +244,8 @@ asio::awaitable<std::unique_ptr<Connection>> open(
 
     // SNI: Anthropic/OpenAI require it for TLS 1.3 cert selection.
     if (!SSL_set_tlsext_host_name(s.native_handle(), k.host.c_str())) {
-        throw asio::system_error{
-            asio::error_code{static_cast<int>(::ERR_get_error()),
+        throw neograph_asio_system_error{
+            neograph_asio_error_code{static_cast<int>(::ERR_get_error()),
                              asio::error::get_ssl_category()},
             "SNI setup"};
     }
@@ -292,7 +292,7 @@ asio::awaitable<std::optional<detail::ExchangeResult>> try_exchange(
         }
         auto r = co_await detail::run_exchange(*conn.tls, req, opts);
         co_return r;
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         // Cancellation belongs to the caller's deadline/shutdown path, not
         // to stale-connection recovery. In particular, allow_replay must
         // never turn a timed-out POST into a late duplicate request.
@@ -403,7 +403,7 @@ asio::awaitable<HttpResponse> ConnPool::async_post_owned(
                 impl->dispatch(std::move(key), req, opts))
             || timer.async_wait(asio::use_awaitable));
         if (res.index() == 1) {
-            throw asio::system_error(asio::error::timed_out,
+            throw neograph_asio_system_error(asio::error::timed_out,
                                      "ConnPool::async_post: timeout");
         }
         auto captured = std::get<0>(std::move(res));

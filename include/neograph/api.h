@@ -28,6 +28,8 @@
  */
 #pragma once
 
+#include <neograph/define.h>
+
 #if defined(NEOGRAPH_STATIC_BUILD)
 // Static-only build: no decoration, every symbol is a normal
 // member of the static archive.

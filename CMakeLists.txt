@@ -304,10 +304,39 @@ target_include_directories(cppdotenv INTERFACE
 # turns off the Boost.System coupling. Any TU linking this must also
 # link a threads lib (std::thread backend).
 add_library(asio INTERFACE)
-target_include_directories(asio INTERFACE
-    $<BUILD_INTERFACE:${DEPS_DIR}/asio/include>
-    $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
-target_compile_definitions(asio INTERFACE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+# Downstream projects that already use Boost.Asio pass -DBOOST_ROOT=<prefix>:
+# the vendored standalone asio is then dropped in favour of the Boost headers
+# and consumers see NEOGRAPH_USE_BOOST_ASIO, which makes <neograph/define.h>
+# expose boost::asio as `asio` and route the error types through the
+# neograph_asio_error_code / neograph_asio_system_error aliases.
+# Without BOOST_ROOT the vendored deps/asio stays in use (default).
+if (BOOST_ROOT)
+    set(NEOGRAPH_BOOST_ROOT "${BOOST_ROOT}")
+elseif (Boost_ROOT)
+    set(NEOGRAPH_BOOST_ROOT "${Boost_ROOT}")
+else()
+    set(NEOGRAPH_BOOST_ROOT "")
+endif()
+if ("${NEOGRAPH_BOOST_ROOT}" STREQUAL "")
+    target_include_directories(asio INTERFACE
+        $<BUILD_INTERFACE:${DEPS_DIR}/asio/include>
+        $<INSTALL_INTERFACE:${NEOGRAPH_VENDOR_INSTALL_INCLUDEDIR}>)
+else()
+    message(STATUS "[neograph] USE BOOST/asio: ${NEOGRAPH_BOOST_ROOT}")
+    target_include_directories(asio INTERFACE
+        ${NEOGRAPH_BOOST_ROOT}/include/boost/
+        ${NEOGRAPH_BOOST_ROOT}/include/)
+    target_compile_definitions(asio INTERFACE NEOGRAPH_USE_BOOST_ASIO)
+endif()
+add_definitions(-DBOOST_ASIO_STANDALONE=1)
+add_definitions(-DASIO_STANDALONE=1)
+add_definitions(-DBOOST_ASIO_NO_DEPRECATED=1)
+add_definitions(-DASIO_NO_DEPRECATED=1)
+target_compile_definitions(asio INTERFACE
+    BOOST_ASIO_STANDALONE
+    ASIO_STANDALONE
+    BOOST_ASIO_NO_DEPRECATED
+    ASIO_NO_DEPRECATED)
 # Windows: target Windows 10+ so httplib compiles (it hard-errors on
 # _WIN32_WINNT < 0x0A00) and asio's newer overlapped/pipe paths light up.
 # Also scrub min/max macros from <windows.h> that clobber std::min/max.

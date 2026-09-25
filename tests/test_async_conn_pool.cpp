@@ -84,7 +84,7 @@ struct MockServer {
     }
 
     ~MockServer() {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         acceptor.close(ec);
         io.stop();
         if (worker.joinable()) worker.join();
@@ -201,14 +201,14 @@ struct MockServer {
         } catch (...) {
             // client disconnected / malformed — drop
         }
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.close(ec);
     }
 
     asio::awaitable<void> accept_loop() {
         for (;;) {
             asio::ip::tcp::socket sock{io};
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             co_await acceptor.async_accept(
                 sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
@@ -517,7 +517,7 @@ TEST(ConnPool, TimeoutCancellationNeverReplaysOptedInPost) {
                     "127.0.0.1", std::to_string(srv.port),
                     "/x", "{}", {}, false, opts);
                 (void)response;
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 timed_out = error.code() == asio::error::timed_out;
             } catch (...) {
             }
@@ -691,7 +691,7 @@ TEST(ConnPool, InFlightWaiterTimeoutCancelsGateWait) {
                 "127.0.0.1", std::to_string(srv.port),
                 "/x", "{}", {}, false, opts);
             (void)response;
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             second_timed_out = error.code() == asio::error::timed_out;
         } catch (...) {
         }
@@ -723,7 +723,7 @@ TEST(ConnPool, InFlightOperationOwnsStateAfterPoolDestruction) {
         pool.reset();
         try {
             (void)co_await std::move(operation);
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             timed_out = error.code() == asio::error::timed_out;
         }
     }, asio::detached);

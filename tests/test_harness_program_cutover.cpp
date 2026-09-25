@@ -12,7 +12,6 @@
 #endif
 
 #include <asio/error.hpp>
-#include <asio/system_error.hpp>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -164,7 +163,7 @@ public:
 
     neograph::ChatCompletion complete(const neograph::CompletionParams&) override {
         parent_->cancel();
-        throw asio::system_error(asio::error::make_error_code(asio::error::timed_out));
+        throw neograph_asio_system_error(asio::error::make_error_code(asio::error::timed_out));
     }
 
     std::string get_name() const override { return "parent-cancels-then-asio-error-provider"; }

@@ -173,7 +173,7 @@ TEST(ResourceArbiter, TimeoutRemovesWaiterAndPreservesCapacity) {
     try {
         (void)neograph::async::run_sync(arbiter->acquire_async(exclusive_request(40ms)));
         FAIL() << "queued resource acquisition unexpectedly succeeded";
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::timed_out);
     }
 

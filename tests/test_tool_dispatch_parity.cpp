@@ -303,7 +303,7 @@ TEST(ToolDispatchParity, AgentRunStreamLabelsToolDetectionTimeout) {
     public:
         asio::awaitable<ChatCompletion>
         invoke(const CompletionParams&, StreamCallback) override {
-            throw asio::system_error(
+            throw neograph_asio_system_error(
                 asio::error::timed_out, "ConnPool::async_post: timeout");
             co_return ChatCompletion{};
         }
@@ -318,7 +318,7 @@ TEST(ToolDispatchParity, AgentRunStreamLabelsToolDetectionTimeout) {
     try {
         (void)agent.run_stream(messages, [](const std::string&) {});
         FAIL() << "expected tool-detection timeout";
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::timed_out);
         EXPECT_NE(std::string(error.what()).find("tool-detection phase"),
                   std::string::npos);

@@ -1,6 +1,6 @@
 // Unit tests for neograph::async error taxonomy (Stage 3 Semester 1.3).
 //
-// Pure classifier tests — no network. We build asio::error_codes the
+// Pure classifier tests — no network. We build neograph_asio_error_codes the
 // same way asio does internally (via make_error_code on the category
 // enums) and feed them through classify_asio_error / classify_http_status.
 //
@@ -106,7 +106,7 @@ TEST(HttpErrorTaxonomy, ClassifySslVerifyFailed) {
     // Build a raw SSL error_code with the verify-failed reason.
     // ERR_PACK(lib, func, reason) is what OpenSSL uses; asio wraps
     // the same integer in its ssl category.
-    asio::error_code ec(
+    neograph_asio_error_code ec(
         ERR_PACK(ERR_LIB_SSL, 0, SSL_R_CERTIFICATE_VERIFY_FAILED),
         asio::error::get_ssl_category());
     EXPECT_EQ(async::classify_asio_error(ec),
@@ -127,7 +127,7 @@ TEST(HttpErrorTaxonomy, ClassifySslGenericHandshake) {
     // A non-verify SSL error → TlsHandshakeReset (retryable).
     // Use an arbitrary reason code that isn't verify-failed or
     // short-read.
-    asio::error_code ec(
+    neograph_asio_error_code ec(
         ERR_PACK(ERR_LIB_SSL, 0, SSL_R_BAD_PACKET_LENGTH),
         asio::error::get_ssl_category());
     EXPECT_EQ(async::classify_asio_error(ec),
@@ -137,12 +137,12 @@ TEST(HttpErrorTaxonomy, ClassifySslGenericHandshake) {
 
 TEST(HttpErrorTaxonomy, ClassifyUnknownFallsThrough) {
     // No error → Unknown.
-    asio::error_code none;
+    neograph_asio_error_code none;
     EXPECT_EQ(async::classify_asio_error(none),
               async::HttpErrorKind::Unknown);
 
     // An errno we don't map (ENOSYS = 38 on Linux) → Unknown.
-    asio::error_code unmapped(ENOSYS, std::system_category());
+    neograph_asio_error_code unmapped(ENOSYS, std::system_category());
     EXPECT_EQ(async::classify_asio_error(unmapped),
               async::HttpErrorKind::Unknown);
 }

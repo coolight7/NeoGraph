@@ -21,7 +21,7 @@
 #include <asio/redirect_error.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
-#include <asio/system_error.hpp>
+#include <asio/error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
@@ -69,7 +69,7 @@ struct RoutedMock {
     }
 
     ~RoutedMock() {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         acceptor.close(ec);
         io.stop();
         if (worker.joinable()) worker.join();
@@ -150,14 +150,14 @@ struct RoutedMock {
                     asio::use_awaitable);
             }
         } catch (...) { }
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         sock.close(ec);
     }
 
     asio::awaitable<void> accept_loop() {
         for (;;) {
             asio::ip::tcp::socket sock{io};
-            asio::error_code ec;
+            neograph_asio_error_code ec;
             co_await acceptor.async_accept(
                 sock, asio::redirect_error(asio::use_awaitable, ec));
             if (ec) co_return;
@@ -588,7 +588,7 @@ TEST(RequestOptions, TimeoutTriggers) {
             // The acceptor belongs to the I/O thread. Closing it there lets
             // the pending accept finish before the thread is joined.
             asio::post(io, [this] {
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 acc.close(ec);
             });
             if (worker.joinable()) worker.join();
@@ -596,7 +596,7 @@ TEST(RequestOptions, TimeoutTriggers) {
         asio::awaitable<void> loop() {
             for (;;) {
                 asio::ip::tcp::socket sock{io};
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 co_await acc.async_accept(
                     sock, asio::redirect_error(asio::use_awaitable, ec));
                 if (ec) co_return;
@@ -620,7 +620,7 @@ TEST(RequestOptions, TimeoutTriggers) {
                     "127.0.0.1", std::to_string(srv.port),
                     "/x", "{}", {}, false, opts);
                 co_await std::move(request);
-            } catch (const asio::system_error& e) {
+            } catch (const neograph_asio_system_error& e) {
                 if (e.code() == asio::error::timed_out) {
                     timed_out = true;
                 }
@@ -662,7 +662,7 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
             // The acceptor belongs to the I/O thread. Closing it there lets
             // the pending accept finish before the thread is joined.
             asio::post(io, [this] {
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 acc.close(ec);
             });
             if (worker.joinable()) worker.join();
@@ -670,7 +670,7 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
         asio::awaitable<void> loop() {
             for (;;) {
                 asio::ip::tcp::socket sock{io};
-                asio::error_code ec;
+                neograph_asio_error_code ec;
                 co_await acc.async_accept(
                     sock, asio::redirect_error(asio::use_awaitable, ec));
                 if (ec) co_return;
@@ -692,7 +692,7 @@ TEST(RequestOptions, PoolTimeoutTriggers) {
                     "127.0.0.1", std::to_string(srv.port),
                     "/x", "{}", {}, false, opts);
                 co_await std::move(request);
-            } catch (const asio::system_error& e) {
+            } catch (const neograph_asio_system_error& e) {
                 if (e.code() == asio::error::timed_out) {
                     timed_out = true;
                 }
@@ -802,7 +802,7 @@ TEST(RequestOptions, HeaderLimitReturnsMessageSize) {
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/headers", "{}", {}, false, opts);
                 co_await std::move(request);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -831,7 +831,7 @@ TEST(RequestOptions, ContentLengthLimitReturnsMessageSizeBeforeBodyRead) {
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/length", "{}", {}, false, opts);
                 co_await std::move(request);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -858,7 +858,7 @@ TEST(RequestOptions, ContentLengthOverflowReturnsMessageSize) {
                     io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                     "/overflow", "{}", {}, false);
                 co_await std::move(request);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -885,7 +885,7 @@ TEST(RequestOptions, PoolPropagatesBodyLimitAndDiscardsConnection) {
                     "127.0.0.1", std::to_string(srv.port),
                     "/pool-limit", "{}", {}, false, opts);
                 co_await std::move(request);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 message_size = error.code() == asio::error::message_size;
             }
         },
@@ -901,7 +901,7 @@ TEST(RequestOptions, ImmediateTransportFailureIsNotMaskedAsTimeout) {
     RoutedMock srv([](const std::string&) { return std::string{}; });
 
     asio::io_context io;
-    asio::error_code observed;
+    neograph_asio_error_code observed;
     bool saw_exception = false;
     std::chrono::steady_clock::duration elapsed{};
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
@@ -913,7 +913,7 @@ TEST(RequestOptions, ImmediateTransportFailureIsNotMaskedAsTimeout) {
                 io.get_executor(), "127.0.0.1", std::to_string(srv.port),
                 "/closed", "{}", {}, false, opts);
             (void)co_await std::move(request);
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             saw_exception = true;
             observed = error.code();
         } catch (...) {
@@ -933,7 +933,7 @@ TEST(RequestOptions, PoolImmediateTransportFailureIsNotMaskedAsTimeout) {
 
     asio::io_context io;
     neograph::async::ConnPool pool(io.get_executor());
-    asio::error_code observed;
+    neograph_asio_error_code observed;
     bool saw_exception = false;
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
         neograph::async::RequestOptions opts;
@@ -943,7 +943,7 @@ TEST(RequestOptions, PoolImmediateTransportFailureIsNotMaskedAsTimeout) {
                 "127.0.0.1", std::to_string(srv.port),
                 "/closed", "{}", {}, false, opts);
             (void)co_await std::move(request);
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             saw_exception = true;
             observed = error.code();
         } catch (...) {

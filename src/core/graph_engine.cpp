@@ -13,7 +13,6 @@
 #include <asio/co_spawn.hpp>
 #include <asio/error.hpp>
 #include <asio/post.hpp>
-#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/thread_pool.hpp>
 #include <asio/use_awaitable.hpp>
@@ -695,7 +694,7 @@ asio::awaitable<RunResult> GraphEngine::run_async_with_runtime(
             execute_graph_async(config, cb, {}, nullptr, metadata, &resources),
             asio::bind_cancellation_slot(
                 execution->slot(), asio::use_awaitable));
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         if (operation->is_cancelled() &&
             error.code() == asio::error::operation_aborted) {
             throw CancelledException("run_async operation aborted");
@@ -973,7 +972,7 @@ asio::awaitable<RunResult> GraphEngine::resume_async_with_runtime(
                 std::move(checkpoint_id)),
             asio::bind_cancellation_slot(
                 execution->slot(), asio::use_awaitable));
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         if (operation->is_cancelled() &&
             error.code() == asio::error::operation_aborted) {
             throw CancelledException("resume_async operation aborted");

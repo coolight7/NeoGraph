@@ -20,7 +20,7 @@
 #include <asio/redirect_error.hpp>
 #include <asio/read.hpp>
 #include <asio/streambuf.hpp>
-#include <asio/system_error.hpp>
+#include <asio/error.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
 
@@ -46,7 +46,7 @@ namespace neograph::async::detail {
 enum class ConnDirective { keep_alive, close };
 
 [[noreturn]] inline void throw_message_size(const char* context) {
-    throw asio::system_error(asio::error::message_size, context);
+    throw neograph_asio_system_error(asio::error::message_size, context);
 }
 
 inline bool exceeds_limit(std::size_t value, std::size_t limit) noexcept {
@@ -722,7 +722,7 @@ struct ExchangeResult {
 };
 
 // Drive one HTTP/1.1 request/response cycle on `stream`. Caller has
-// already built `req` via build_request(). Throws asio::system_error /
+// already built `req` via build_request(). Throws neograph_asio_system_error /
 // std::runtime_error on wire or parse failure.
 // Result of a chunked-streaming exchange. No body field — the body
 // was delivered to the caller's on_chunk as it arrived.
@@ -1051,12 +1051,12 @@ asio::awaitable<void> read_close_delimited_body(
         ? chunk.size()
         : std::min(chunk.size(), opts.max_response_chunk_bytes);
     for (;;) {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         const std::size_t received = co_await stream.async_read_some(
             asio::buffer(chunk.data(), read_size),
             asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::eof) co_return;
-        if (ec) throw asio::system_error(ec, "async_post: close-delimited body");
+        if (ec) throw neograph_asio_system_error(ec, "async_post: close-delimited body");
         if (received == 0) continue;
         if (out.size() > out.max_size() ||
             received > out.max_size() - out.size() ||
@@ -1103,13 +1103,13 @@ asio::awaitable<void> read_close_delimited_stream(
         ? chunk.size()
         : std::min(chunk.size(), opts.max_response_chunk_bytes);
     for (;;) {
-        asio::error_code ec;
+        neograph_asio_error_code ec;
         const std::size_t received = co_await stream.async_read_some(
             asio::buffer(chunk.data(), read_size),
             asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::eof) co_return;
         if (ec) {
-            throw asio::system_error(ec,
+            throw neograph_asio_system_error(ec,
                                      "async_post_stream: close-delimited body");
         }
         if (received == 0) continue;

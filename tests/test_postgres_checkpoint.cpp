@@ -172,7 +172,7 @@ struct StalledTcpServer {
         acceptor.listen();
         port = acceptor.local_endpoint().port();
         auto pending = std::make_shared<asio::ip::tcp::socket>(io);
-        acceptor.async_accept(*pending, [this, pending](const asio::error_code& ec) {
+        acceptor.async_accept(*pending, [this, pending](const neograph_asio_error_code& ec) {
             if (!ec) client = pending;
         });
         worker = std::thread([this] { io.run(); });
@@ -307,7 +307,7 @@ TEST(PostgresCheckpointPoolTest, AsyncWaitDoesNotBlockIoContext) {
     auto started = std::chrono::steady_clock::now();
 
     asio::steady_timer heartbeat(io, std::chrono::milliseconds(20));
-    heartbeat.async_wait([&](const asio::error_code& ec) {
+    heartbeat.async_wait([&](const neograph_asio_error_code& ec) {
         if (!ec) {
             heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started);
@@ -356,7 +356,7 @@ TEST(PostgresCheckpointPoolTest, CancelledWaiterIsRemoved) {
         asio::bind_cancellation_slot(cancel.slot(),
             [&](std::exception_ptr error) { waiter_error = error; }));
     asio::steady_timer cancel_timer(io, std::chrono::milliseconds(20));
-    cancel_timer.async_wait([&](const asio::error_code& ec) {
+    cancel_timer.async_wait([&](const neograph_asio_error_code& ec) {
         if (!ec) cancel.emit(asio::cancellation_type::all);
     });
 
@@ -365,7 +365,7 @@ TEST(PostgresCheckpointPoolTest, CancelledWaiterIsRemoved) {
     ASSERT_NE(waiter_error, nullptr);
     try {
         std::rethrow_exception(waiter_error);
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::operation_aborted);
     } catch (...) {
         FAIL() << "cancelled pool waiter returned an unexpected exception";
@@ -448,14 +448,14 @@ TEST(PostgresCheckpointAsyncIoTest, ReconnectPollDoesNotBlockIoContext) {
     auto started = std::chrono::steady_clock::now();
 
     asio::steady_timer heartbeat(io, std::chrono::milliseconds(20));
-    heartbeat.async_wait([&](const asio::error_code& ec) {
+    heartbeat.async_wait([&](const neograph_asio_error_code& ec) {
         if (!ec) {
             heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started);
         }
     });
     asio::steady_timer cancel_timer(io, std::chrono::milliseconds(100));
-    cancel_timer.async_wait([&](const asio::error_code& ec) {
+    cancel_timer.async_wait([&](const neograph_asio_error_code& ec) {
         if (!ec) cancel.emit(asio::cancellation_type::all);
     });
     asio::co_spawn(io,
@@ -472,7 +472,7 @@ TEST(PostgresCheckpointAsyncIoTest, ReconnectPollDoesNotBlockIoContext) {
     ASSERT_NE(rebuild_error, nullptr);
     try {
         std::rethrow_exception(rebuild_error);
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::operation_aborted);
     } catch (...) {
         FAIL() << "cancelled async reconnect returned an unexpected exception";
@@ -495,7 +495,7 @@ TEST(PostgresCheckpointAsyncIoTest, ResolverPollDoesNotBlockIoContext) {
     std::exception_ptr rebuild_error;
     auto started = std::chrono::steady_clock::now();
     asio::steady_timer heartbeat(io, std::chrono::milliseconds(20));
-    heartbeat.async_wait([&](const asio::error_code& ec) {
+    heartbeat.async_wait([&](const neograph_asio_error_code& ec) {
         if (!ec) {
             heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started);
@@ -1040,7 +1040,7 @@ TEST_F(PostgresCheckpointTest, AsyncBlobLoadDoesNotBlockIoContext) {
     asio::steady_timer heartbeat(io);
     asio::post(io, [&] {
         heartbeat.expires_after(std::chrono::milliseconds(20));
-        heartbeat.async_wait([&](const asio::error_code& ec) {
+        heartbeat.async_wait([&](const neograph_asio_error_code& ec) {
             if (!ec) {
                 heartbeat_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - started);
@@ -1323,7 +1323,7 @@ TEST_F(PostgresCheckpointTest, CancelledAsyncQueryDiscardsConnectionWithoutRetry
     ASSERT_NE(save_error, nullptr);
     try {
         std::rethrow_exception(save_error);
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::operation_aborted);
     } catch (...) {
         FAIL() << "cancelled async query returned an unexpected exception";
@@ -1332,7 +1332,7 @@ TEST_F(PostgresCheckpointTest, CancelledAsyncQueryDiscardsConnectionWithoutRetry
         << "PostgreSQL cleanup permanently disabled caller cancellation";
     try {
         std::rethrow_exception(followup_error);
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::operation_aborted);
     } catch (...) {
         FAIL() << "follow-up wait returned an unexpected exception";
@@ -1437,7 +1437,7 @@ TEST_F(PostgresCheckpointTest, CancelledAsyncPutWritesDiscardsTransactionWithout
     ASSERT_NE(write_error, nullptr);
     try {
         std::rethrow_exception(write_error);
-    } catch (const asio::system_error& error) {
+    } catch (const neograph_asio_system_error& error) {
         EXPECT_EQ(error.code(), asio::error::operation_aborted);
     } catch (...) {
         FAIL() << "cancelled put_writes_async returned an unexpected exception";

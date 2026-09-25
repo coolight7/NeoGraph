@@ -7,6 +7,8 @@
 // Not production code. The real async_http_client lives alongside this
 // once the PoC bench confirms the approach.
 
+#include <neograph/define.h>
+
 #include <asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>

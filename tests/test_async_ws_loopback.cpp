@@ -18,7 +18,6 @@
 #include <asio/ip/tcp.hpp>
 #include <asio/post.hpp>
 #include <asio/read.hpp>
-#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/use_future.hpp>
@@ -435,7 +434,7 @@ TEST_F(WsLoopback, CancellationAbortsHeldReceive) {
     auto                           token = std::make_shared<neograph::graph::CancelToken>();
     std::promise<void>             receive_entered;
     auto                           entered = receive_entered.get_future();
-    std::promise<asio::error_code> completion;
+    std::promise<neograph_asio_error_code> completion;
     auto                           result = completion.get_future();
 
     asio::co_spawn(
@@ -457,7 +456,7 @@ TEST_F(WsLoopback, CancellationAbortsHeldReceive) {
                     operation_executor, wait_for_message(),
                     asio::bind_cancellation_slot(operation->slot(), asio::use_awaitable));
                 completion.set_value(asio::error::fault);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 completion.set_value(error.code());
             } catch (...) {
                 completion.set_value(asio::error::fault);

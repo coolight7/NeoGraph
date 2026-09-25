@@ -110,7 +110,7 @@ struct Pending {
     int redirects_followed = 0;
 
     asio::any_io_executor caller_ex;
-    std::function<void(asio::error_code, HttpResponse, std::exception_ptr)> on_done;
+    std::function<void(neograph_asio_error_code, HttpResponse, std::exception_ptr)> on_done;
     std::shared_ptr<RequestControl> control = std::make_shared<RequestControl>();
 
     // Filled by the worker as the request runs.
@@ -292,7 +292,7 @@ struct CurlH2Pool::Impl {
     std::shared_ptr<MultiWakeup>          wakeup = std::make_shared<MultiWakeup>();
 
     void complete(std::unique_ptr<Pending> p,
-                  asio::error_code ec = {},
+                  neograph_asio_error_code ec = {},
                   HttpResponse response = {},
                   std::exception_ptr err = {}) {
         auto on_done = std::move(p->on_done);
@@ -568,13 +568,13 @@ struct CurlH2Pool::Impl {
 
         curl_slist_free_all(p->curl_hdrs);
         curl_easy_cleanup(easy);
-        const asio::error_code ec = cancelled
+        const neograph_asio_error_code ec = cancelled
             ? asio::error::operation_aborted
             : p->limit_error
                 ? asio::error::message_size
             : code == CURLE_OPERATION_TIMEDOUT
                 ? asio::error::timed_out
-                : asio::error_code{};
+                : neograph_asio_error_code{};
         complete(std::move(p),
                  ec,
                  std::move(r), std::move(err));
@@ -612,7 +612,7 @@ asio::awaitable<HttpResponse> CurlH2Pool::async_post(
     auto ex = co_await asio::this_coro::executor;
 
     co_return co_await asio::async_initiate<
-        decltype(asio::use_awaitable), void(asio::error_code, HttpResponse)>(
+        decltype(asio::use_awaitable), void(neograph_asio_error_code, HttpResponse)>(
         [this, ex,
          url = std::move(url),
          body = std::move(body),
@@ -636,7 +636,7 @@ asio::awaitable<HttpResponse> CurlH2Pool::async_post(
             // can hold it.
             auto h_sp = std::make_shared<std::decay_t<decltype(handler)>>(
                 std::move(handler));
-            p->on_done = [h_sp](asio::error_code ec,
+            p->on_done = [h_sp](neograph_asio_error_code ec,
                                 HttpResponse r,
                                 std::exception_ptr err) {
                 if (ec) {
@@ -649,11 +649,11 @@ asio::awaitable<HttpResponse> CurlH2Pool::async_post(
                         HttpResponse e_resp;
                         e_resp.status = 0;
                         e_resp.body   = std::string("CurlH2Pool error: ") + e.what();
-                        std::move(*h_sp)(asio::error_code{}, std::move(e_resp));
+                        std::move(*h_sp)(neograph_asio_error_code{}, std::move(e_resp));
                         return;
                     }
                 }
-                std::move(*h_sp)(asio::error_code{}, std::move(r));
+                std::move(*h_sp)(neograph_asio_error_code{}, std::move(r));
             };
 
             if (slot.is_connected()) {

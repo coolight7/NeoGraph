@@ -24,6 +24,7 @@
  */
 #pragma once
 
+#include <neograph/define.h>
 #include <neograph/graph/cancel.h>
 
 #include <asio/awaitable.hpp>
@@ -33,7 +34,6 @@
 #include <asio/error.hpp>
 #include <asio/io_context.hpp>
 #include <asio/post.hpp>
-#include <asio/system_error.hpp>
 #include <asio/thread_pool.hpp>
 
 #include <cstddef>
@@ -98,7 +98,7 @@ T run_sync_operation(
         if (operation && operation->is_cancelled()) {
             try {
                 std::rethrow_exception(err);
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 if (error.code() == asio::error::operation_aborted) {
                     throw neograph::graph::CancelledException(
                         "run_sync operation aborted");
@@ -205,7 +205,7 @@ T run_sync(asio::awaitable<T> aw,
         // weak_ptr expires → next parent.cancel()/fork() prunes it.
 
         // v0.3.2: if the inner co_spawn completed because of a cancel
-        // (asio::system_error operation_aborted from a torn-down HTTP
+        // (neograph_asio_system_error operation_aborted from a torn-down HTTP
         // socket), surface it as the typed CancelledException so the
         // executor's retry loop can short-circuit instead of treating
         // it as a transient runtime_error.

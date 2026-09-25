@@ -12,7 +12,6 @@
 #include <asio/experimental/parallel_group.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/strand.hpp>
-#include <asio/system_error.hpp>
 #include <asio/this_coro.hpp>
 #include <asio/use_awaitable.hpp>
 
@@ -295,7 +294,7 @@ asio::awaitable<NodeResult> NodeExecutor::execute_node_with_retry_async(
             // cancel flag, the second HTTP call would slip through,
             // and the cost leak would persist for max_retries × ~3 s.
             throw;
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             // Socket/timer cancellation enters node code as
             // operation_aborted. Once this operation's token is set, that is
             // cancellation control flow, not a retryable transport failure.

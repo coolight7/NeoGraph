@@ -1001,7 +1001,7 @@ void cancel_deadline_timer(const asio::any_io_executor&        executor,
 asio::awaitable<void> cancel_after_timer(std::shared_ptr<asio::steady_timer> timer,
                                          std::shared_ptr<graph::CancelToken> token,
                                          std::shared_ptr<std::atomic<bool>> expired) {
-    asio::error_code wait_error;
+    neograph_asio_error_code wait_error;
     co_await         timer->async_wait(asio::redirect_error(asio::use_awaitable, wait_error));
     if (!wait_error) {
         // Cancelling the child can complete its branch before this timer's
@@ -1162,7 +1162,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
     asio::co_spawn(
         control->deadline_executor,
         [control, timer]() -> asio::awaitable<void> {
-            asio::error_code error;
+            neograph_asio_error_code error;
             co_await         timer->async_wait(asio::redirect_error(asio::use_awaitable, error));
             if (!error) control->cancel(CancellationCause::Timeout);
             co_return;
@@ -2094,7 +2094,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                     co_await asio::co_spawn(
                         completion_executor,
                         [batch_state]() -> asio::awaitable<void> {
-                            asio::error_code error;
+                            neograph_asio_error_code error;
                             co_await         batch_state->timer->async_wait(
                                 asio::redirect_error(asio::use_awaitable, error));
                         },
@@ -2449,7 +2449,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                     std::vector<std::shared_ptr<graph::CancelToken>> branch_tokens;
                     std::exception_ptr                               error;
                     std::size_t                                      remaining = 0;
-                    std::shared_ptr<asio::experimental::channel<void(asio::error_code, int)>>
+                    std::shared_ptr<asio::experimental::channel<void(neograph_asio_error_code, int)>>
                         completion;
                 };
                 const auto executor = co_await asio::this_coro::executor;
@@ -2461,7 +2461,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                 // the parent begins receiving it. A cancelled timer would lose that
                 // wake-up and leave the parent waiting forever.
                 parallel->completion =
-                    std::make_shared<asio::experimental::channel<void(asio::error_code, int)>>(
+                    std::make_shared<asio::experimental::channel<void(neograph_asio_error_code, int)>>(
                         completion_executor, 1);
                 parallel->branch_tokens.reserve(branches.size());
                 for (std::size_t index = 0; index < branches.size(); ++index) {
@@ -2496,7 +2496,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                                         if (token) token->cancel();
                                 }
                                 if (all_done)
-                                    (void)parallel->completion->try_send(asio::error_code(), 1);
+                                    (void)parallel->completion->try_send(neograph_asio_error_code(), 1);
                             }));
                 }
                 const auto [completion_error, ignored] =
@@ -2558,7 +2558,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                     std::optional<std::size_t>                       winner;
                     std::size_t                                      completed           = 0;
                     bool                                             selection_scheduled = false;
-                    std::shared_ptr<asio::experimental::channel<void(asio::error_code, int)>>
+                    std::shared_ptr<asio::experimental::channel<void(neograph_asio_error_code, int)>>
                         completion;
                 };
                 const auto executor = co_await asio::this_coro::executor;
@@ -2567,7 +2567,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                 // A buffered completion signal remains observable if both branches
                 // settle before this parent reaches async_receive.
                 race->completion =
-                    std::make_shared<asio::experimental::channel<void(asio::error_code, int)>>(
+                    std::make_shared<asio::experimental::channel<void(neograph_asio_error_code, int)>>(
                         completion_executor, 1);
                 race->tokens.push_back(operation_token->fork());
                 race->tokens.push_back(operation_token->fork());
@@ -2626,10 +2626,10 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                                             if (sibling != *winner) race->tokens[sibling]->cancel();
                                     }
                                     if (all_done)
-                                        (void)race->completion->try_send(asio::error_code(), 1);
+                                        (void)race->completion->try_send(neograph_asio_error_code(), 1);
                                 });
                             } else if (all_done) {
-                                (void)race->completion->try_send(asio::error_code(), 1);
+                                (void)race->completion->try_send(neograph_asio_error_code(), 1);
                             }
                         }));
                 }
@@ -2934,7 +2934,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                 co_await asio::co_spawn(
                     completion_executor,
                     [parallel_map]() -> asio::awaitable<void> {
-                        asio::error_code error;
+                        neograph_asio_error_code error;
                         co_await         parallel_map->timer->async_wait(
                             asio::redirect_error(asio::use_awaitable, error));
                     },
@@ -3097,7 +3097,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                     auto timeout        = std::make_shared<asio::steady_timer>(executor);
                     timeout->expires_after(std::chrono::milliseconds(*operation.timeout_ms()));
                     auto timeout_operation = [timeout]() -> asio::awaitable<void> {
-                        asio::error_code error;
+                        neograph_asio_error_code error;
                         co_await         timeout->async_wait(
                             asio::redirect_error(asio::use_awaitable, error));
                     };
@@ -3327,7 +3327,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                             std::chrono::milliseconds(1),
                             std::chrono::duration_cast<std::chrono::milliseconds>(native_deadline -
                                                                                   now)));
-                        asio::error_code wait_error;
+                        neograph_asio_error_code wait_error;
                         co_await         completion_wait.async_wait(
                             asio::redirect_error(asio::use_awaitable, wait_error));
                     }
@@ -3487,7 +3487,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                         bool                                finished  = false;
                         bool                                timed_out = false;
                         std::shared_ptr<asio::steady_timer> timer;
-                        std::shared_ptr<asio::experimental::channel<void(asio::error_code, int)>>
+                        std::shared_ptr<asio::experimental::channel<void(neograph_asio_error_code, int)>>
                             completion;
                     };
                     auto       await_state         = std::make_shared<AwaitState>();
@@ -3495,7 +3495,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                     await_state->timer             = std::make_shared<asio::steady_timer>(executor);
                     await_state->timer->expires_after(std::chrono::milliseconds(*timeout));
                     await_state->completion =
-                        std::make_shared<asio::experimental::channel<void(asio::error_code, int)>>(
+                        std::make_shared<asio::experimental::channel<void(neograph_asio_error_code, int)>>(
                             completion_executor, 1);
                     auto awaited_token = operation_token->fork();
 
@@ -3516,13 +3516,13 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                                 }
                                 await_state->timer->cancel();
                                 if (signal)
-                                    await_state->completion->try_send(asio::error_code(), 1);
+                                    await_state->completion->try_send(neograph_asio_error_code(), 1);
                             }));
                     asio::co_spawn(
                         executor,
                         [await_state, completion_executor, scope,
                          awaited_token]() -> asio::awaitable<void> {
-                            asio::error_code error;
+                            neograph_asio_error_code error;
                             co_await         await_state->timer->async_wait(
                                 asio::redirect_error(asio::use_awaitable, error));
                             if (error) co_return;
@@ -3652,7 +3652,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                     bool                                               selection_scheduled = false;
                     bool                       initial_launches_registered                 = false;
                     std::optional<std::size_t> winner;
-                    std::shared_ptr<asio::experimental::channel<void(asio::error_code, int)>>
+                    std::shared_ptr<asio::experimental::channel<void(neograph_asio_error_code, int)>>
                         completion;
                 };
                 auto state = std::make_shared<JoinState>();
@@ -3664,7 +3664,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                 state->scopes.resize(members.size());
                 const auto completion_executor = asio::make_strand(executor);
                 state->completion =
-                    std::make_shared<asio::experimental::channel<void(asio::error_code, int)>>(
+                    std::make_shared<asio::experimental::channel<void(neograph_asio_error_code, int)>>(
                         completion_executor, 1);
 
                 // A member can complete before the initial launch loop finishes. Completion
@@ -3792,7 +3792,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                                                 state->tokens[index]->cancel();
                                         }
                                         if (signal_completion)
-                                            state->completion->try_send(asio::error_code(), 1);
+                                            state->completion->try_send(neograph_asio_error_code(), 1);
                                     });
                                 }
                                 if (cancel_all) {
@@ -3813,7 +3813,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                                 for (const auto index : to_launch)
                                     (*launch_member)(index);
                                 if (signal_completion)
-                                    state->completion->try_send(asio::error_code(), 1);
+                                    state->completion->try_send(neograph_asio_error_code(), 1);
                             }));
                 };
                 state->next = cap;
@@ -3840,7 +3840,7 @@ asio::awaitable<void> execute_run_attempt(std::shared_ptr<RunControl> control,
                 }
                 for (const auto index : deferred_launches)
                     (*launch_member)(index);
-                if (signal_completion) state->completion->try_send(asio::error_code(), 1);
+                if (signal_completion) state->completion->try_send(neograph_asio_error_code(), 1);
 
                 co_await asio::co_spawn(
                     completion_executor,

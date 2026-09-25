@@ -173,7 +173,7 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
             // Cancellation is graph control flow, not a tool result that the
             // model should consume before the run terminates.
             throw;
-        } catch (const asio::system_error& error) {
+        } catch (const neograph_asio_system_error& error) {
             if (execution.cancel_token && execution.cancel_token->is_cancelled()
                 && error.code() == asio::error::operation_aborted) {
                 throw graph::CancelledException("tool operation aborted");
@@ -228,7 +228,7 @@ dispatch_tool_calls(std::vector<ToolCall> calls, std::vector<Tool*> tools,
                 std::rethrow_exception(excs[i]);
             } catch (const graph::CancelledException&) {
                 throw;
-            } catch (const asio::system_error& error) {
+            } catch (const neograph_asio_system_error& error) {
                 if (execution.cancel_token && execution.cancel_token->is_cancelled()
                     && error.code() == asio::error::operation_aborted) {
                     throw graph::CancelledException("tool operation aborted");

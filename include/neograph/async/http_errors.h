@@ -3,7 +3,7 @@
  * @brief Error taxonomy for async HTTP — retryable vs permanent.
  *
  * Stage 3 / Semester 1.3 — classifies the error_codes that surface
- * from asio::system_error (and OpenSSL) during async HTTP work into
+ * from neograph_asio_system_error (and OpenSSL) during async HTTP work into
  * a small enum, plus a single `is_retryable()` predicate. Higher
  * layers (Provider, MCPClient, future Engine retry) use this instead
  * of each reinventing "which errno means try again".
@@ -11,7 +11,7 @@
  * Scope bounds:
  *   - This header defines the taxonomy and classifiers. It does
  *     *not* change async_post / ConnPool behavior — those still
- *     throw asio::system_error / std::runtime_error verbatim, so
+ *     throw neograph_asio_system_error / std::runtime_error verbatim, so
  *     callers that already catch std::exception are unaffected.
  *     Wrapping internal throws in HttpError is deferred to
  *     Semester 2 when Provider layers want structured retry.
@@ -19,6 +19,8 @@
  *     call from any thread, any context, under error unwinding.
  */
 #pragma once
+
+#include <neograph/define.h>
 
 #include <asio/error.hpp>
 #include <asio/ssl/error.hpp>
@@ -88,9 +90,9 @@ constexpr bool is_retryable(HttpErrorKind k) noexcept {
 }
 
 /// Classify an asio error_code — the kind returned inside
-/// asio::system_error::code() from any connect/read/write/handshake
+/// neograph_asio_system_error::code() from any connect/read/write/handshake
 /// op. Unknown category or unknown value returns HttpErrorKind::Unknown.
-inline HttpErrorKind classify_asio_error(const asio::error_code& ec) noexcept {
+inline HttpErrorKind classify_asio_error(const neograph_asio_error_code& ec) noexcept {
     if (!ec) return HttpErrorKind::Unknown;
 
     const auto& cat = ec.category();
@@ -161,7 +163,7 @@ constexpr HttpErrorKind classify_http_status(int status) noexcept {
 
 /// Structured exception. Optional — today's async_post / ConnPool do
 /// not throw this, but higher layers can construct one from a caught
-/// asio::system_error plus classify_asio_error().
+/// neograph_asio_system_error plus classify_asio_error().
 struct HttpError : std::runtime_error {
     HttpErrorKind kind        = HttpErrorKind::Unknown;
     int           http_status = 0;           ///< When kind is 4xx/5xx-derived.
