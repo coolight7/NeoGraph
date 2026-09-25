@@ -84,6 +84,34 @@ public:
     void write(const std::string& channel, const json& value);
 
     /**
+     * @brief Replace a channel value without running its reducer (exclusive lock).
+     *
+     * `write()` merges the new value into the current one through the
+     * channel's reducer (append, for the message channel); hosts that need
+     * the incoming value to win — rewriting a message history, replacing a
+     * compacted transcript — call this instead. Retention still applies.
+     *
+     * @param channel Channel name.
+     * @param value Value stored as-is.
+     * @throws std::runtime_error If the channel is not declared.
+     */
+    void overwrite(const std::string& channel, const json& value);
+
+    /// Overload of [overwrite] that takes ownership of the value to store.
+    void overwrite(const std::string& channel, json&& value);
+
+    /**
+     * @brief Drop a channel from this state (exclusive lock).
+     *
+     * After a remove, `has_channel()` is false and `get()` returns null.
+     * `write()` on that name throws again until the channel is declared.
+     * Removing an undeclared channel does nothing.
+     *
+     * @param channel Channel name.
+     */
+    void remove(const std::string& channel);
+
+    /**
      * @brief Apply a batch of channel writes atomically (exclusive lock).
      *
      * All writes in the batch are applied under a single lock acquisition,

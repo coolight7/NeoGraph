@@ -548,6 +548,48 @@ void GraphEngine::update_state_writes(
     checkpoint_store_->save(new_cp);
 }
 
+void GraphEngine::update_state(const std::string& thread_id,
+                               const std::function<void(GraphState&)>& on_update,
+                               const std::string& as_node) {
+    if (!checkpoint_store_)
+        throw std::runtime_error("Cannot update_state: no checkpoint store configured");
+
+    auto cp_opt = checkpoint_store_->load_latest(thread_id);
+    if (!cp_opt)
+        throw std::runtime_error("No checkpoint found for thread: " + thread_id);
+    auto& cp = *cp_opt;
+
+    GraphState state;
+    init_state(state);
+    state.restore(cp.channel_values);
+
+    // The handler owns the mutation: it may replace a channel
+    // (overwrite), drop one (remove), or derive the new value.
+    on_update(state);
+
+    Checkpoint new_cp;
+    new_cp.id              = Checkpoint::generate_id();
+    new_cp.thread_id       = thread_id;
+    new_cp.channel_values  = state.serialize();
+    new_cp.parent_id       = cp.id;
+    new_cp.current_node    = as_node.empty() ? cp.current_node : as_node;
+    new_cp.next_nodes      = cp.next_nodes;
+    new_cp.interrupt_phase = CheckpointPhase::Updated;
+    // Barrier accumulators must survive an admin update, exactly as in
+    // update_state_writes: dropping barrier_state here would silently
+    // discard partial arrivals of an in-flight AND-join.
+    new_cp.barrier_state   = cp.barrier_state;
+    new_cp.step            = cp.step;
+    const int64_t now = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    // The parent's step is preserved, so a millisecond timestamp tie would
+    // leave durable stores unable to identify the newer checkpoint.
+    new_cp.timestamp       = std::max(now, cp.timestamp + 1);
+
+    checkpoint_store_->save(new_cp);
+}
+
 std::string GraphEngine::fork(const std::string& source_thread_id,
                                const std::string& new_thread_id,
                                const std::string& checkpoint_id) {

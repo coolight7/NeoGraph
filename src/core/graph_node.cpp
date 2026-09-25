@@ -126,6 +126,23 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     // the in-flight HTTPS socket.
     params.cancel_token = in.ctx.cancel_token;
 
+    // Single dispatch point: the provider call lives in onReceiveToken()
+    // so a subclass can replace how the completion is produced without
+    // copying this body (see the virtual's docstring).
+    auto completion = co_await onReceiveToken(params, in);
+    record_usage(in.ctx, completion);   // #88
+
+    json msg_json;
+    to_json(msg_json, completion.message);
+
+    NodeOutput out;
+    out.writes.push_back(
+        ChannelWrite{"messages", json::array({msg_json})});
+    co_return out;
+}
+
+asio::awaitable<ChatCompletion> LLMCallNode::onReceiveToken(CompletionParams& params,
+                                                            NodeInput&        in) {
     // ROADMAP_v1.md Candidate 6 PR2: dispatch through Provider::invoke()
     // — the v1.0 unified entry point. Same semantic as the previous
     // `if (in.stream_cb) complete_stream_async else complete_async` pair,
@@ -145,17 +162,8 @@ asio::awaitable<NodeOutput> LLMCallNode::run(NodeInput in) {
     }
     std::vector<ChatMessage> host_instructions;
     if (!instructions_.empty()) host_instructions.push_back({"system", instructions_});
-    auto completion = co_await invoke_provider(provider_, std::move(params), std::move(on_token),
-                                               std::move(host_instructions));
-    record_usage(in.ctx, completion);   // #88
-
-    json msg_json;
-    to_json(msg_json, completion.message);
-
-    NodeOutput out;
-    out.writes.push_back(
-        ChannelWrite{"messages", json::array({msg_json})});
-    co_return out;
+    co_return co_await invoke_provider(provider_, std::move(params), std::move(on_token),
+                                       std::move(host_instructions));
 }
 
 // =========================================================================

@@ -51,8 +51,13 @@ namespace neograph::graph {
  * copied into the coroutine frame so its references survive suspension.
  */
 struct NodeInput {
-    /// Snapshot of the channel state visible to this node.
-    const GraphState&  state;
+    /// Channel state visible to this node.
+    ///
+    /// Not const: nodes that act as a host boundary (rewriting a message
+    /// history, compacting a transcript) write channels directly through
+    /// `GraphState::overwrite()` / `remove()` instead of paying a
+    /// serialize/restore hop through the output writes.
+    GraphState& state;
 
     /// Per-run metadata threaded by the engine — cancel token, usage,
     /// thread_id, current super-step, stream mode, Store, resume value, and
@@ -208,9 +213,20 @@ public:
     /// HTTP socket without the legacy thread-local smuggling.
     asio::awaitable<NodeOutput> run(NodeInput in) override;
 
+    /// Single completion entry point of this node.
+    ///
+    /// ``run()`` builds the params and then calls this, so a subclass can
+    /// replace how the provider is driven (custom transport selection,
+    /// parameter injection, per-chunk bookkeeping) without copying the
+    /// whole ``run()`` body. The default implementation keeps the engine's
+    /// behaviour: it bridges ``in.stream_cb`` to the provider callback and
+    /// returns the completion unchanged.
+    virtual asio::awaitable<ChatCompletion> onReceiveToken(CompletionParams& params,
+                                                           NodeInput&        in);
+
     std::string get_name() const override { return name_; }
 
-private:
+protected:
     std::string              name_;
     std::shared_ptr<Provider> provider_;
     std::vector<Tool*>       tools_;
@@ -246,7 +262,7 @@ public:
     asio::awaitable<NodeOutput> run(NodeInput in) override;
     std::string get_name() const override { return name_; }
 
-private:
+protected:
     std::string        name_;
     std::vector<Tool*> tools_;
 };

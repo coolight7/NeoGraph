@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -104,6 +105,13 @@ public:
  */
 class NEOGRAPH_API Tool {
   public:
+    /// Host-owned metadata attached to the tool, as string key/value pairs.
+    ///
+    /// NeoGraph never reads these keys: they let a host carry its own tool
+    /// policy (retry limits, feature switches) alongside the tool object it
+    /// registers, including for tools it did not create itself.
+    std::map<std::string, std::string> extra;
+
     virtual ~Tool() = default;
 
     /**
@@ -140,6 +148,17 @@ class NEOGRAPH_API Tool {
      * apply ToolExecutionController policy before calling either path.
      */
     virtual asio::awaitable<std::string> execute_async(const json& arguments);
+
+    /**
+     * @brief Interception point around async tool execution.
+     *
+     * A dispatcher that has to run host policy around every invocation —
+     * argument rewriting, retry bookkeeping, hand-off to a worker pool —
+     * awaits this instead of `execute_async()`. The default forwards to
+     * `execute_async()`, so tools that only override that method (or just
+     * `execute()`) keep working unchanged.
+     */
+    virtual asio::awaitable<std::string> real_execute_async(const json& arguments);
 };
 
 /**

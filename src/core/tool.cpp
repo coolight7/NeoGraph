@@ -17,6 +17,14 @@ asio::awaitable<std::string> Tool::execute_async(const json& arguments) {
     co_return co_await detail::execute_blocking_tool_async(*this, json(arguments));
 }
 
+// Interception point around async execution. Dispatchers that must run the
+// host's own policy around every invocation await this instead of
+// execute_async(); the default simply forwards, so existing tools keep their
+// behaviour.
+asio::awaitable<std::string> Tool::real_execute_async(const json& arguments) {
+    co_return co_await execute_async(arguments);
+}
+
 std::string AsyncTool::execute(const json& arguments) {
     return neograph::async::run_sync(execute_async(arguments));
 }

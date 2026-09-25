@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -757,6 +758,25 @@ public:
     void update_state_writes(const std::string& thread_id,
                              const std::vector<ChannelWrite>& channel_writes,
                              const std::string& as_node = "");
+
+    /**
+     * @brief Update state by handing the restored state to a caller handler.
+     *
+     * Same checkpoint dance as [update_state_writes] (load latest, apply,
+     * save a `Updated` checkpoint), but the caller gets the whole
+     * `GraphState` and can express what a list of channel writes cannot:
+     * replacing a channel through `overwrite()`, dropping one through
+     * `remove()`, or computing the new value from the old one.
+     *
+     * @param thread_id Thread ID to update.
+     * @param on_update Handler invoked with the restored state.
+     * @param as_node Optional node name to attribute the update to (for tracing).
+     * @throws std::runtime_error If no checkpoint store is configured or the
+     *         thread has no checkpoint yet.
+     */
+    void update_state(const std::string&                      thread_id,
+                      const std::function<void(GraphState&)>& on_update,
+                      const std::string&                      as_node = "");
 
     /**
      * @brief Fork a thread, creating a new thread from an existing checkpoint.
