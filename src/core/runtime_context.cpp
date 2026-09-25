@@ -152,11 +152,11 @@ void validate_message(const ChatMessage& message) {
         detail::validate_utf8(call.arguments);
     }
     if (message.role != "assistant" &&
-        (!message.reasoning.empty() || !message.reasoning_details.empty())) {
+        (!message.reasoning_content.empty() || !message.reasoning_details.empty())) {
         throw std::invalid_argument(
             "Only assistant runtime history messages may contain reasoning");
     }
-    detail::validate_utf8(message.reasoning);
+    detail::validate_utf8(message.reasoning_content);
     if (!message.reasoning_details.is_array()) {
         throw std::invalid_argument(
             "Runtime history reasoning_details must be an array");
@@ -196,7 +196,7 @@ ChatMessage parse_message(const json& value) {
         value, "Stored RuntimeHistoryRecord message",
         {"role", "content", "tool_calls", "tool_call_id", "tool_name", "tool_status",
          "tool_retryable", "tool_effect_uncertain", "image_urls", "reasoning",
-         "reasoning_details"});
+         "reasoning_content", "reasoning_details"});
     if (!value.contains("role") || !value.at("role").is_string() ||
         !value.contains("content") || !value.at("content").is_string()) {
         throw std::invalid_argument("Stored RuntimeHistoryRecord message requires role and content");
@@ -214,6 +214,9 @@ ChatMessage parse_message(const json& value) {
     }
     if (value.contains("image_urls")) (void)required_string_array(value, "image_urls");
     if (value.contains("reasoning") && !value.at("reasoning").is_string()) {
+        throw std::invalid_argument("Stored runtime reasoning must be a string");
+    }
+    if (value.contains("reasoning_content") && !value.at("reasoning_content").is_string()) {
         throw std::invalid_argument("Stored runtime reasoning must be a string");
     }
     if (value.contains("reasoning_details") &&

@@ -175,4 +175,21 @@ Provider::invoke(const CompletionParams& params, StreamCallback on_chunk) {
     co_return co_await complete_async(params);
 }
 
+asio::awaitable<ChatCompletion>
+Provider::invoke_format_data(const CompletionParams& params,
+                             FormatDataStreamCallback on_chunk) {
+    // Nothing to tag without a callback: keep the non-streaming transport so
+    // the request shape does not change just because the tagged entry point
+    // was used.
+    if (!on_chunk) {
+        co_return co_await invoke(params, nullptr);
+    }
+    co_return co_await invoke(params, [&on_chunk](const std::string& chunk) {
+        on_chunk(neograph::ChatStreamChunk{
+            neograph::ChatStreamChunk::TYPE_CONTENT,
+            chunk,
+        });
+    });
+}
+
 } // namespace neograph

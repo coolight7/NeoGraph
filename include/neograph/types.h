@@ -10,10 +10,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 #include <neograph/define.h>
 #include <neograph/json.h>
@@ -34,6 +38,45 @@ struct ToolCall {
 };
 
 /**
+ * @brief Bit mask describing host-visible properties of a ChatMessage.
+ *
+ * Kept as a mask so several properties combine in one field and the memory
+ * stays small. NeoGraph itself never interprets these bits: they travel with
+ * the message through serialization for the host (an agent runtime) to use,
+ * and message-request builders leave them out of the LLM API payload.
+ */
+enum class MessageFlag : uint64_t {
+    None = 0,
+    /// Inserted by the host runtime rather than produced by the user or the model.
+    AutoInserted = 1 << 0,
+    /// A tool result that the host shortened before storing it.
+    ShareStoreTruncated = 1 << 1,
+    /// Content moved to the host's store; `content` keeps only a reference.
+    ContentOffloaded = 1 << 2,
+    /// Replaced by a summary; the replaced text is kept by the host.
+    Summarized = 1 << 3,
+    /// No longer valid, e.g. a tool call that was superseded.
+    Outdated = 1 << 4,
+    /// The tool call behind this message was interrupted (HITL).
+    Interrupt = 1 << 5,
+};
+
+inline MessageFlag operator|(MessageFlag a, MessageFlag b) {
+    return static_cast<MessageFlag>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
+}
+inline MessageFlag operator&(MessageFlag a, MessageFlag b) {
+    return static_cast<MessageFlag>(static_cast<uint64_t>(a) & static_cast<uint64_t>(b));
+}
+inline MessageFlag& operator|=(MessageFlag& a, MessageFlag b) {
+    a = a | b;
+    return a;
+}
+/// @brief Whether [test] is set in [flags].
+inline bool hasFlag(MessageFlag flags, MessageFlag test) {
+    return (static_cast<uint64_t>(flags & test)) != 0;
+}
+
+/**
  * @brief A message in the conversation history.
  *
  * Supports all standard roles (user, assistant, tool, system) and
@@ -50,10 +93,26 @@ struct ChatMessage {
     bool tool_retryable = false;
     bool tool_effect_uncertain = false;
     std::vector<std::string> image_urls; ///< Base64 data URLs or HTTP URLs for vision support.
+    /// Base64 data URLs or HTTP URLs for audio attachments (`input_audio` on
+    /// the wire: only a data URL can be converted, a plain HTTP URL cannot).
+    std::vector<std::string> audio_urls;
+    /// Base64 data URLs or HTTP URLs for video attachments.
+    std::vector<std::string> video_urls;
     /// Provider-returned reasoning text. Keep separate from user-visible content.
-    std::string reasoning;
+    std::string reasoning_content;
     /// Opaque provider-native continuation blocks replayed only on a compatible route.
     json reasoning_details = json::array();
+
+    /// Earlier versions of this message, oldest first. A host that rewrites or
+    /// regenerates history keeps the replaced content here so the UI can offer
+    /// it back without a second store.
+    std::vector<std::string> history_contents;
+
+    /// Bit mask of host-used message properties (see MessageFlag).
+    MessageFlag flags = MessageFlag::None;
+    /// Host-owned side data for this message (share-store ids, timings, ...).
+    /// NeoGraph copies it through serialization; the keys are the host's.
+    json extra;
 };
 
 /**
@@ -87,6 +146,25 @@ struct ChatCompletion {
         int cached_prompt_tokens = 0; ///< Prompt-token subset served from cache.
         int reasoning_tokens = 0;   ///< Completion-token subset spent on reasoning.
     } usage;
+};
+
+/**
+ * @brief One streamed piece of a completion, tagged with what it carries.
+ *
+ * `StreamCallback` only reports text, so a host that renders thinking
+ * separately (or persists it as a message field) cannot tell reasoning tokens
+ * from answer tokens. Providers that can distinguish the two report through
+ * `FormatDataStreamCallback` / `Provider::invoke_format_data` and use these
+ * tags; the plain string callback stays available unchanged.
+ */
+class ChatStreamChunk {
+public:
+    inline static constexpr int TYPE_CONTENT  = 1;
+    inline static constexpr int TYPE_THINKING = 1 << 2;
+    inline static constexpr int TYPE_UNKNOWN  = 1 << 30;
+
+    int         type = TYPE_CONTENT;
+    std::string data;
 };
 
 /**
@@ -261,8 +339,13 @@ inline void to_json(json& j, const ChatMessage& msg) {
     if (msg.tool_retryable)        j["tool_retryable"] = true;
     if (msg.tool_effect_uncertain) j["tool_effect_uncertain"] = true;
     if (!msg.image_urls.empty())   j["image_urls"] = msg.image_urls;
-    if (!msg.reasoning.empty())    j["reasoning"] = msg.reasoning;
+    if (!msg.audio_urls.empty())   j["audio_urls"] = msg.audio_urls;
+    if (!msg.video_urls.empty())   j["video_urls"] = msg.video_urls;
+    if (!msg.history_contents.empty()) j["history_contents"] = msg.history_contents;
+    if (!msg.reasoning_content.empty()) j["reasoning_content"] = msg.reasoning_content;
     if (!msg.reasoning_details.empty()) j["reasoning_details"] = msg.reasoning_details;
+    if (msg.flags != MessageFlag::None) j["flags"] = static_cast<uint64_t>(msg.flags);
+    if (!msg.extra.empty())        j["extra"] = msg.extra;
 }
 
 /// @brief Deserialize a ChatMessage from JSON.
@@ -286,7 +369,28 @@ inline void from_json(const json& j, ChatMessage& msg) {
     if (j.contains("image_urls") && j["image_urls"].is_array()) {
         msg.image_urls = j["image_urls"].get<std::vector<std::string>>();
     }
-    msg.reasoning = j.value("reasoning", "");
+    if (j.contains("audio_urls") && j["audio_urls"].is_array()) {
+        msg.audio_urls = j["audio_urls"].get<std::vector<std::string>>();
+    }
+    if (j.contains("video_urls") && j["video_urls"].is_array()) {
+        msg.video_urls = j["video_urls"].get<std::vector<std::string>>();
+    }
+    if (j.contains("history_contents") && j["history_contents"].is_array()) {
+        msg.history_contents = j["history_contents"].get<std::vector<std::string>>();
+    }
+    // `reasoning` is the key an older revision wrote; accept it so records
+    // stored before this field was renamed still load.
+    if (j.contains("reasoning_content") && j["reasoning_content"].is_string()) {
+        msg.reasoning_content = j["reasoning_content"].get<std::string>();
+    } else {
+        msg.reasoning_content = j.value("reasoning", "");
+    }
+    if (j.contains("flags")) {
+        msg.flags = static_cast<MessageFlag>(j["flags"].get<uint64_t>());
+    }
+    if (j.contains("extra")) {
+        msg.extra = j["extra"];
+    }
     if (j.contains("reasoning_details") && !j["reasoning_details"].is_array()) {
         throw std::invalid_argument("ChatMessage reasoning_details must be an array");
     }
@@ -297,11 +401,112 @@ inline void from_json(const json& j, ChatMessage& msg) {
 
 // --- JSON serialization helpers ---
 
+/// @brief Parse a base64 data URL (RFC 2397): "data:[<mediatype>][;base64],<data>".
+///
+/// Only base64-encoded data URLs are supported; anything else (a plain URL,
+/// a percent-encoded payload, or a malformed header) returns std::nullopt.
+/// @return `{media_type, base64 payload}` on success, where the media type may
+///         be empty (the `data:;base64,...` form); the caller decides how to
+///         treat an empty type.
+inline std::optional<std::pair<std::string, std::string>> parse_data_url(std::string_view url) {
+    constexpr std::string_view kPrefix = "data:";
+    if (!url.starts_with(kPrefix)) {
+        return std::nullopt;
+    }
+    url.remove_prefix(kPrefix.size());
+    auto comma = url.find(',');
+    if (comma == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::string_view header = url.substr(0, comma);
+    std::string      payload{url.substr(comma + 1)};
+
+    std::string_view mime     = header;
+    bool             is_base64 = false;
+    auto             semi      = header.find(';');
+    if (semi != std::string_view::npos) {
+        mime       = header.substr(0, semi);
+        auto params = header.substr(semi + 1);
+        // Walk the parameter list so both "data:image/png;base64,..." and
+        // "data:image/png;name=a.png;base64,..." are accepted.
+        while (!params.empty()) {
+            auto next  = params.find(';');
+            auto param = params.substr(0, next);
+            if (param == "base64") {
+                is_base64 = true;
+            }
+            params = (next == std::string_view::npos) ? std::string_view{}
+                                                      : params.substr(next + 1);
+        }
+    }
+    if (!is_base64) {
+        // Percent-encoded data URLs are not supported yet.
+        return std::nullopt;
+    }
+    return std::make_pair(std::string(mime), std::move(payload));
+}
+
+/// @brief Derive the audio/video `format` identifier the APIs expect.
+///
+/// Common aliases are normalized and parameters dropped (e.g. ";codecs=..."),
+/// so callers can pass the media type straight from a data URL:
+///   audio/wav|x-wav|wave -> wav; audio/mpeg|audio/mp3|audio/mpga -> mp3;
+///   audio/ogg -> ogg; audio/aac -> aac; audio/flac -> flac; audio/webm -> webm;
+///   video/mp4 -> mp4; video/mpeg -> mpeg; video/quicktime -> mov;
+///   video/webm -> webm; video/x-msvideo -> avi; video/x-matroska -> mkv;
+///   video/mp2t -> mpegts; video/vnd.apple.mpegurl -> m3u8
+/// Anything else returns the lower-cased subtype (the text after "/"), or the
+/// whole lower-cased media type when there is no "/".
+inline std::string media_format_from_mime(std::string_view mime) {
+    std::string m(mime);
+    for (auto& c : m) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    auto semi = m.find(';');
+    if (semi != std::string::npos) {
+        m.resize(semi);
+    }
+    auto        slash   = m.find('/');
+    std::string type    = (slash == std::string::npos) ? m : m.substr(0, slash);
+    std::string subtype = (slash == std::string::npos) ? m : m.substr(slash + 1);
+
+    if (subtype == "x-wav" || subtype == "wave") {
+        return "wav";
+    }
+    if (subtype == "mpeg" || subtype == "mpga") {
+        return (type == "audio") ? "mp3" : "mpeg";
+    }
+    if (subtype == "quicktime") {
+        return "mov";
+    }
+    if (subtype == "x-msvideo") {
+        return "avi";
+    }
+    if (subtype == "x-matroska") {
+        return "mkv";
+    }
+    if (subtype == "mp2t") {
+        return "mpegts";
+    }
+    if (subtype == "vnd.apple.mpegurl") {
+        return "m3u8";
+    }
+    return subtype;
+}
+
 /**
  * @brief Convert a vector of ChatMessages to OpenAI-compatible JSON format.
  *
  * Handles tool call messages, tool result messages, and multi-modal
- * messages (text + images in OpenAI Vision format).
+ * messages (text plus images/audio/video) in OpenAI multimodal format:
+ *   - image: {"type":"image_url","image_url":{"url":<url>}}
+ *   - audio: {"type":"input_audio","input_audio":{"data":<base64>,"format":<fmt>}}
+ *            (a data URL becomes data+format; an HTTP URL cannot be turned
+ *             into base64, so it is passed through as {"url":...} for
+ *             gateways that accept it)
+ *   - video: {"type":"video_url","video_url":{"url":<url>}}
  *
  * @param messages Vector of ChatMessage objects to convert.
  * @return JSON array in OpenAI messages format.
@@ -326,14 +531,35 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
                 });
             }
             j["tool_calls"] = tc_arr;
-        } else if (!msg.image_urls.empty()) {
-            // Multi-modal: text + images (OpenAI Vision format)
+        } else if (!msg.image_urls.empty() || !msg.audio_urls.empty() ||
+                   !msg.video_urls.empty()) {
+            // Multi-modal: text + images/audio/video (OpenAI multimodal format)
             json parts = json::array();
             if (!msg.content.empty()) {
                 parts.push_back({{"type", "text"}, {"text", msg.content}});
             }
             for (auto& url : msg.image_urls) {
                 parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+            }
+            for (const auto& url : msg.audio_urls) {
+                if (auto parsed = parse_data_url(url)) {
+                    parts.push_back({
+                        {"type", "input_audio"},
+                        {"input_audio",
+                         {{"data", parsed->second},
+                          {"format", media_format_from_mime(parsed->first)}}},
+                    });
+                } else {
+                    // An HTTP URL (or an unparsable data URL) is passed through
+                    // as a url field; only a data URL can become base64.
+                    parts.push_back({
+                        {"type", "input_audio"},
+                        {"input_audio", {{"url", url}}},
+                    });
+                }
+            }
+            for (const auto& url : msg.video_urls) {
+                parts.push_back({{"type", "video_url"}, {"video_url", {{"url", url}}}});
             }
             j["content"] = parts;
         } else {
@@ -347,8 +573,8 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
                         "ChatMessage reasoning_details must be an array");
                 }
                 j["reasoning_details"] = msg.reasoning_details;
-            } else if (!msg.reasoning.empty()) {
-                j["reasoning_content"] = msg.reasoning;
+            } else if (!msg.reasoning_content.empty()) {
+                j["reasoning_content"] = msg.reasoning_content;
             }
         }
 
@@ -366,16 +592,44 @@ inline json messages_to_json(const std::vector<ChatMessage>& messages) {
 inline json tools_to_json(const std::vector<ChatTool>& tools) {
     json arr = json::array();
     for (const auto& tool : tools) {
+        // A tool without a parameter schema would serialize as
+        // "parameters": null, which strict gateways reject with
+        // 400 "Format Error"; fall back to an empty object schema.
+        json params = tool.parameters.is_object() ? tool.parameters : json::object();
         arr.push_back({
             {"type", "function"},
             {"function", {
                 {"name", tool.name},
                 {"description", tool.description},
-                {"parameters", tool.parameters}
+                {"parameters", std::move(params)}
             }}
         });
     }
     return arr;
+}
+
+/// @brief Serialize a message list as a JSON array of ChatMessage objects.
+///
+/// This is the lossless form (it keeps the host fields too), unlike
+/// messages_to_json(), which builds the OpenAI request shape.
+inline void to_json(json& j, const std::vector<ChatMessage>& msgs) {
+    j = json::array();
+    for (const auto& msg : msgs) {
+        json msg_json;
+        to_json(msg_json, msg);
+        j.push_back(std::move(msg_json));
+    }
+}
+
+/// @brief Serialize one streamed chunk (tag + payload).
+inline void to_json(json& j, const neograph::ChatStreamChunk& e) {
+    j = json{{"type", e.type}, {"data", e.data}};
+}
+
+/// @brief Deserialize one streamed chunk.
+inline void from_json(const json& j, neograph::ChatStreamChunk& e) {
+    e.type = j.value<int>("type", 0);
+    e.data = j.value<std::string>("data", "");
 }
 
 /**
@@ -395,10 +649,10 @@ inline ChatMessage parse_response_message(const json& choice) {
     msg.content = (m.contains("content") && !m["content"].is_null())
                   ? m["content"].get<std::string>() : "";
     if (m.contains("reasoning") && m["reasoning"].is_string()) {
-        msg.reasoning = m["reasoning"].get<std::string>();
+        msg.reasoning_content = m["reasoning"].get<std::string>();
     } else if (m.contains("reasoning_content") &&
                m["reasoning_content"].is_string()) {
-        msg.reasoning = m["reasoning_content"].get<std::string>();
+        msg.reasoning_content = m["reasoning_content"].get<std::string>();
     }
     if (m.contains("reasoning_details") && m["reasoning_details"].is_array()) {
         msg.reasoning_details = m["reasoning_details"];

@@ -51,6 +51,11 @@ private:
 /// @param chunk The token or text chunk received from the LLM.
 using StreamCallback = std::function<void(const std::string& chunk)>;
 
+/// Callback invoked per streamed chunk, tagged with what the chunk carries
+/// (answer text vs. reasoning text). See `ChatStreamChunk`.
+/// @param chunk The tagged chunk received from the LLM.
+using FormatDataStreamCallback = std::function<void(const neograph::ChatStreamChunk& chunk)>;
+
 /**
  * @brief Parameters for an LLM completion request.
  */
@@ -295,6 +300,25 @@ class NEOGRAPH_API Provider {
      */
     virtual asio::awaitable<ChatCompletion>
     invoke(const CompletionParams& params, StreamCallback on_chunk = nullptr);
+
+    /**
+     * @brief Streaming entry point that reports tagged chunks.
+     *
+     * Same request as [invoke], but the per-chunk callback receives a
+     * `ChatStreamChunk`, so a provider that can tell reasoning tokens from
+     * answer tokens can report both. The default bridges to [invoke]: every
+     * string chunk is reported as `ChatStreamChunk::TYPE_CONTENT`, and a
+     * `nullptr` callback selects the non-streaming transport, exactly as
+     * `invoke(params, nullptr)` does.
+     *
+     * @param params Completion parameters (model, messages, tools, ...).
+     * @param on_chunk Optional per-chunk callback; `nullptr` for a
+     *                 non-streaming request.
+     * @return Awaitable yielding the full assembled completion.
+     */
+    virtual asio::awaitable<ChatCompletion>
+    invoke_format_data(const CompletionParams& params,
+                       FormatDataStreamCallback on_chunk = nullptr);
 
     /**
      * @brief Get the provider name (e.g., "openai", "claude").
